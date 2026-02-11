@@ -381,16 +381,44 @@ runs:
           gerrit-plugins-${{ inputs.plugin_version }}
           gerrit-plugins-
 
-    # Pre-pull Gerrit Docker image
-    - name: 'Pre-pull Gerrit image'
+    # Build custom Gerrit Docker image with uv and gerrit_to_platform
+    - name: 'Build custom Gerrit image'
       if: inputs.enable_cache == 'true'
       shell: bash
       run: |
-        # Pre-pull Gerrit image for caching
-        echo "Pulling: gerritcodereview/gerrit:${{ inputs.gerrit_version }}"
-        docker pull gerritcodereview/gerrit:${{ inputs.gerrit_version }} || {
-          echo "Warning: Failed to pre-pull image, will attempt during run"
-        }
+        # Build custom Gerrit image with uv and gerrit_to_platform
+        GERRIT_VERSION="${{ inputs.gerrit_version }}"
+        CUSTOM_IMAGE="gerrit-extended:${GERRIT_VERSION}"
+
+        echo "Building custom Gerrit image..."
+        echo "  Base: gerritcodereview/gerrit:${GERRIT_VERSION}"
+        echo "  Target: ${CUSTOM_IMAGE}"
+
+        if docker build \
+          --build-arg "GERRIT_VERSION=${GERRIT_VERSION}" \
+          -t "${CUSTOM_IMAGE}" \
+          -f "${{ github.action_path }}/Dockerfile" \
+          "${{ github.action_path }}"; then
+          echo "Custom image built successfully ✅"
+
+          # Verify components (use --entrypoint="" to prevent Gerrit from starting)
+          echo "Verifying custom image components..."
+          if docker run --rm --entrypoint="" "${CUSTOM_IMAGE}" uv --version 2>/dev/null; then
+            echo "  uv: ✅"
+          else
+            echo "  uv: ⚠️ not found"
+          fi
+          if docker run --rm --entrypoint="" "${CUSTOM_IMAGE}" which change-merged 2>/dev/null; then
+            echo "  gerrit-to-platform: ✅"
+          else
+            echo "  gerrit-to-platform: ⚠️ not found"
+          fi
+        else
+          echo "::warning::Failed to build custom image, will fall back to official image"
+          docker pull "gerritcodereview/gerrit:${GERRIT_VERSION}" || {
+            echo "Warning: Failed to pre-pull fallback image"
+          }
+        fi
 
     # Detect Gerrit API paths
     - name: 'Detect Gerrit API paths'

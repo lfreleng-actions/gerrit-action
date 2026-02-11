@@ -13,6 +13,58 @@ echo "Starting Gerrit instances..."
 # API paths file (populated by detect-api-paths.sh)
 API_PATHS_FILE="$WORK_DIR/api_paths.json"
 
+# Custom image name (built from our Dockerfile with uv/gerrit_to_platform)
+CUSTOM_IMAGE_NAME="gerrit-extended"
+CUSTOM_IMAGE_TAG="${GERRIT_VERSION}"
+CUSTOM_IMAGE="${CUSTOM_IMAGE_NAME}:${CUSTOM_IMAGE_TAG}"
+
+# Build custom Gerrit image with uv and gerrit_to_platform
+build_custom_image() {
+  local dockerfile_dir
+  dockerfile_dir="$(dirname "$0")/.."
+
+  # Check if Dockerfile exists
+  if [ ! -f "$dockerfile_dir/Dockerfile" ]; then
+    echo "::warning::Dockerfile not found at $dockerfile_dir/Dockerfile"
+    echo "::warning::Falling back to official gerritcodereview/gerrit image"
+    CUSTOM_IMAGE="gerritcodereview/gerrit:${GERRIT_VERSION}"
+    return 0
+  fi
+
+  echo "Building custom Gerrit image with uv and gerrit_to_platform..."
+  echo "  Base image: gerritcodereview/gerrit:${GERRIT_VERSION}"
+  echo "  Custom image: ${CUSTOM_IMAGE}"
+
+  # Build the custom image
+  if docker build \
+    --build-arg "GERRIT_VERSION=${GERRIT_VERSION}" \
+    -t "${CUSTOM_IMAGE}" \
+    -f "$dockerfile_dir/Dockerfile" \
+    "$dockerfile_dir" 2>&1; then
+    echo "Custom image built successfully ✅"
+
+    # Verify uv and gerrit-to-platform are available
+    # Use --entrypoint="" to prevent Gerrit from starting during verification
+    echo "Verifying custom image components..."
+    if docker run --rm --entrypoint="" "${CUSTOM_IMAGE}" uv --version 2>/dev/null; then
+      echo "  uv: ✅"
+    else
+      echo "::warning::uv not found in custom image"
+    fi
+    if docker run --rm --entrypoint="" "${CUSTOM_IMAGE}" which change-merged 2>/dev/null; then
+      echo "  gerrit-to-platform: ✅"
+    else
+      echo "::warning::gerrit-to-platform not found in custom image"
+    fi
+  else
+    echo "::warning::Failed to build custom image, falling back to official image"
+    CUSTOM_IMAGE="gerritcodereview/gerrit:${GERRIT_VERSION}"
+  fi
+}
+
+# Build the custom image before starting instances
+build_custom_image
+
 # Function to get API path for a slug
 get_api_path() {
   local slug="$1"
@@ -380,7 +432,7 @@ init_gerrit_site() {
     -v "$instance_dir/logs:/var/gerrit/logs" \
     -v "$instance_dir/plugins:/var/gerrit/plugins" \
     -e CANONICAL_WEB_URL="$canonical_url" \
-    "gerritcodereview/gerrit:${GERRIT_VERSION}" \
+    "${CUSTOM_IMAGE}" \
     init || {
     echo "::error::Failed to initialize Gerrit site for $slug ❌"
     return 1
@@ -778,8 +830,7 @@ start_instance() {
   fi
 
   docker run "${docker_args[@]}" \
-    --pull=missing \
-    "gerritcodereview/gerrit:${GERRIT_VERSION}" || {
+    "${CUSTOM_IMAGE}" || {
     echo "::error::Failed to start Gerrit container for $slug ❌"
     return 1
   }

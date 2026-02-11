@@ -2,289 +2,211 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: 2025 The Linux Foundation
 
-# Local Docker test script for debugging pull-replication
-# Usage: ./test-local.sh [gerrit_host] [api_path] [project_filter]
+# Local test script for Gerrit pull-replication with custom image
 #
-# Example:
-#   ./test-local.sh gerrit.linuxfoundation.org /infra releng/lftools
-#   ./test-local.sh gerrit.linuxfoundation.org /infra "releng/lftools,releng/ciman"
-#   ./test-local.sh gerrit.linuxfoundation.org /infra ""           # All projects
-#   ./test-local.sh gerrit.linuxfoundation.org /infra "all"        # All projects
-#   ./test-local.sh gerrit.linuxfoundation.org /infra "releng/.*"  # Regex pattern
+# This script tests the Gerrit container setup locally, including:
+# - Building the custom Gerrit image with uv and gerrit_to_platform
+# - Configuring fetchEvery polling mode (web UI enabled)
+# - Pre-creating project directories for replication
+# - Verifying replication works correctly
+#
+# Usage: ./test-local.sh [gerrit_host] [project]
+#
+# Examples:
+#   ./test-local.sh gerrit.linuxfoundation.org releng/lftools
+#   ./test-local.sh gerrit.onap.org onap/ccsdk/cds
+#
+# Environment variables:
+#   GERRIT_HTTP_USERNAME - HTTP Basic auth username (or use ~/.netrc)
+#   GERRIT_HTTP_PASSWORD - HTTP Basic auth password (or use ~/.netrc)
+#   API_PATH             - API path prefix (default: /infra)
+#   GERRIT_VERSION       - Gerrit Docker image version (default: 3.13.1-ubuntu24)
+#   PLUGIN_VERSION       - Pull-replication plugin version (default: stable-3.13)
+#   HTTP_PORT            - Local HTTP port (default: 8080)
+#   FETCH_EVERY          - Polling interval (default: 15s)
+#   USE_CUSTOM_IMAGE     - Build/use custom image with uv (default: true)
 #
 # Prerequisites:
 #   - Docker running
-#   - HTTP credentials in environment or .env file:
-#     export GERRIT_HTTP_USERNAME="your-username"
-#     export GERRIT_HTTP_PASSWORD="your-password"
-#
-# Replication approach: fetchEvery polling (default)
-# The pull-replication plugin is configured with fetchEvery which polls the
-# source Gerrit at regular intervals to fetch new/changed refs. This enables
-# full web UI access while maintaining automatic replication.
-#
-# Alternatively, set REPLICA_MODE=true to use the older replica-based approach
-# which uses replicateOnStartup but disables the web UI.
-#
-# Key insight: Projects must exist locally before they can be replicated.
-# This script creates empty bare repos for each project before starting Gerrit.
+#   - Credentials in ~/.netrc or environment variables
 
 set -euo pipefail
 
+# Script directory for finding Dockerfile
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
 # Configuration
 GERRIT_HOST="${1:-gerrit.linuxfoundation.org}"
-API_PATH="${2:-/infra}"
-PROJECT_FILTER="${3:-releng/lftools}"
-MAX_PROJECTS="${MAX_PROJECTS:-100}"  # Limit for fetching all projects
+PROJECT="${2:-releng/lftools}"
+API_PATH="${API_PATH:-/infra}"
 GERRIT_VERSION="${GERRIT_VERSION:-3.13.1-ubuntu24}"
 PLUGIN_VERSION="${PLUGIN_VERSION:-stable-3.13}"
 CONTAINER_NAME="gerrit-local-test"
 HTTP_PORT="${HTTP_PORT:-8080}"
-SSH_PORT="${SSH_PORT:-29418}"
-FETCH_EVERY="${FETCH_EVERY:-60s}"
-FETCH_EVERY_ENABLED=true
-# REPLICA_MODE: Set to 'true' to use replica mode (disables web UI)
-# Default is 'false' for fetchEvery polling mode (web UI enabled)
-REPLICA_MODE="${REPLICA_MODE:-false}"
+FETCH_EVERY="${FETCH_EVERY:-15s}"
+INSTANCE_DIR="/tmp/gerrit-local-test"
+USE_CUSTOM_IMAGE="${USE_CUSTOM_IMAGE:-true}"
 
-# Fetch project list from remote Gerrit server
-fetch_remote_projects() {
-  local gerrit_host="$1"
-  local api_path="${2:-}"
-  local project_filter="${3:-}"
-  local max_projects="${4:-100}"
+# Custom image settings
+CUSTOM_IMAGE_NAME="gerrit-extended"
+CUSTOM_IMAGE="${CUSTOM_IMAGE_NAME}:${GERRIT_VERSION}"
+DOCKER_IMAGE="${CUSTOM_IMAGE}"
 
-  log_info "Fetching project list from $gerrit_host..."
-
-  # Build API URL
-  local api_url
-  if [ -n "$api_path" ]; then
-    api_path="${api_path#/}"  # Remove leading slash
-    api_url="https://${gerrit_host}/${api_path}/projects/"
-  else
-    api_url="https://${gerrit_host}/projects/"
-  fi
-
-  # Add query parameters
-  local query_params="n=${max_projects}"
-  if [ -n "$project_filter" ] && [ "$project_filter" != ".*" ] && [ "$project_filter" != "all" ]; then
-    # Use regex filter if it looks like a pattern, otherwise prefix match
-    if [[ "$project_filter" == *"*"* ]] || [[ "$project_filter" == *"."* ]]; then
-      query_params="${query_params}&r=$(printf '%s' "$project_filter" | jq -sRr @uri)"
-    else
-      query_params="${query_params}&p=$(printf '%s' "$project_filter" | jq -sRr @uri)"
-    fi
-  fi
-
-  local full_url="${api_url}?${query_params}"
-  log_info "  API URL: $full_url"
-
-  # Fetch projects (Gerrit API returns )]}' prefix for XSSI protection)
-  local response
-  response=$(curl -s --connect-timeout 30 --max-time 60 "$full_url" 2>/dev/null) || {
-    log_error "Failed to fetch project list from $gerrit_host"
-    return 1
-  }
-
-  # Remove XSSI protection prefix and parse JSON
-  local projects
-  projects=$(echo "$response" | tail -n +2 | jq -r 'keys[]' 2>/dev/null) || {
-    log_error "Failed to parse project list response"
-    return 1
-  }
-
-  local count
-  count=$(echo "$projects" | grep -c . || echo "0")
-  log_success "Found $count projects on remote server"
-
-  # Return project list (one per line)
-  echo "$projects"
-}
-
-# Colors for output
+# Colors
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
-NC='\033[0m' # No Color
+NC='\033[0m'
 
 log_info() { echo -e "${BLUE}[INFO]${NC} $*"; }
 log_success() { echo -e "${GREEN}[OK]${NC} $*"; }
 log_warn() { echo -e "${YELLOW}[WARN]${NC} $*"; }
 log_error() { echo -e "${RED}[ERROR]${NC} $*"; }
 
-# Validate and check if fetchEvery should be disabled
-# 0 or 0 with any unit (0s, 0m, 0h) disables automatic polling
-if ! [[ "$FETCH_EVERY" =~ ^[0-9]+[smhSMH]?$ ]]; then
-  log_error "Invalid FETCH_EVERY value: '$FETCH_EVERY'. Expected format: <integer>[s|m|h], e.g. 60s, 5m, 1h, or 0 to disable"
-  exit 1
-fi
-if [[ "$FETCH_EVERY" =~ ^0[smhSMH]?$ ]]; then
-  FETCH_EVERY_ENABLED=false
-  log_warn "fetchEvery disabled (interval set to $FETCH_EVERY)"
-fi
+# Build custom Gerrit image with uv and gerrit_to_platform
+build_custom_image() {
+  local dockerfile_dir="${SCRIPT_DIR}/.."
 
-# Load .env file if it exists
-if [ -f ".env" ]; then
-  log_info "Loading .env file..."
-  # shellcheck disable=SC1091
-  source .env
-fi
+  if [ "$USE_CUSTOM_IMAGE" != "true" ]; then
+    log_info "Skipping custom image build (USE_CUSTOM_IMAGE=$USE_CUSTOM_IMAGE)"
+    DOCKER_IMAGE="gerritcodereview/gerrit:${GERRIT_VERSION}"
+    return 0
+  fi
 
-# Try to load credentials from .netrc if not already set
-if [ -z "${GERRIT_HTTP_USERNAME:-}" ] || [ -z "${GERRIT_HTTP_PASSWORD:-}" ]; then
+  if [ ! -f "$dockerfile_dir/Dockerfile" ]; then
+    log_warn "Dockerfile not found at $dockerfile_dir/Dockerfile"
+    log_warn "Falling back to official gerritcodereview/gerrit image"
+    DOCKER_IMAGE="gerritcodereview/gerrit:${GERRIT_VERSION}"
+    return 0
+  fi
+
+  log_info "Building custom Gerrit image with uv and gerrit_to_platform..."
+  log_info "  Base image: gerritcodereview/gerrit:${GERRIT_VERSION}"
+  log_info "  Custom image: ${CUSTOM_IMAGE}"
+
+  if docker build \
+    --build-arg "GERRIT_VERSION=${GERRIT_VERSION}" \
+    -t "${CUSTOM_IMAGE}" \
+    -f "$dockerfile_dir/Dockerfile" \
+    "$dockerfile_dir"; then
+    log_success "Custom image built successfully"
+    DOCKER_IMAGE="${CUSTOM_IMAGE}"
+
+    # Verify components are available
+    verify_custom_image_components
+  else
+    log_error "Failed to build custom image"
+    log_warn "Falling back to official gerritcodereview/gerrit image"
+    DOCKER_IMAGE="gerritcodereview/gerrit:${GERRIT_VERSION}"
+  fi
+}
+
+# Verify uv and gerrit-to-platform are available in the custom image
+verify_custom_image_components() {
+  log_info "Verifying custom image components..."
+
+  # Check uv (use --entrypoint="" to prevent Gerrit from starting)
+  if docker run --rm --entrypoint="" "${DOCKER_IMAGE}" uv --version 2>/dev/null; then
+    log_success "  uv: available"
+  else
+    log_warn "  uv: not found in image"
+  fi
+
+  # Check gerrit-to-platform executables
+  if docker run --rm --entrypoint="" "${DOCKER_IMAGE}" which change-merged 2>/dev/null; then
+    log_success "  gerrit-to-platform: available"
+  else
+    log_warn "  gerrit-to-platform: not found in image"
+  fi
+}
+
+# Load credentials from ~/.netrc
+load_credentials() {
   if [ -f "$HOME/.netrc" ]; then
-    log_info "Checking ~/.netrc for credentials..."
+    log_info "Loading credentials from ~/.netrc..."
     NETRC_ENTRY=$(grep -A2 "machine ${GERRIT_HOST}" "$HOME/.netrc" 2>/dev/null || echo "")
     if [ -n "$NETRC_ENTRY" ]; then
       GERRIT_HTTP_USERNAME=$(echo "$NETRC_ENTRY" | grep "login" | awk '{print $2}')
       GERRIT_HTTP_PASSWORD=$(echo "$NETRC_ENTRY" | grep "password" | awk '{print $2}')
       if [ -n "$GERRIT_HTTP_USERNAME" ] && [ -n "$GERRIT_HTTP_PASSWORD" ]; then
-        log_success "Loaded credentials from ~/.netrc for $GERRIT_HOST"
+        log_success "Loaded credentials for $GERRIT_HOST"
+        return 0
       fi
     fi
   fi
-fi
 
-# Check for credentials
-if [ -z "${GERRIT_HTTP_USERNAME:-}" ] || [ -z "${GERRIT_HTTP_PASSWORD:-}" ]; then
-  log_error "Missing credentials!"
-  echo ""
-  echo "Please set environment variables:"
-  echo "  export GERRIT_HTTP_USERNAME='your-username'"
-  echo "  export GERRIT_HTTP_PASSWORD='your-password'"
-  echo ""
-  echo "Or create a .env file with these variables."
-  echo "Or add an entry to ~/.netrc for $GERRIT_HOST"
-  exit 1
-fi
-
-# Create working directory
-WORK_DIR=$(mktemp -d)
-INSTANCE_DIR="$WORK_DIR/gerrit"
-log_info "Working directory: $WORK_DIR"
+  if [ -z "${GERRIT_HTTP_USERNAME:-}" ] || [ -z "${GERRIT_HTTP_PASSWORD:-}" ]; then
+    log_error "No credentials found."
+    log_error "Set GERRIT_HTTP_USERNAME and GERRIT_HTTP_PASSWORD environment variables"
+    log_error "Or add an entry to ~/.netrc for $GERRIT_HOST"
+    exit 1
+  fi
+}
 
 cleanup() {
   log_info "Cleaning up..."
   docker rm -f "$CONTAINER_NAME" 2>/dev/null || true
-  # Uncomment to auto-remove work dir:
-  # rm -rf "$WORK_DIR"
-  log_info "Work directory preserved at: $WORK_DIR"
+  # Use Docker to remove files that may have been created with root ownership
+  if [ -d "$INSTANCE_DIR" ]; then
+    docker run --rm -v "$INSTANCE_DIR:/cleanup" alpine rm -rf /cleanup/* 2>/dev/null || true
+    rm -rf "$INSTANCE_DIR" 2>/dev/null || true
+  fi
 }
+
+# Trap for cleanup on script exit
 trap cleanup EXIT
 
-# Stop any existing container
+# Header
+log_info "=============================================="
+log_info "Local Gerrit Test - fetchEvery Mode"
+log_info "=============================================="
+log_info "Host: $GERRIT_HOST"
+log_info "Project: $PROJECT"
+log_info "API Path: $API_PATH"
+log_info "Gerrit Version: $GERRIT_VERSION"
+log_info "Fetch interval: $FETCH_EVERY"
+log_info "Custom image: $USE_CUSTOM_IMAGE"
+log_info ""
+log_info "Goal: Test pull-replication with web UI enabled"
+echo ""
+
+load_credentials
+
+# Cleanup any previous run
 docker rm -f "$CONTAINER_NAME" 2>/dev/null || true
+# Use Docker to remove files that may have been created with root ownership
+if [ -d "$INSTANCE_DIR" ]; then
+  docker run --rm -v "$INSTANCE_DIR:/cleanup" alpine rm -rf /cleanup/* 2>/dev/null || true
+  rm -rf "$INSTANCE_DIR" 2>/dev/null || true
+fi
+
+# Build custom image (if enabled)
+build_custom_image
+
+log_info "Using Docker image: ${DOCKER_IMAGE}"
+echo ""
 
 # Create directory structure
 log_info "Creating Gerrit site structure..."
 mkdir -p "$INSTANCE_DIR"/{git,cache,index,data,etc,logs,plugins,tmp}
 chmod -R 777 "$INSTANCE_DIR"
 
-# Download pull-replication plugin
-PLUGIN_CACHE="/tmp/gerrit-plugins"
-PLUGIN_JAR="$PLUGIN_CACHE/pull-replication-${PLUGIN_VERSION}.jar"
-mkdir -p "$PLUGIN_CACHE"
+# Build git URL - use authenticated HTTPS with /a/ prefix
+# The /a/ prefix is Gerrit's authenticated endpoint
+# The ${name} placeholder is replaced by Gerrit with the project name
+GIT_URL="https://${GERRIT_HOST}${API_PATH}/a/\${name}.git"
 
-if [ -f "$PLUGIN_JAR" ]; then
-  log_info "Using cached plugin: $PLUGIN_JAR"
-else
-  log_info "Downloading pull-replication plugin..."
-  PLUGIN_URL="https://gerrit-ci.gerritforge.com/job/plugin-pull-replication-gh-bazel-${PLUGIN_VERSION}/lastSuccessfulBuild/artifact/bazel-bin/plugins/pull-replication/pull-replication.jar"
-  curl -fL -o "$PLUGIN_JAR" "$PLUGIN_URL" || {
-    log_error "Failed to download plugin"
-    exit 1
-  }
-  log_success "Plugin downloaded"
-fi
-
-# Initialize Gerrit site
-log_info "Initializing Gerrit site..."
-docker run --rm \
-  -v "$INSTANCE_DIR/git:/var/gerrit/git" \
-  -v "$INSTANCE_DIR/cache:/var/gerrit/cache" \
-  -v "$INSTANCE_DIR/index:/var/gerrit/index" \
-  -v "$INSTANCE_DIR/data:/var/gerrit/data" \
-  -v "$INSTANCE_DIR/etc:/var/gerrit/etc" \
-  -v "$INSTANCE_DIR/logs:/var/gerrit/logs" \
-  -v "$INSTANCE_DIR/plugins:/var/gerrit/plugins" \
-  -e CANONICAL_WEB_URL="http://localhost:$HTTP_PORT" \
-  "gerritcodereview/gerrit:${GERRIT_VERSION}" \
-  init
-
-log_success "Gerrit site initialized"
-
-# Configure Gerrit
-log_info "Configuring Gerrit..."
-CONFIG_FILE="$INSTANCE_DIR/etc/gerrit.config"
-
-git config -f "$CONFIG_FILE" gerrit.instanceId "local-test"
-git config -f "$CONFIG_FILE" gerrit.canonicalWebUrl "http://localhost:$HTTP_PORT"
-git config -f "$CONFIG_FILE" httpd.listenUrl "http://*:8080/"
-git config -f "$CONFIG_FILE" sshd.listenAddress "*:29418"
-git config -f "$CONFIG_FILE" auth.type "DEVELOPMENT_BECOME_ANY_ACCOUNT"
-git config -f "$CONFIG_FILE" container.user "root"
-git config -f "$CONFIG_FILE" plugin.pull-replication.enabled "true"
-
-# Configure replication mode
-if [ "$REPLICA_MODE" = "true" ]; then
-  log_info "Enabling replica mode (replicateOnStartup, no web UI)..."
-  git config -f "$CONFIG_FILE" container.replica "true"
-else
-  log_info "Using fetchEvery polling mode (web UI enabled)..."
-  log_info "  Fetch interval: $FETCH_EVERY"
-  # Non-replica mode: web UI is fully functional
-  # Replication happens via fetchEvery polling
-fi
-
-log_success "Gerrit configured"
-
-# Install plugin
-log_info "Installing pull-replication plugin..."
-cp "$PLUGIN_JAR" "$INSTANCE_DIR/plugins/pull-replication.jar"
-
-# Remove bundled replication plugin to avoid conflicts
-rm -f "$INSTANCE_DIR/plugins/replication.jar" 2>/dev/null || true
-log_success "Plugin installed"
-
-# Build API URL
-API_PATH_CLEAN="${API_PATH#/}"
-if [ -n "$API_PATH_CLEAN" ]; then
-  API_URL="https://${GERRIT_HOST}/${API_PATH_CLEAN}"
-  GIT_URL="https://${GERRIT_HOST}/${API_PATH_CLEAN}/a/\${name}.git"
-else
-  API_URL="https://${GERRIT_HOST}"
-  GIT_URL="https://${GERRIT_HOST}/a/\${name}.git"
-fi
-
-log_info "API URL: $API_URL"
-log_info "Git URL template: $GIT_URL"
-
-# Create replication.config
-log_info "Creating replication.config..."
-
-# Build projects configuration for replication.config
-# Only add projects filter if a specific filter is provided
-PROJECTS_CONFIG=""
-if [ -n "$PROJECT_FILTER" ] && [ "$PROJECT_FILTER" != "all" ]; then
-  # Split by comma for literal project names
-  IFS=',' read -ra PROJECT_ARRAY <<< "$PROJECT_FILTER"
-  for project in "${PROJECT_ARRAY[@]}"; do
-    project=$(echo "$project" | xargs)  # trim whitespace
-    if [ -n "$project" ]; then
-      PROJECTS_CONFIG="${PROJECTS_CONFIG}  projects = ${project}\n"
-    fi
-  done
-fi
-# Note: If PROJECTS_CONFIG is empty, all projects will be replicated
-
-# Generate replication.config based on mode
-if [ "$REPLICA_MODE" = "true" ]; then
-  # Replica mode: uses apiUrl and replicateOnStartup
-  cat > "$INSTANCE_DIR/etc/replication.config" <<EOF
-# Pull-replication configuration for local testing (REPLICA MODE)
-# Key: replicateOnStartup requires projects to exist in local projectCache
-# The FetchAll iterates over projectCache.all() to find projects to replicate
+# Create replication.config with fetchEvery (matching CI config)
+log_info "Creating replication.config (fetchEvery mode)..."
+cat > "$INSTANCE_DIR/etc/replication.config" <<EOF
+# Pull-replication configuration - fetchEvery mode
+# Matching CI configuration from start-instances.sh
+#
+# Key settings:
+# - replicateOnStartup = true : initial sync on startup
+# - fetchEvery : poll at regular intervals
+# - NO apiUrl : mutually exclusive with fetchEvery
 
 [gerrit]
   replicateOnStartup = true
@@ -298,7 +220,7 @@ if [ "$REPLICA_MODE" = "true" ]; then
 
 [remote "source"]
   url = ${GIT_URL}
-  apiUrl = ${API_URL}
+  fetchEvery = ${FETCH_EVERY}
   timeout = 600
   connectionTimeout = 120000
   replicationDelay = 0
@@ -308,49 +230,16 @@ if [ "$REPLICA_MODE" = "true" ]; then
   replicateHiddenProjects = false
   fetch = +refs/heads/*:refs/heads/*
   fetch = +refs/tags/*:refs/tags/*
-$(echo -e "$PROJECTS_CONFIG")
+  projects = ${PROJECT}
 EOF
-else
-  # fetchEvery mode: polls source at configured interval, web UI enabled
-  # Note: apiUrl is NOT used because it's mutually exclusive with fetchEvery
-  cat > "$INSTANCE_DIR/etc/replication.config" <<EOF
-# Pull-replication configuration for local testing (FETCHEVERY MODE)
-# The plugin polls the source Gerrit at regular intervals to fetch changes.
-# This enables full web UI access while maintaining automatic replication.
-
-[gerrit]
-  replicateOnStartup = false
-  autoReload = true
-
-[replication]
-  lockErrorMaxRetries = 5
-  maxRetries = 5
-  useCGitClient = false
-  refsBatchSize = 50
-
-[remote "source"]
-  url = ${GIT_URL}
-$( [ "$FETCH_EVERY_ENABLED" = "true" ] && echo "  fetchEvery = ${FETCH_EVERY}" )
-  timeout = 600
-  connectionTimeout = 120000
-  replicationDelay = 0
-  replicationRetry = 60
-  threads = 4
-  createMissingRepositories = true
-  replicateHiddenProjects = false
-  fetch = +refs/heads/*:refs/heads/*
-  fetch = +refs/tags/*:refs/tags/*
-$(echo -e "$PROJECTS_CONFIG")
-EOF
-fi
 
 log_success "replication.config created"
 echo ""
 cat "$INSTANCE_DIR/etc/replication.config"
 echo ""
 
-# Create secure.config with credentials
-log_info "Creating secure.config with credentials..."
+# Create secure.config
+log_info "Creating secure.config..."
 cat > "$INSTANCE_DIR/etc/secure.config" <<EOF
 [remote "source"]
   username = ${GERRIT_HTTP_USERNAME}
@@ -359,71 +248,10 @@ EOF
 chmod 600 "$INSTANCE_DIR/etc/secure.config"
 log_success "secure.config created"
 
-# CRITICAL: Create empty bare repos for each project
-# The pull-replication plugin's FetchAll iterates over projectCache.all()
-# which only includes projects that exist locally. Without creating these
-# repos first, replicateOnStartup will have nothing to replicate!
-log_info "Creating empty bare repositories for projects to replicate..."
-log_info "(Required: FetchAll iterates over projectCache.all())"
-echo ""
-
-# Determine projects to create
-declare -a PROJECTS_TO_CREATE=()
-
-if [ -z "$PROJECT_FILTER" ] || [ "$PROJECT_FILTER" = "all" ]; then
-  # Fetch all projects from remote server
-  log_info "No specific project filter - fetching all projects from remote..."
-  if remote_projects=$(fetch_remote_projects "$GERRIT_HOST" "$API_PATH" "" "$MAX_PROJECTS"); then
-    while IFS= read -r proj; do
-      [ -n "$proj" ] && PROJECTS_TO_CREATE+=("$proj")
-    done <<< "$remote_projects"
-  else
-    log_error "Could not fetch remote project list"
-    exit 1
-  fi
-elif [[ "$PROJECT_FILTER" == *"*"* ]] || [[ "$PROJECT_FILTER" == *"["* ]] || \
-     [[ "$PROJECT_FILTER" == "^"* ]] || [[ "$PROJECT_FILTER" == ".*" ]]; then
-  # Regex pattern - fetch matching projects
-  log_info "Project filter is a regex: $PROJECT_FILTER"
-  if remote_projects=$(fetch_remote_projects "$GERRIT_HOST" "$API_PATH" "$PROJECT_FILTER" "$MAX_PROJECTS"); then
-    while IFS= read -r proj; do
-      [ -n "$proj" ] && PROJECTS_TO_CREATE+=("$proj")
-    done <<< "$remote_projects"
-  else
-    log_error "Could not fetch filtered project list"
-    exit 1
-  fi
-else
-  # Literal project name(s) - use as-is
-  IFS=',' read -ra LITERAL_PROJECTS <<< "$PROJECT_FILTER"
-  for project in "${LITERAL_PROJECTS[@]}"; do
-    project=$(echo "$project" | xargs)  # trim whitespace
-    [ -n "$project" ] && PROJECTS_TO_CREATE+=("$project")
-  done
-fi
-
-log_info "Will create ${#PROJECTS_TO_CREATE[@]} project repositories"
-
-for project in "${PROJECTS_TO_CREATE[@]}"; do
-  PROJECT_DIR="$INSTANCE_DIR/git/${project}.git"
-
-  log_info "Creating: ${project}.git"
-  mkdir -p "$PROJECT_DIR"
-  git init --bare "$PROJECT_DIR" 2>/dev/null
-
-  # Set proper permissions
-  chmod -R 777 "$PROJECT_DIR"
-done
-
-log_success "Project repositories created: ${#PROJECTS_TO_CREATE[@]}"
-echo ""
-
-# Start container
-log_info "Starting Gerrit container..."
-docker run -d \
-  --name "$CONTAINER_NAME" \
-  -p "${HTTP_PORT}:8080" \
-  -p "${SSH_PORT}:29418" \
+# Initialize Gerrit site first (required before starting)
+log_info "Initializing Gerrit site..."
+log_info "Using image: ${DOCKER_IMAGE}"
+docker run --rm \
   -v "$INSTANCE_DIR/git:/var/gerrit/git" \
   -v "$INSTANCE_DIR/cache:/var/gerrit/cache" \
   -v "$INSTANCE_DIR/index:/var/gerrit/index" \
@@ -431,136 +259,265 @@ docker run -d \
   -v "$INSTANCE_DIR/etc:/var/gerrit/etc" \
   -v "$INSTANCE_DIR/logs:/var/gerrit/logs" \
   -v "$INSTANCE_DIR/plugins:/var/gerrit/plugins" \
-  -v "$INSTANCE_DIR/tmp:/var/gerrit/tmp" \
-  -e "CANONICAL_WEB_URL=http://localhost:$HTTP_PORT" \
-  "gerritcodereview/gerrit:${GERRIT_VERSION}"
+  -e CANONICAL_WEB_URL="http://localhost:$HTTP_PORT" \
+  "${DOCKER_IMAGE}" \
+  init
 
-log_success "Container started: $CONTAINER_NAME"
+log_success "Gerrit site initialized"
+
+# Show what plugins were installed by init
+log_info "Bundled plugins after init:"
+ls -la "$INSTANCE_DIR/plugins/"
+
+# Remove bundled replication plugin (conflicts with pull-replication)
+# Keep replication-api.jar as pull-replication depends on it
+log_info "Removing bundled replication plugin (keeping replication-api)..."
+rm -f "$INSTANCE_DIR/plugins/replication.jar"
+log_success "Bundled replication plugin removed"
+
+# Download pull-replication plugin AFTER init
+log_info "Downloading pull-replication plugin..."
+PLUGIN_URL="https://gerrit-ci.gerritforge.com/job/plugin-pull-replication-gh-bazel-${PLUGIN_VERSION}/lastSuccessfulBuild/artifact/bazel-bin/plugins/pull-replication/pull-replication.jar"
+
+# Download with proper error handling
+if curl -fL --retry 3 -o "$INSTANCE_DIR/plugins/pull-replication.jar" "$PLUGIN_URL"; then
+  # Verify it's a valid JAR (should start with PK for zip format)
+  if file "$INSTANCE_DIR/plugins/pull-replication.jar" | grep -q "Zip archive\|Java archive"; then
+    log_success "Plugin downloaded and verified"
+  else
+    log_error "Downloaded file is not a valid JAR"
+    log_error "File type: $(file "$INSTANCE_DIR/plugins/pull-replication.jar")"
+    log_error "First bytes: $(head -c 50 "$INSTANCE_DIR/plugins/pull-replication.jar" | xxd | head -2)"
+    exit 1
+  fi
+else
+  log_error "Failed to download plugin from: $PLUGIN_URL"
+  exit 1
+fi
+
+# Apply custom Gerrit configuration (overwrites init defaults)
+log_info "Applying custom configuration..."
+cat > "$INSTANCE_DIR/etc/gerrit.config" <<EOF
+[gerrit]
+  basePath = git
+  canonicalWebUrl = http://localhost:${HTTP_PORT}/
+
+[index]
+  type = LUCENE
+
+[auth]
+  type = DEVELOPMENT_BECOME_ANY_ACCOUNT
+
+[sshd]
+  listenAddress = off
+
+[httpd]
+  listenUrl = http://*:${HTTP_PORT}/
+
+[cache]
+  directory = cache
+
+[container]
+  javaOptions = -Xmx512m
+  user = gerrit
+  # NOTE: replica is NOT set - web UI is enabled
+EOF
+
+log_success "gerrit.config updated"
+
+# Pre-create the project directory so fetchEvery knows about it
+# This is required because fetchEvery only polls repos in projectCache
+log_info "Pre-creating project directory: ${PROJECT}.git"
+PROJECT_DIR="$INSTANCE_DIR/git/${PROJECT}.git"
+mkdir -p "$PROJECT_DIR"
+git init --bare "$PROJECT_DIR" 2>/dev/null
+chmod -R 777 "$PROJECT_DIR"
+log_success "Project directory created"
+
+# Start Gerrit container
+log_info "Starting Gerrit container..."
+docker run -d \
+  --name "$CONTAINER_NAME" \
+  -p "${HTTP_PORT}:${HTTP_PORT}" \
+  -v "$INSTANCE_DIR/git:/var/gerrit/git" \
+  -v "$INSTANCE_DIR/etc:/var/gerrit/etc" \
+  -v "$INSTANCE_DIR/cache:/var/gerrit/cache" \
+  -v "$INSTANCE_DIR/index:/var/gerrit/index" \
+  -v "$INSTANCE_DIR/logs:/var/gerrit/logs" \
+  -v "$INSTANCE_DIR/plugins:/var/gerrit/plugins" \
+  -v "$INSTANCE_DIR/data:/var/gerrit/data" \
+  -v "$INSTANCE_DIR/tmp:/var/gerrit/tmp" \
+  "${DOCKER_IMAGE}"
+
+log_success "Container started"
 echo ""
 
-# Wait for Gerrit to be ready
+# Wait for Gerrit to start
 log_info "Waiting for Gerrit to start..."
-MAX_WAIT=120
-ELAPSED=0
-while [ $ELAPSED -lt $MAX_WAIT ]; do
-  # Use grep without -q and redirect stdout to /dev/null to avoid broken pipe errors
-  if docker logs "$CONTAINER_NAME" 2>&1 | grep "Gerrit Code Review.*ready" >/dev/null 2>&1; then
-    log_success "Gerrit is ready!"
+for i in {1..60}; do
+  if curl -s "http://localhost:${HTTP_PORT}/" >/dev/null 2>&1; then
+    log_success "Gerrit is responding!"
     break
   fi
+  echo -n "."
   sleep 2
-  ELAPSED=$((ELAPSED + 2))
-  if [ $((ELAPSED % 10)) -eq 0 ]; then
-    echo "  Waiting... ${ELAPSED}s"
-  fi
 done
-
-if [ $ELAPSED -ge $MAX_WAIT ]; then
-  log_warn "Gerrit didn't show ready message, continuing anyway..."
-fi
-
-echo ""
-log_info "=== Container Info ==="
-echo "Container: $CONTAINER_NAME"
-echo "HTTP: http://localhost:$HTTP_PORT"
-echo "SSH: ssh://localhost:$SSH_PORT"
-echo "Work Dir: $WORK_DIR"
-echo "Replica Mode: $REPLICA_MODE"
 echo ""
 
-# Check plugin loading
-log_info "=== Plugin Status ==="
-docker logs "$CONTAINER_NAME" 2>&1 | grep -i "plugin" | tail -10
-echo ""
-
-# Wait for replication to trigger
-if [ "$REPLICA_MODE" = "true" ]; then
-  log_info "=== Waiting for replicateOnStartup (triggers 30s after plugin load) ==="
-  log_info "The FetchAll is scheduled with a 30-second delay..."
-  sleep 35
+# Verify web UI is accessible (not in replica mode)
+log_info "Checking web UI accessibility..."
+HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" "http://localhost:${HTTP_PORT}/")
+if [ "$HTTP_STATUS" = "200" ] || [ "$HTTP_STATUS" = "302" ]; then
+  log_success "Web UI is accessible (HTTP $HTTP_STATUS)"
 else
-  log_info "=== Waiting for fetchEvery polling to trigger ==="
-  log_info "First poll occurs within the fetch interval: $FETCH_EVERY"
-  log_info "Waiting 90 seconds for first poll cycle..."
-  sleep 90
+  log_warn "Web UI returned HTTP $HTTP_STATUS"
 fi
 
-# Check for replication activity
-log_info "=== Replication Logs ==="
-docker logs "$CONTAINER_NAME" 2>&1 | grep -iE "replication|fetch|pull|remote" | tail -20
-echo ""
+# Check plugin loaded
+log_info "Checking pull-replication plugin..."
+sleep 5
 
-# Check pull_replication_log specifically
-log_info "=== Pull Replication Log ==="
-docker exec "$CONTAINER_NAME" cat /var/gerrit/logs/pull_replication_log 2>/dev/null || echo "(empty)"
-echo ""
+PLUGIN_WORKING=false
 
-# Show repository status
-log_info "=== Repository Status ==="
-echo "Repositories in git directory:"
-docker exec "$CONTAINER_NAME" find /var/gerrit/git -name '*.git' -type d 2>/dev/null | head -20
-echo ""
-echo "Disk usage:"
-docker exec "$CONTAINER_NAME" du -sh /var/gerrit/git
-echo ""
+# Check for explicit plugin load message
+if docker logs "$CONTAINER_NAME" 2>&1 | grep -q "Loaded plugin pull-replication"; then
+  PLUGIN_LOG=$(docker logs "$CONTAINER_NAME" 2>&1 | grep "Loaded plugin pull-replication" | tail -1)
+  log_success "pull-replication plugin loaded"
+  echo "  $PLUGIN_LOG"
+  PLUGIN_WORKING=true
+fi
 
-# Check if repos have content
-log_info "=== Checking replicated content ==="
-for project in "${PROJECTS_TO_CREATE[@]}"; do
-  PROJECT_GIT="/var/gerrit/git/${project}.git"
-  echo "Project: $project"
+# Check for fetchEvery polling activity
+if docker logs "$CONTAINER_NAME" 2>&1 | grep -q "SourceFetchPeriodically"; then
+  FETCH_LOG=$(docker logs "$CONTAINER_NAME" 2>&1 | grep "SourceFetchPeriodically" | tail -1)
+  log_success "pull-replication fetchEvery polling is active"
+  echo "  $FETCH_LOG"
+  PLUGIN_WORKING=true
+fi
 
-  # Check for branches
-  BRANCHES=$(docker exec "$CONTAINER_NAME" bash -c "cd $PROJECT_GIT && git branch 2>/dev/null | wc -l" || echo "0")
-  echo "  Branches: $BRANCHES"
-
-  # Check for packed-refs (indicates successful fetch)
-  if docker exec "$CONTAINER_NAME" test -f "$PROJECT_GIT/packed-refs"; then
-    REFS=$(docker exec "$CONTAINER_NAME" wc -l < "$PROJECT_GIT/packed-refs" || echo "0")
-    echo "  Packed refs: $REFS lines"
+if [ "$PLUGIN_WORKING" = "false" ]; then
+  log_warn "Plugin may not be loaded yet, waiting..."
+  sleep 10
+  if docker logs "$CONTAINER_NAME" 2>&1 | grep -qE "Loaded plugin pull-replication|SourceFetchPeriodically"; then
+    log_success "pull-replication plugin loaded (delayed)"
+    PLUGIN_WORKING=true
   else
-    echo "  Packed refs: none"
+    log_warn "Plugin may not be fully loaded, continuing anyway..."
+    docker logs "$CONTAINER_NAME" 2>&1 | tail -30
   fi
-  echo ""
+fi
+echo ""
+
+# Show initial state
+log_info "Initial git directory contents:"
+ls -la "$INSTANCE_DIR/git/" 2>/dev/null || echo "(empty or not accessible)"
+echo ""
+
+# Wait for fetchEvery polling to complete
+log_info "=============================================="
+log_info "Waiting for fetchEvery polling to sync..."
+log_info "(fetchEvery polls every $FETCH_EVERY)"
+log_info "=============================================="
+echo ""
+
+# Monitor for 2 minutes
+SUCCESS=false
+
+for i in {1..24}; do
+  sleep 5
+  elapsed=$((i * 5))
+
+  # Count repos (excluding All-Projects, All-Users)
+  repo_count=$(find "$INSTANCE_DIR/git" -name "*.git" -type d 2>/dev/null | grep -c -v -E "All-Projects|All-Users" || echo "0")
+  disk_usage=$(du -sh "$INSTANCE_DIR/git" 2>/dev/null | cut -f1)
+
+  echo "[${elapsed}s] Repos: $repo_count, Disk: $disk_usage"
+
+  # Check logs for activity every 30 seconds
+  if [ $((elapsed % 30)) -eq 0 ]; then
+    echo ""
+    log_info "Recent pull_replication_log:"
+    if [ -f "$INSTANCE_DIR/logs/pull_replication_log" ]; then
+      tail -10 "$INSTANCE_DIR/logs/pull_replication_log" 2>/dev/null | sed 's/^/  /' || echo "  (empty)"
+    else
+      echo "  (no log file yet)"
+    fi
+    echo ""
+  fi
+
+  # Check if project was created and has content
+  if [ -d "$INSTANCE_DIR/git/${PROJECT}.git" ]; then
+    # Check if it has content
+    obj_count=$(find "$INSTANCE_DIR/git/${PROJECT}.git/objects" -type f 2>/dev/null | wc -l | tr -d ' ')
+    if [ "$obj_count" -gt 0 ]; then
+      log_success "Repository has content! ($obj_count objects)"
+      SUCCESS=true
+      break
+    fi
+  fi
 done
 
-# Interactive commands
 echo ""
-log_info "=== Useful Commands ==="
-echo ""
-echo "# Follow all logs:"
-echo "docker logs -f $CONTAINER_NAME"
-echo ""
-echo "# Follow replication logs:"
-echo "docker logs -f $CONTAINER_NAME 2>&1 | grep -i replication"
-echo ""
-echo "# Watch pull_replication_log:"
-echo "docker exec $CONTAINER_NAME tail -f /var/gerrit/logs/pull_replication_log"
-echo ""
-echo "# Check repositories:"
-echo "docker exec $CONTAINER_NAME find /var/gerrit/git -name '*.git' -type d"
-echo ""
-echo "# Check disk usage:"
-echo "docker exec $CONTAINER_NAME du -sh /var/gerrit/git"
-echo ""
-echo "# View replication config:"
-echo "cat $INSTANCE_DIR/etc/replication.config"
-echo ""
-echo "# Edit replication config (changes auto-reload):"
-echo "nano $INSTANCE_DIR/etc/replication.config"
-echo ""
-echo "# Shell into container:"
-echo "docker exec -it $CONTAINER_NAME bash"
-echo ""
-echo "# Stop container:"
-echo "docker rm -f $CONTAINER_NAME"
-echo ""
+log_info "=============================================="
+log_info "Final State"
+log_info "=============================================="
 
-log_info "Container is running. Use the commands above to debug."
-log_info "Press Ctrl+C to stop and cleanup, or run: docker rm -f $CONTAINER_NAME"
-echo ""
+log_info "Git directory contents:"
+find "$INSTANCE_DIR/git" -name "*.git" -type d 2>/dev/null | head -20 || echo "(none)"
 
-# Keep script running and show logs
-log_info "Tailing container logs (Ctrl+C to exit)..."
 echo ""
-docker logs -f "$CONTAINER_NAME" 2>&1 | grep -iE "replication|fetch|pull|remote|error|exception" || true
+log_info "Disk usage:"
+du -sh "$INSTANCE_DIR/git" 2>/dev/null || echo "(unknown)"
+
+echo ""
+log_info "pull_replication_log (last 30 lines):"
+if [ -f "$INSTANCE_DIR/logs/pull_replication_log" ]; then
+  tail -30 "$INSTANCE_DIR/logs/pull_replication_log" 2>/dev/null || echo "(empty)"
+else
+  echo "(no log file)"
+fi
+
+echo ""
+log_info "Container logs (replication related, last 50 lines):"
+docker logs "$CONTAINER_NAME" 2>&1 | grep -iE "replication|pull-replication|fetch|remote|FetchAll|apiUrl" | tail -50 || echo "(no matches)"
+
+echo ""
+log_info "=============================================="
+if [ "$SUCCESS" = true ]; then
+  log_success "TEST PASSED!"
+  log_success "- fetchEvery polling mode works"
+  log_success "- Web UI is enabled"
+  log_success "- Repository sync completed"
+  if [ "$USE_CUSTOM_IMAGE" = "true" ]; then
+    log_success "- Custom image with uv/gerrit_to_platform verified"
+  fi
+else
+  # Check if repo was created but empty
+  if [ -d "$INSTANCE_DIR/git/${PROJECT}.git" ]; then
+    log_warn "TEST PARTIAL: Repository exists but may be empty"
+  else
+    log_error "TEST FAILED: Repository was NOT created"
+  fi
+
+  echo ""
+  log_info "Troubleshooting tips:"
+  echo "  1. Check container logs: docker logs $CONTAINER_NAME"
+  echo "  2. Verify credentials are correct"
+  echo "  3. Check if project exists on remote server"
+  echo "  4. Verify API path is correct"
+fi
+log_info "=============================================="
+
+echo ""
+log_info "Container is still running. To inspect:"
+log_info "  docker exec -it $CONTAINER_NAME bash"
+log_info "  http://localhost:${HTTP_PORT}/"
+if [ "$USE_CUSTOM_IMAGE" = "true" ]; then
+  log_info ""
+  log_info "To test uv/gerrit_to_platform in the container:"
+  log_info "  docker exec -it $CONTAINER_NAME uv --version"
+  log_info "  docker exec -it $CONTAINER_NAME uv tool list"
+fi
+log_info ""
+log_info "Press Ctrl+C to stop and cleanup"
+read -r

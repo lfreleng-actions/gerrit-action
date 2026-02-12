@@ -27,7 +27,6 @@
 # - webhooks
 
 ARG GERRIT_VERSION=3.13.1-ubuntu24
-ARG UV_VERSION=0.10.2
 FROM gerritcodereview/gerrit:${GERRIT_VERSION}
 
 LABEL org.opencontainers.image.title="Gerrit Extended"
@@ -50,14 +49,28 @@ RUN set -eux; \
     apt-get clean; \
     rm -rf /var/lib/apt/lists/*
 
-# Install uv system-wide with version pinning for reproducibility
-# Note: UV_INSTALL_DIR specifies where uv and uvx binaries are placed directly
-# Using versioned installer URL for security (avoid unverified latest script)
-ARG UV_VERSION
+# --- uv: direct binary install with SHA-256 integrity verification ----------
+# Version and checksum are kept in sync by the pre-commit hook
+# scripts/check-uv-checksum.sh (which also runs in CI).
+#
+# To update manually:
+#   1. Set UV_VERSION to the desired release tag
+#   2. Fetch the checksum:
+#        curl -sSfL https://github.com/astral-sh/uv/releases/download/<VERSION>/uv-x86_64-unknown-linux-gnu.tar.gz.sha256
+#   3. Paste the hex digest into UV_CHECKSUM below
+#
+# renovate: datasource=github-releases depName=astral-sh/uv
+ARG UV_VERSION=0.10.4
+ARG UV_CHECKSUM=6b52a47358deea1c5e173278bf46b2b489747a59ae31f2a4362ed5c6c1c269f7
+
 RUN set -eux; \
-    curl -LsSf "https://astral.sh/uv/${UV_VERSION}/install.sh" -o /tmp/uv-install.sh; \
-    env UV_INSTALL_DIR=/usr/local/bin sh /tmp/uv-install.sh; \
-    rm /tmp/uv-install.sh; \
+    UV_TARBALL="uv-x86_64-unknown-linux-gnu.tar.gz"; \
+    curl -LsSf \
+      "https://github.com/astral-sh/uv/releases/download/${UV_VERSION}/${UV_TARBALL}" \
+      -o "/tmp/${UV_TARBALL}"; \
+    echo "${UV_CHECKSUM}  /tmp/${UV_TARBALL}" | sha256sum -c -; \
+    tar -xzf "/tmp/${UV_TARBALL}" -C /usr/local/bin --strip-components=1; \
+    rm "/tmp/${UV_TARBALL}"; \
     uv --version
 ENV PATH="/usr/local/bin:${PATH}"
 
@@ -66,9 +79,21 @@ ENV UV_TOOL_DIR=/opt/uv-tools
 ENV UV_TOOL_BIN_DIR=/opt/uv-tools/bin
 RUN mkdir -p /opt/uv-tools/bin && chmod 755 /opt/uv-tools
 
-# Install gerrit-to-platform using uv tool
-# This installs executables: change-merged, comment-added, patchset-created
-RUN /usr/local/bin/uv tool install gerrit-to-platform
+# --- gerrit-to-platform: version-pinned install from requirements file -------
+# The pinned version (with hash) lives in docker/requirements.txt and is
+# kept up-to-date automatically by Dependabot (pip ecosystem, directory: /docker).
+COPY docker/requirements.txt /tmp/docker-requirements.txt
+
+RUN set -eux; \
+    G2P_VERSION=$(grep -oP 'gerrit-to-platform==\K[0-9][0-9.]*' /tmp/docker-requirements.txt); \
+    /usr/local/bin/uv tool install "gerrit-to-platform==${G2P_VERSION}"; \
+    rm /tmp/docker-requirements.txt
+
+# Create a Python virtual environment for the Gerrit API scripts
+# and install required dependencies
+ENV GERRIT_SCRIPTS_VENV=/opt/gerrit-scripts
+RUN python3 -m venv $GERRIT_SCRIPTS_VENV && \
+    $GERRIT_SCRIPTS_VENV/bin/pip install --no-cache-dir requests
 
 # Make tool binaries accessible system-wide
 RUN ln -sf /opt/uv-tools/bin/change-merged /usr/local/bin/change-merged && \
@@ -82,13 +107,14 @@ RUN set -eux; \
     uvx --version && \
     uv tool list && \
     change-merged --help | head -5 || echo "Note: change-merged requires args" && \
+    $GERRIT_SCRIPTS_VENV/bin/python -c "import requests; print('requests:', requests.__version__)" && \
     echo "=== Root verification complete ==="
 
 # Switch back to gerrit user for normal operation
 USER gerrit
 
-# Set PATH to include uv tools for gerrit user
-ENV PATH="/opt/uv-tools/bin:/usr/local/bin:${PATH}"
+# Set PATH to include uv tools and scripts venv for gerrit user
+ENV PATH="/opt/gerrit-scripts/bin:/opt/uv-tools/bin:/usr/local/bin:${PATH}"
 
 # Verify tools are accessible as gerrit user
 RUN set -eux; \

@@ -44,7 +44,6 @@ RUN set -eux; \
         curl \
         ca-certificates \
         python3 \
-        python3-pip \
         python3-venv; \
     apt-get clean; \
     rm -rf /var/lib/apt/lists/*
@@ -79,36 +78,55 @@ ENV UV_TOOL_DIR=/opt/uv-tools
 ENV UV_TOOL_BIN_DIR=/opt/uv-tools/bin
 RUN mkdir -p /opt/uv-tools/bin && chmod 755 /opt/uv-tools
 
-# --- gerrit-to-platform: hash-verified install from requirements file --------
-# The pinned version (with hash) lives in docker/requirements.txt and is
-# kept up-to-date automatically by Dependabot (pip ecosystem, directory: /docker).
+# --- gerrit-to-platform: top-level hash-pinned install from requirements -----
+# The pinned gerrit-to-platform version (with hash) lives in
+# docker/requirements.txt and is kept up-to-date automatically by Dependabot
+# (pip ecosystem, directory: /docker).
+#
+# Installed via uv into an isolated venv to avoid PEP 668
+# "externally managed environment" errors on Ubuntu 24.04+.
+#
+# Note: uv verifies hashes by default for any entry that includes a --hash
+# line. We intentionally omit --require-hashes here, so only the explicitly
+# pinned top-level package is hash-verified; transitive dependencies are not
+# fully hash-locked, which matches Dependabot's single-package pin workflow.
+ENV GERRIT_TOOLS_VENV=/opt/gerrit-tools
 COPY docker/requirements.txt /tmp/docker-requirements.txt
 
 RUN set -eux; \
-    python3 -m pip install --no-cache-dir --require-hashes \
+    uv venv "$GERRIT_TOOLS_VENV"; \
+    uv pip install --no-cache \
+        --python "$GERRIT_TOOLS_VENV/bin/python" \
         -r /tmp/docker-requirements.txt; \
     rm /tmp/docker-requirements.txt
 
-# Create a Python virtual environment for the Gerrit API scripts
-# and install required dependencies
+# --- Gerrit API scripts venv: hash-pinned requests + transitive deps ---------
+# The full lock file lives in docker/requirements-scripts.txt and is
+# kept up-to-date automatically by Dependabot (pip ecosystem, directory: /docker).
 ENV GERRIT_SCRIPTS_VENV=/opt/gerrit-scripts
-RUN python3 -m venv $GERRIT_SCRIPTS_VENV && \
-    $GERRIT_SCRIPTS_VENV/bin/pip install --no-cache-dir requests
+COPY docker/requirements-scripts.txt /tmp/docker-requirements-scripts.txt
+
+RUN set -eux; \
+    uv venv "$GERRIT_SCRIPTS_VENV"; \
+    uv pip install --no-cache \
+        --python "$GERRIT_SCRIPTS_VENV/bin/python" \
+        -r /tmp/docker-requirements-scripts.txt; \
+    rm /tmp/docker-requirements-scripts.txt
 
 # Verify installations work as root
 RUN set -eux; \
     echo "=== Verifying as root ===" && \
     uv --version && \
     uvx --version && \
-    change-merged --help | head -5 || echo "Note: change-merged requires args" && \
-    $GERRIT_SCRIPTS_VENV/bin/python -c "import requests; print('requests:', requests.__version__)" && \
+    "$GERRIT_TOOLS_VENV/bin/change-merged" --help > /dev/null && \
+    "$GERRIT_SCRIPTS_VENV/bin/python" -c "import requests; print('requests:', requests.__version__)" && \
     echo "=== Root verification complete ==="
 
 # Switch back to gerrit user for normal operation
 USER gerrit
 
 # Set PATH to include uv tools and scripts venv for gerrit user
-ENV PATH="/opt/gerrit-scripts/bin:/opt/uv-tools/bin:/usr/local/bin:${PATH}"
+ENV PATH="$GERRIT_TOOLS_VENV/bin:$GERRIT_SCRIPTS_VENV/bin:/opt/uv-tools/bin:/usr/local/bin:${PATH}"
 
 # Verify tools are accessible as gerrit user
 RUN set -eux; \

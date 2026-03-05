@@ -8,8 +8,9 @@
 from __future__ import annotations
 
 import json
+import types
 from typing import Any, cast
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
 import pytest
 
@@ -77,6 +78,13 @@ def make_gerrit_response(data: Any) -> str:
     return prefix + json.dumps(data)
 
 
+class MockPreparedRequest:
+    """Mock requests.PreparedRequest attached to responses."""
+
+    def __init__(self, headers: dict[str, str] | None = None) -> None:
+        self.headers: dict[str, str] = headers or {}
+
+
 class MockResponse:
     """Mock requests.Response for testing."""
 
@@ -96,6 +104,8 @@ class MockResponse:
         self.headers: dict[str, str] = headers or {"content-type": "application/json"}
         self.url = url
         self.history: list = history if history is not None else []
+        # Mock the PreparedRequest that requests attaches to every Response
+        self.request = MockPreparedRequest()
 
     @property
     def text(self) -> str:
@@ -120,9 +130,12 @@ class MockCookieJar:
         self._cookies = []
         if cookies:
             for name, value in cookies:
-                cookie = MagicMock()
-                cookie.name = name
-                cookie.value = value
+                cookie = types.SimpleNamespace(
+                    name=name,
+                    value=value,
+                    domain="localhost.local",
+                    path="/",
+                )
                 self._cookies.append(cookie)
 
     def __iter__(self):
@@ -130,6 +143,39 @@ class MockCookieJar:
 
     def __len__(self):
         return len(self._cookies)
+
+    def set(self, name, value, **kwargs):
+        """Set a cookie in the jar."""
+        cookie = types.SimpleNamespace(
+            name=name,
+            value=value,
+            domain=kwargs.get("domain", ""),
+            path=kwargs.get("path", "/"),
+        )
+        self._cookies.append(cookie)
+
+    def set_cookie(self, cookie):
+        """Add an ``http.cookiejar.Cookie`` (or duck-typed object) to the jar."""
+        self._cookies.append(cookie)
+
+    def clear(self, domain="", path="/", name=""):
+        """Remove cookies matching the given domain/path/name.
+
+        Raises ``KeyError`` when no matching cookie is found, which
+        mirrors the behaviour of ``http.cookiejar.CookieJar.clear``.
+        """
+        before = len(self._cookies)
+        self._cookies = [
+            c
+            for c in self._cookies
+            if not (
+                getattr(c, "name", "") == name
+                and getattr(c, "domain", "") == domain
+                and getattr(c, "path", "/") == path
+            )
+        ]
+        if len(self._cookies) == before:
+            raise KeyError(f"No cookie: {name!r} for domain={domain!r} path={path!r}")
 
 
 class MockSession:
@@ -147,6 +193,13 @@ class MockSession:
     def set_cookies(self, cookies):
         """Set cookies on the mock session."""
         self.cookies = MockCookieJar(cookies)
+
+    def prepare_request(self, req):
+        """Mock prepare_request — returns a PreparedRequest with cookie header."""
+        cookie_parts = [f"{c.name}={c.value}" for c in self.cookies]
+        cookie_header = "; ".join(cookie_parts) if cookie_parts else ""
+        headers = {"Cookie": cookie_header} if cookie_header else {}
+        return MockPreparedRequest(headers)
 
     def add_response(self, method, url_pattern, response):
         """Add a mock response for a specific method and URL pattern."""
@@ -818,6 +871,151 @@ class TestGerritDevClientAuthentication:
 
         assert len(posted_urls) == 1
         assert posted_urls[0] == "http://localhost:8080/r/login/"
+
+
+class TestVerifyAuthOrFixCookies:
+    """Tests for _verify_auth_or_fix_cookies cookie verification/fix-up."""
+
+    def test_cookie_transmitted_no_fixup_needed(
+        self, mock_requests: MockSession
+    ) -> None:
+        """When the cookie IS in the prepared header, return immediately."""
+        # Setup: login succeeds normally (cookies always in prepared header)
+        mock_requests.add_response(
+            "GET",
+            "/login/",
+            MockResponse(status_code=302),
+        )
+        mock_requests.set_cookies(
+            [
+                ("GerritAccount", "session-cookie"),
+                ("XSRF_TOKEN", "xsrf-token"),
+            ]
+        )
+
+        client = GerritDevClient("http://localhost:8080")
+        result = client.become_account(1000000)
+
+        assert result is True
+        # Cookies should be untouched (still have localhost.local domain)
+        domains = [c.domain for c in client.session.cookies]
+        assert all("localhost" in d for d in domains)
+
+    def test_cookie_not_transmitted_triggers_fixup(
+        self, mock_requests: MockSession
+    ) -> None:
+        """When cookie exists but is NOT in prepared header, apply fixup."""
+        mock_requests.add_response(
+            "GET",
+            "/login/",
+            MockResponse(status_code=302),
+        )
+        mock_requests.set_cookies(
+            [
+                ("GerritAccount", "session-cookie"),
+                ("XSRF_TOKEN", "xsrf-token"),
+            ]
+        )
+
+        # Override prepare_request to simulate the localhost bug:
+        # first call returns empty Cookie header (bug), subsequent calls
+        # return the correct header (after fix-up).
+        call_count = 0
+        original_prepare = mock_requests.prepare_request
+
+        def broken_then_fixed_prepare(req):
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                # First call: simulate cookie NOT being transmitted
+                return MockPreparedRequest(headers={})
+            return original_prepare(req)
+
+        mock_requests.prepare_request = broken_then_fixed_prepare  # type: ignore[method-assign]
+
+        # Also need accounts/self for the post-fixup verification
+        mock_requests.add_response(
+            "GET",
+            "/a/accounts/self",
+            MockResponse(json_data={"_account_id": 1000000}),
+        )
+
+        client = GerritDevClient("http://localhost:8080")
+        result = client.become_account(1000000)
+
+        assert result is True
+        # Verify fixup replaced cookies (at least one with empty domain)
+        domains = [getattr(c, "domain", "") for c in client.session.cookies]
+        assert any(d == "" for d in domains)
+
+    def test_cookie_fixup_fails_raises_auth_error(
+        self, mock_requests: MockSession
+    ) -> None:
+        """When cookie cannot be fixed, raise GerritAuthError."""
+        mock_requests.add_response(
+            "GET",
+            "/login/",
+            MockResponse(status_code=302),
+        )
+        mock_requests.set_cookies(
+            [
+                ("GerritAccount", "session-cookie"),
+                ("XSRF_TOKEN", "xsrf-token"),
+            ]
+        )
+
+        # prepare_request always returns empty Cookie header — unfixable
+        def always_broken_prepare(req):
+            return MockPreparedRequest(headers={})
+
+        mock_requests.prepare_request = always_broken_prepare  # type: ignore[method-assign]
+
+        client = GerritDevClient("http://localhost:8080")
+        with pytest.raises(GerritAuthError, match="not being transmitted"):
+            client.become_account(1000000)
+
+    def test_cookie_fixup_removes_originals(self, mock_requests: MockSession) -> None:
+        """Fixup should remove original localhost cookies, not just add new ones."""
+        mock_requests.add_response(
+            "GET",
+            "/login/",
+            MockResponse(status_code=302),
+        )
+        mock_requests.set_cookies(
+            [
+                ("GerritAccount", "session-cookie"),
+                ("XSRF_TOKEN", "xsrf-token"),
+            ]
+        )
+
+        call_count = 0
+        original_prepare = mock_requests.prepare_request
+
+        def broken_then_fixed_prepare(req):
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                return MockPreparedRequest(headers={})
+            return original_prepare(req)
+
+        mock_requests.prepare_request = broken_then_fixed_prepare  # type: ignore[method-assign]
+
+        mock_requests.add_response(
+            "GET",
+            "/a/accounts/self",
+            MockResponse(json_data={"_account_id": 1000000}),
+        )
+
+        client = GerritDevClient("http://localhost:8080")
+        client.become_account(1000000)
+
+        # After fix-up, no cookie should still have a localhost domain
+        for cookie in client.session.cookies:
+            domain = getattr(cookie, "domain", "")
+            if domain:
+                assert "localhost" not in str(domain), (
+                    f"Cookie {cookie.name!r} still has localhost domain after fix-up"
+                )
 
 
 class TestGerritDevClientAPIRequests:

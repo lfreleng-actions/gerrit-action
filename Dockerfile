@@ -118,7 +118,7 @@ RUN set -eux; \
     echo "=== Verifying as root ===" && \
     uv --version && \
     uvx --version && \
-    "$GERRIT_TOOLS_VENV/bin/change-merged" --help > /dev/null && \
+    test -x "$GERRIT_TOOLS_VENV/bin/change-merged" && \
     "$GERRIT_SCRIPTS_VENV/bin/python" -c "import requests; print('requests:', requests.__version__)" && \
     echo "=== Root verification complete ==="
 

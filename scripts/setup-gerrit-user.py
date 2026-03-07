@@ -51,6 +51,7 @@ import logging
 import os
 import re
 import sys
+import time
 from pathlib import Path
 from typing import Any
 
@@ -387,36 +388,80 @@ def run_loop_instances(
         gerrit_url = f"http://localhost:{http_port}{effective_api_path}"
         logger.info(f"  Gerrit URL: {gerrit_url}")
 
-        # Run the setup
-        try:
-            account = run_local(
-                url=gerrit_url,
-                username=username,
-                ssh_keys=ssh_keys,
-                name=name,
-                email=email,
-                add_to_admins=add_to_admins,
-            )
+        # Run the setup with retries — the Gerrit container may still be
+        # initialising its auth subsystem even though the health-check
+        # (which hits a public endpoint) already passed.
+        max_attempts = 3
+        retry_delay = 3  # seconds
+        last_error: Exception | None = None
 
-            if output_json:
-                print(json.dumps(account, indent=2))
-            else:
-                logger.info(f"  SSH keys configured for {username} ✅")
+        for attempt in range(1, max_attempts + 1):
+            try:
+                account = run_local(
+                    url=gerrit_url,
+                    username=username,
+                    ssh_keys=ssh_keys,
+                    name=name,
+                    email=email,
+                    add_to_admins=add_to_admins,
+                )
 
-            success_count += 1
-            summary_rows.append((slug, "✅ Configured"))
+                if output_json:
+                    print(json.dumps(account, indent=2))
+                else:
+                    logger.info(f"  SSH keys configured for {username} ✅")
 
-        except GerritAPIError as e:
-            logger.warning(
-                f"Failed to configure SSH keys for {username} on {slug}: {e}"
-            )
-            failure_count += 1
-            summary_rows.append((slug, "❌ Failed"))
+                success_count += 1
+                summary_rows.append((slug, "✅ Configured"))
+                last_error = None
+                break
 
-        except Exception as e:
-            logger.warning(
-                f"Unexpected error configuring SSH keys for {username} on {slug}: {e}"
-            )
+            except GerritAPIError as e:
+                last_error = e
+                # Only retry on transient failures: network errors
+                # (no status code) or specific HTTP codes.
+                _transient = {429, 500, 502, 503, 504}
+                is_transient = e.status_code is None or e.status_code in _transient
+                if is_transient and attempt < max_attempts:
+                    logger.warning(
+                        "Attempt %d/%d failed for %s on %s: %s (retrying in %ds…)",
+                        attempt,
+                        max_attempts,
+                        username,
+                        slug,
+                        e,
+                        retry_delay,
+                    )
+                    time.sleep(retry_delay)
+                    # Increase delay for next attempt
+                    retry_delay *= 2
+                else:
+                    logger.warning(
+                        "Failed to configure SSH keys for %s on %s "
+                        "after %d attempt(s): %s",
+                        username,
+                        slug,
+                        attempt,
+                        e,
+                    )
+                    if e.status_code is not None:
+                        logger.warning("  HTTP status: %s", e.status_code)
+                    if e.response_text:
+                        logger.debug("  Response body: %s", e.response_text)
+                    logger.warning("  Gerrit URL was: %s", gerrit_url)
+                    break
+
+            except Exception as e:
+                last_error = e
+                logger.warning(
+                    "Unexpected error configuring SSH keys for %s on %s: %s",
+                    username,
+                    slug,
+                    e,
+                )
+                break
+
+        if last_error is not None:
             failure_count += 1
             summary_rows.append((slug, "❌ Failed"))
 

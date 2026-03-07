@@ -32,12 +32,13 @@ Usage:
 from __future__ import annotations
 
 import contextlib
+import http.cookiejar
 import json
 import logging
 import sys
 import time
 from typing import Any, cast
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlparse
 
 import requests
 from requests.adapters import HTTPAdapter
@@ -45,6 +46,21 @@ from urllib3.util.retry import Retry
 
 # Configure logging
 logger = logging.getLogger(__name__)
+
+
+def _cookie_names_from_header(cookie_header: str) -> set[str]:
+    """Parse cookie names from a ``Cookie`` header value.
+
+    Returns a set of cookie names (the part before ``=`` in each
+    ``name=value`` pair separated by ``; ``).
+    """
+    names: set[str] = set()
+    for pair in cookie_header.split(";"):
+        pair = pair.strip()
+        if "=" in pair:
+            names.add(pair.split("=", 1)[0])
+    return names
+
 
 # Gerrit API constants
 GERRIT_MAGIC_JSON_PREFIX = ")]}'\n"
@@ -233,6 +249,15 @@ class GerritDevClient:
         account by visiting /login/?account_id=<id>. This sets session cookies
         including the XSRF token needed for write operations.
 
+        After obtaining the session cookie, this method verifies that the
+        cookie would actually be transmitted by preparing (but not sending)
+        a request and inspecting the ``Cookie`` header.  Python's
+        ``http.cookiejar`` has known issues with ``localhost`` cookies
+        (they can be stored in the jar but never sent back), so the
+        verification step catches this and applies a domain workaround.
+        If the workaround is needed, ``accounts/self`` is called to
+        confirm the session is valid end-to-end.
+
         Args:
             account_id: The account ID to become (e.g., 1000000 for default admin)
 
@@ -266,8 +291,8 @@ class GerritDevClient:
                     f"  redirect [{i}]: HTTP {r.status_code} -> "
                     f"{r.headers.get('Location', '(no Location header)')}"
                 )
-        cookie_names = [c.name for c in self.session.cookies]
-        logger.debug(f"Session cookies after login: {cookie_names}")
+        cookie_details = [(c.name, c.domain, c.path) for c in self.session.cookies]
+        logger.debug(f"Session cookies after login: {cookie_details}")
 
         # Check for GerritAccount cookie
         has_account_cookie = any(
@@ -290,7 +315,185 @@ class GerritDevClient:
             f"XSRF token: {'present' if self._xsrf_token else 'missing'}"
         )
 
+        # --- Verify the cookie actually works ---
+        # Python's http.cookiejar can silently refuse to send cookies for
+        # "localhost" due to domain-matching rules.  Detect this by making
+        # a test request and checking whether the cookie was transmitted.
+        self._verify_auth_or_fix_cookies(account_id)
+
         return True
+
+    def _verify_auth_or_fix_cookies(self, account_id: int) -> None:
+        """Verify session cookies are sent and fix localhost cookie issues.
+
+        After ``become_account`` stores the session cookies, this method
+        prepares (but does not send) a request to ``accounts/self`` and
+        inspects the ``Cookie`` header to confirm that the session cookie
+        would actually be transmitted.  If the header looks good, the
+        method returns immediately **without** making a network call
+        (header-only verification).
+
+        If the cookie exists in the jar but is **not** present in the
+        prepared header (a known ``http.cookiejar`` problem with
+        ``localhost`` domains), this method removes the original
+        localhost-scoped cookies and re-adds them with an empty domain
+        so that ``requests`` will attach them unconditionally.  After
+        the fix-up, ``accounts/self`` is called to confirm the session
+        is valid end-to-end.
+
+        Raises
+        ------
+        GerritAuthError
+            If the cookie cannot be made to work after the fix-up.
+        """
+        verify_url = self._make_url("accounts/self")
+
+        # Prepare (but don't send) the request to inspect headers
+        req = requests.Request("GET", verify_url, headers=self._get_headers())
+        prepared = self.session.prepare_request(req)
+        cookie_header = prepared.headers.get("Cookie", "")
+
+        if "GerritAccount" in _cookie_names_from_header(cookie_header):
+            logger.debug("Auth verification: cookie is transmitted ✅")
+            return
+
+        # Guard: only apply the localhost workaround when the base URL
+        # actually targets a loopback address.  This prevents cookies
+        # from being broadened to domain="" when talking to a real host.
+        parsed = urlparse(self.base_url)
+        hostname = (parsed.hostname or "").lower()
+        is_localhost = hostname in ("localhost", "127.0.0.1", "::1")
+
+        if not is_localhost:
+            raise GerritAuthError(
+                f"Auth cookie exists in jar but is not being transmitted for host "
+                f"'{hostname}'. Localhost workaround is disabled; authenticated "
+                f"session cannot be established."
+            )
+
+        # Cookie exists in jar but won't be sent — likely a localhost
+        # domain-matching issue.
+        logger.warning(
+            "Auth cookie exists in jar but is not being transmitted "
+            "(localhost cookie-jar bug). Applying workaround…"
+        )
+        logger.debug(
+            "Cookie domains in jar: %s",
+            [(c.name, c.domain, c.path) for c in self.session.cookies],
+        )
+
+        # Workaround: replace each localhost-scoped cookie with one whose
+        # domain is empty so the jar sends it unconditionally.
+        # We clone all original attributes and only override the domain
+        # to avoid dropping flags like secure, expires, etc.
+        fixed: list[str] = []
+        originals: list[Any] = []
+        for cookie in list(self.session.cookies):
+            domain = getattr(cookie, "domain", "")
+            if domain and "localhost" in str(domain):
+                originals.append(cookie)
+                fixed.append(getattr(cookie, "name", ""))
+
+        # Remove originals, then re-add with empty domain
+        for cookie in originals:
+            c_name = getattr(cookie, "name", "")
+            c_domain = getattr(cookie, "domain", "")
+            c_path = getattr(cookie, "path", "/")
+
+            # Defensive: remove any pre-existing empty-domain cookie
+            # with the same name to avoid duplicates if run twice.
+            with contextlib.suppress(KeyError):
+                self.session.cookies.clear(domain="", path=c_path, name=c_name)
+            # Remove the original localhost-scoped cookie.
+            # cookiejar may store the domain in various forms, so
+            # wrap each clear() individually to tolerate KeyError.
+            with contextlib.suppress(KeyError):
+                self.session.cookies.clear(domain=c_domain, path=c_path, name=c_name)
+            # Also sweep any remaining cookies with the same name
+            # that still carry a localhost domain.
+            for remaining in list(self.session.cookies):
+                if getattr(remaining, "name", "") == c_name and "localhost" in str(
+                    getattr(remaining, "domain", "")
+                ):
+                    with contextlib.suppress(KeyError):
+                        self.session.cookies.clear(
+                            domain=getattr(remaining, "domain", ""),
+                            path=getattr(remaining, "path", "/"),
+                            name=c_name,
+                        )
+
+            # Re-add with domain="" while preserving all other attributes
+            # from the original cookie (secure, expires, rest/HttpOnly, …).
+            new_cookie = http.cookiejar.Cookie(
+                version=getattr(cookie, "version", 0),
+                name=c_name,
+                value=getattr(cookie, "value", "") or "",
+                port=getattr(cookie, "port", None),
+                port_specified=getattr(cookie, "port_specified", False),
+                domain="",
+                domain_specified=False,
+                domain_initial_dot=False,
+                path=c_path,
+                path_specified=getattr(cookie, "path_specified", True),
+                secure=getattr(cookie, "secure", False),
+                expires=getattr(cookie, "expires", None),
+                discard=getattr(cookie, "discard", True),
+                comment=getattr(cookie, "comment", None),
+                comment_url=getattr(cookie, "comment_url", None),
+                rest=getattr(cookie, "_rest", {}),
+            )
+            self.session.cookies.set_cookie(new_cookie)
+
+        if fixed:
+            logger.info(
+                "Fixed %d cookie(s) with localhost domain: %s",
+                len(fixed),
+                ", ".join(fixed),
+            )
+
+        # Re-extract XSRF token from the (possibly updated) cookie jar
+        self._xsrf_token = self._extract_xsrf_token()
+
+        # Verify the fix worked
+        req2 = requests.Request("GET", verify_url, headers=self._get_headers())
+        prepared2 = self.session.prepare_request(req2)
+        cookie_header2 = prepared2.headers.get("Cookie", "")
+
+        if "GerritAccount" not in _cookie_names_from_header(cookie_header2):
+            # Avoid logging raw cookie values; include only non-sensitive metadata.
+            cookie_names = [getattr(c, "name", "") for c in self.session.cookies]
+            raise GerritAuthError(
+                f"Auth cookie for account {account_id} is not being "
+                f"transmitted even after localhost workaround. "
+                f"Cookie jar contains {len(cookie_names)} cookie(s): "
+                f"{', '.join(cookie_names)}",
+            )
+
+        # Final confirmation: actually call the endpoint and verify
+        # we are authenticated as the expected account.
+        try:
+            account_info = self.get("accounts/self")
+            actual_id = account_info.get("_account_id")
+            if actual_id is None:
+                raise GerritAuthError(
+                    f"Auth cookie is transmitted but accounts/self response "
+                    f"does not contain _account_id for requested account {account_id}."
+                )
+            if int(actual_id) != int(account_id):
+                raise GerritAuthError(
+                    f"Auth cookie authenticated as unexpected account {actual_id} "
+                    f"instead of requested account {account_id}."
+                )
+            logger.debug(
+                "Auth verification: accounts/self returned ID %s (expected %s) ✅",
+                actual_id,
+                account_id,
+            )
+        except GerritAuthError as exc:
+            raise GerritAuthError(
+                f"Auth cookie is transmitted but Gerrit rejected it "
+                f"for account {account_id}: {exc}"
+            ) from exc
 
     def _create_first_account(self) -> int:
         """Create the first account on a fresh Gerrit instance.
@@ -461,6 +664,7 @@ class GerritDevClient:
         url = self._make_url(endpoint)
         headers = self._get_headers()
         headers.update(kwargs.pop("headers", {}))
+        logger.debug("GET %s", url)
 
         response = self.session.get(
             url,
@@ -469,6 +673,20 @@ class GerritDevClient:
             verify=self.verify_ssl,
             **kwargs,
         )
+
+        if not response.ok:
+            cookie_hdr = response.request.headers.get("Cookie", "")
+            cookie_info = (
+                ", ".join(sorted(_cookie_names_from_header(cookie_hdr)))
+                if cookie_hdr
+                else "(none)"
+            )
+            logger.debug(
+                "GET %s → HTTP %s  (cookie names: %s)",
+                url,
+                response.status_code,
+                cookie_info,
+            )
 
         return _parse_response(response)
 
@@ -494,6 +712,7 @@ class GerritDevClient:
         url = self._make_url(endpoint)
         headers = self._get_headers(content_type)
         headers.update(kwargs.pop("headers", {}))
+        logger.debug("PUT %s", url)
 
         body: str | None = json.dumps(data) if isinstance(data, dict) else data
 
@@ -505,6 +724,20 @@ class GerritDevClient:
             verify=self.verify_ssl,
             **kwargs,
         )
+
+        if not response.ok:
+            cookie_hdr = response.request.headers.get("Cookie", "")
+            cookie_info = (
+                ", ".join(sorted(_cookie_names_from_header(cookie_hdr)))
+                if cookie_hdr
+                else "(none)"
+            )
+            logger.debug(
+                "PUT %s → HTTP %s  (cookie names: %s)",
+                url,
+                response.status_code,
+                cookie_info,
+            )
 
         return _parse_response(response)
 
@@ -530,6 +763,7 @@ class GerritDevClient:
         url = self._make_url(endpoint)
         headers = self._get_headers(content_type)
         headers.update(kwargs.pop("headers", {}))
+        logger.debug("POST %s", url)
 
         body: str | None = json.dumps(data) if isinstance(data, dict) else data
 
@@ -541,6 +775,20 @@ class GerritDevClient:
             verify=self.verify_ssl,
             **kwargs,
         )
+
+        if not response.ok:
+            cookie_hdr = response.request.headers.get("Cookie", "")
+            cookie_info = (
+                ", ".join(sorted(_cookie_names_from_header(cookie_hdr)))
+                if cookie_hdr
+                else "(none)"
+            )
+            logger.debug(
+                "POST %s → HTTP %s  (cookie names: %s)",
+                url,
+                response.status_code,
+                cookie_info,
+            )
 
         return _parse_response(response)
 

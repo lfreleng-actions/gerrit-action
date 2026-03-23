@@ -375,7 +375,7 @@ runs:
     # Cache Docker layers for faster builds
     - name: 'Cache Docker layers'
       if: inputs.enable_cache == 'true'
-      uses: actions/cache@cdf6c1fa76f9f475f3d7449005a359c84ca0f306 # v5.0.3
+      uses: actions/cache@668228422ae6a00e4ad889ee87cd7109ec5666a7 # v5.0.4
       with:
         path: /tmp/.buildx-cache
         key: gerrit-docker-${{ runner.os }}-${{ inputs.gerrit_version }}${{ inputs.cache_key_suffix }}
@@ -387,7 +387,7 @@ runs:
     # Cache plugin downloads
     - name: 'Cache plugin downloads'
       if: inputs.enable_cache == 'true' && inputs.skip_plugin_install != 'true'
-      uses: actions/cache@cdf6c1fa76f9f475f3d7449005a359c84ca0f306 # v5.0.3
+      uses: actions/cache@668228422ae6a00e4ad889ee87cd7109ec5666a7 # v5.0.4
       with:
         path: /tmp/gerrit-plugins
         key: gerrit-plugins-${{ inputs.plugin_version }}${{ inputs.cache_key_suffix }}

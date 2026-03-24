@@ -235,6 +235,94 @@ inputs:
     required: false
     default: ''
 
+  # G2P (gerrit_to_platform) integration
+  g2p_enable:
+    description: |
+      Enable Gerrit to Platform (g2p) integration.
+      When true, configures the gerrit_to_platform plugin
+      inside the Gerrit container to dispatch GitHub Actions
+      workflows in response to Gerrit events.
+    required: false
+    default: 'false'
+  g2p_github_token:
+    description: |
+      GitHub Personal Access Token (Fine-Grained) for the
+      target organisation. Required permissions: Actions
+      (read/write), Contents (read), Metadata (read).
+    required: false
+    default: ''
+  g2p_github_owner:
+    description: |
+      GitHub organisation or user that owns the target
+      repositories. Required when g2p_enable is true.
+    required: false
+    default: ''
+  g2p_remote_name_style:
+    description: |
+      How Gerrit project names map to GitHub repository
+      names in the replication config.
+      Options: dash, underscore, slash
+    required: false
+    default: 'dash'
+  g2p_remote_url:
+    description: |
+      Override the GitHub remote URL pattern. Uses ${name}
+      as the repository name placeholder. Auto-generated
+      from g2p_github_owner when not provided.
+    required: false
+    default: ''
+  g2p_remote_auth_group:
+    description: |
+      Gerrit authGroup for the GitHub replication remote.
+      Must contain "github" for g2p platform detection.
+    required: false
+    default: 'GitHub Replication'
+  g2p_comment_mappings:
+    description: |
+      JSON object mapping comment keywords to workflow
+      search filters for the comment-added hook.
+    required: false
+    default: >-
+      {"recheck": "verify", "reverify": "verify",
+       "remerge": "merge"}
+  g2p_hooks:
+    description: |
+      Comma-separated list of Gerrit hooks to enable for
+      g2p. Available: patchset-created, comment-added,
+      change-merged
+    required: false
+    default: 'patchset-created,comment-added,change-merged'
+  g2p_validation_mode:
+    description: |
+      Controls behaviour when GitHub-side checks fail.
+      Options: error, warn, skip
+    required: false
+    default: 'warn'
+  g2p_validate_workflows:
+    description: |
+      When true, checks that the target GitHub org has
+      properly configured Gerrit workflows.
+    required: false
+    default: 'true'
+  g2p_validate_repos:
+    description: |
+      Comma-separated list of GitHub repositories to
+      check for Gerrit workflow configuration.
+    required: false
+    default: ''
+  g2p_ssh_private_key:
+    description: |
+      SSH private key for GitHub push-based replication.
+      When not provided, a keypair is auto-generated.
+    required: false
+    default: ''
+  g2p_github_known_hosts:
+    description: |
+      SSH known hosts entries for github.com.
+      Auto-fetched via ssh-keyscan when not provided.
+    required: false
+    default: ''
+
 outputs:
   container_ids:
     description: "JSON array of running container IDs"
@@ -264,6 +352,30 @@ outputs:
       which can be used by downstream steps for automation tasks.
       Format: {slug: {ssh_host_rsa_key: "...", ssh_host_ed25519_key: "...", ...}}
     value: ${{ steps.collect-outputs.outputs.ssh_host_keys }}
+  g2p_enabled:
+    description: "Whether G2P integration ran"
+    value: ${{ steps.configure-g2p.outputs.g2p_enabled }}
+  g2p_config_path:
+    description: "Path to generated INI inside container"
+    value: ${{ steps.configure-g2p.outputs.g2p_config_path }}
+  g2p_hooks_enabled:
+    description: "JSON array of hooks that got symlinks"
+    value: ${{ steps.configure-g2p.outputs.g2p_hooks_enabled }}
+  g2p_github_owner:
+    description: "Configured GitHub owner"
+    value: ${{ steps.configure-g2p.outputs.g2p_github_owner }}
+  g2p_remote_name_style:
+    description: "Configured repository name style"
+    value: ${{ steps.configure-g2p.outputs.g2p_remote_name_style }}
+  g2p_validation_results:
+    description: "JSON array of GitHub check results"
+    value: ${{ steps.configure-g2p.outputs.g2p_validation_results }}
+  g2p_token_provided:
+    description: "Whether a GitHub token was supplied"
+    value: ${{ steps.configure-g2p.outputs.g2p_token_provided }}
+  g2p_ssh_public_key:
+    description: "Public key for downstream deploy-key setup"
+    value: ${{ steps.configure-g2p.outputs.g2p_ssh_public_key }}
 
 runs:
   using: "composite"
@@ -537,6 +649,31 @@ runs:
       run: |
         # Verify replication success (Python)
         python3 "${{ github.action_path }}/scripts/verify-replication.py"
+
+    # Configure G2P (gerrit_to_platform)
+    - name: "Configure G2P integration"
+      if: inputs.g2p_enable == 'true'
+      id: configure-g2p
+      shell: bash
+      env:
+        G2P_ENABLE: ${{ inputs.g2p_enable }}
+        G2P_GITHUB_TOKEN: ${{ inputs.g2p_github_token }}
+        G2P_GITHUB_OWNER: ${{ inputs.g2p_github_owner }}
+        G2P_REMOTE_NAME_STYLE: ${{ inputs.g2p_remote_name_style }}
+        G2P_REMOTE_URL: ${{ inputs.g2p_remote_url }}
+        G2P_REMOTE_AUTH_GROUP: ${{ inputs.g2p_remote_auth_group }}
+        G2P_COMMENT_MAPPINGS: ${{ inputs.g2p_comment_mappings }}
+        G2P_HOOKS: ${{ inputs.g2p_hooks }}
+        G2P_VALIDATION_MODE: ${{ inputs.g2p_validation_mode }}
+        G2P_VALIDATE_WORKFLOWS: ${{ inputs.g2p_validate_workflows }}
+        G2P_VALIDATE_REPOS: ${{ inputs.g2p_validate_repos }}
+        G2P_SSH_PRIVATE_KEY: ${{ inputs.g2p_ssh_private_key }}
+        G2P_GITHUB_KNOWN_HOSTS: ${{ inputs.g2p_github_known_hosts }}
+        DEBUG: ${{ inputs.debug }}
+      run: |
+        # Configure gerrit_to_platform inside containers (Python)
+        "$GERRIT_SCRIPTS_VENV/bin/python" \
+          "${{ github.action_path }}/scripts/configure-g2p.py"
 
     # Collect outputs
     - name: "Collect outputs"

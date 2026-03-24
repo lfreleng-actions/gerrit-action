@@ -431,7 +431,7 @@ class TestConfigToContainerSetupFlow:
         assert result.config_path == G2P_INI_PATH
         assert result.hooks_enabled == list(VALID_HOOKS)
         assert result.ssh_public_key.startswith("ssh-ed25519")
-        assert result.replication_remote_appended is True
+        assert result.replication_remote_configured is True
 
         # Docker should have been called multiple times
         assert docker.exec_cmd.call_count > 0

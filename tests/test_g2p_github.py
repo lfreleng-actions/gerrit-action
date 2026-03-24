@@ -186,14 +186,19 @@ class TestGithubRequest:
         mock_urlopen.return_value = _make_urlopen_response(200, {})
         _github_request(f"{GITHUB_API_BASE}/user", "ghp_mytoken")
         req = mock_urlopen.call_args[0][0]
-        assert req.get_header("Authorization") == "Bearer ghp_mytoken"
+        # urllib.request.Request normalises header names: first letter
+        # capitalised, rest lowercased.  Access via .headers dict to
+        # make the stored casing explicit in the assertion.
+        assert req.headers["Authorization"] == "Bearer ghp_mytoken"
 
     @patch("g2p_github.urlopen")
     def test_sets_api_version_header(self, mock_urlopen: MagicMock) -> None:
         mock_urlopen.return_value = _make_urlopen_response(200, {})
         _github_request(f"{GITHUB_API_BASE}/user", "ghp_tok")
         req = mock_urlopen.call_args[0][0]
-        assert req.get_header("X-github-api-version") == "2022-11-28"
+        # urllib normalises "X-GitHub-Api-Version" to
+        # "X-github-api-version" internally.
+        assert req.headers["X-github-api-version"] == "2022-11-28"
 
     @patch("g2p_github.urlopen")
     def test_post_with_body(self, mock_urlopen: MagicMock) -> None:
@@ -207,7 +212,8 @@ class TestGithubRequest:
         )
         assert status == 200
         req = mock_urlopen.call_args[0][0]
-        assert req.get_header("Content-type") == "application/json"
+        # urllib normalises "Content-Type" to "Content-type".
+        assert req.headers["Content-type"] == "application/json"
         assert req.method == "POST"
 
 
@@ -344,6 +350,9 @@ class TestCheckOrgAccess:
         r = check_org_access("ghp_tok", "nonexistent")
         assert r.passed is False
         assert "404" in r.message
+        assert "user check returned HTTP 404" in r.message
+        assert r.details["org_status"] == 404
+        assert r.details["user_status"] == 404
 
     @patch("g2p_github.urlopen")
     def test_forbidden(self, mock_urlopen: MagicMock) -> None:
@@ -373,6 +382,9 @@ class TestCheckOrgAccess:
         r = check_org_access("ghp_tok", "flaky")
         assert r.passed is False
         assert "404" in r.message
+        assert "user check also failed" in r.message
+        assert r.details["org_status"] == 404
+        assert r.details["user_status"] == 0
 
 
 # ===================================================================
@@ -400,6 +412,33 @@ class TestCheckMagicRepo:
         assert r.passed is False
         assert r.severity == "warning"
         assert "not found" in r.message
+
+    @patch("g2p_github.urlopen")
+    def test_auth_error_401(self, mock_urlopen: MagicMock) -> None:
+        mock_urlopen.side_effect = _make_http_error(401, "Unauthorized")
+        r = check_magic_repo("ghp_tok", "onap")
+        assert r.passed is False
+        assert r.severity == "error"
+        assert "401" in r.message
+        assert "authentication or permission" in r.message
+
+    @patch("g2p_github.urlopen")
+    def test_auth_error_403(self, mock_urlopen: MagicMock) -> None:
+        mock_urlopen.side_effect = _make_http_error(403, "Forbidden")
+        r = check_magic_repo("ghp_tok", "onap")
+        assert r.passed is False
+        assert r.severity == "error"
+        assert "403" in r.message
+        assert "authentication or permission" in r.message
+
+    @patch("g2p_github.urlopen")
+    def test_unexpected_status(self, mock_urlopen: MagicMock) -> None:
+        mock_urlopen.side_effect = _make_http_error(500, "Server Error")
+        r = check_magic_repo("ghp_tok", "onap")
+        assert r.passed is False
+        assert r.severity == "warning"
+        assert "500" in r.message
+        assert "may not work" in r.message
 
     @patch("g2p_github.urlopen")
     def test_network_error(self, mock_urlopen: MagicMock) -> None:
@@ -574,7 +613,7 @@ class TestCheckWorkflows:
 
 
 class TestCheckReposExist:
-    """Tests for GraphQL repository existence check."""
+    """Tests for REST-based repository existence check."""
 
     def test_empty_repos_list(self) -> None:
         r = check_repos_exist("ghp_tok", "onap", [])
@@ -583,90 +622,35 @@ class TestCheckReposExist:
 
     @patch("g2p_github.urlopen")
     def test_all_repos_found(self, mock_urlopen: MagicMock) -> None:
-        mock_urlopen.return_value = _make_urlopen_response(
-            200,
-            {
-                "data": {
-                    "organization": {
-                        "repositories": {
-                            "nodes": [
-                                {"name": "ci-management", "isArchived": False},
-                                {"name": "releng-lftools", "isArchived": False},
-                            ]
-                        }
-                    }
-                }
-            },
-        )
+        mock_urlopen.side_effect = [
+            _make_urlopen_response(200, {"name": "ci-management", "archived": False}),
+            _make_urlopen_response(200, {"name": "releng-lftools", "archived": False}),
+        ]
         r = check_repos_exist("ghp_tok", "onap", ["ci-management", "releng-lftools"])
         assert r.passed is True
         assert "2" in r.message
 
     @patch("g2p_github.urlopen")
     def test_missing_repos(self, mock_urlopen: MagicMock) -> None:
-        mock_urlopen.return_value = _make_urlopen_response(
-            200,
-            {
-                "data": {
-                    "organization": {
-                        "repositories": {
-                            "nodes": [
-                                {"name": "ci-management", "isArchived": False},
-                            ]
-                        }
-                    }
-                }
-            },
-        )
+        mock_urlopen.side_effect = [
+            _make_urlopen_response(200, {"name": "ci-management", "archived": False}),
+            _make_http_error(404, "Not Found"),
+        ]
         r = check_repos_exist("ghp_tok", "onap", ["ci-management", "nonexistent"])
         assert r.passed is False
+        assert r.severity == "warning"
         assert "nonexistent" in r.message
         assert "nonexistent" in r.details["missing"]
 
     @patch("g2p_github.urlopen")
     def test_archived_repos_noted(self, mock_urlopen: MagicMock) -> None:
         mock_urlopen.return_value = _make_urlopen_response(
-            200,
-            {
-                "data": {
-                    "organization": {
-                        "repositories": {
-                            "nodes": [
-                                {"name": "old-repo", "isArchived": True},
-                            ]
-                        }
-                    }
-                }
-            },
+            200, {"name": "old-repo", "archived": True}
         )
         r = check_repos_exist("ghp_tok", "onap", ["old-repo"])
         assert r.passed is True
         assert "archived" in r.message.lower()
         assert "old-repo" in r.details["archived"]
-
-    @patch("g2p_github.urlopen")
-    def test_graphql_error(self, mock_urlopen: MagicMock) -> None:
-        mock_urlopen.return_value = _make_urlopen_response(
-            200,
-            {
-                "errors": [{"message": "Field not found"}],
-            },
-        )
-        r = check_repos_exist("ghp_tok", "onap", ["repo1"])
-        assert r.passed is False
-        assert "GraphQL errors" in r.message
-
-    @patch("g2p_github.urlopen")
-    def test_org_not_found_in_graphql(self, mock_urlopen: MagicMock) -> None:
-        mock_urlopen.return_value = _make_urlopen_response(
-            200,
-            {
-                "data": {"organization": None},
-            },
-        )
-        r = check_repos_exist("ghp_tok", "missing-org", ["repo1"])
-        assert r.passed is False
-        assert "not found" in r.message
 
     @patch("g2p_github.urlopen")
     def test_http_error(self, mock_urlopen: MagicMock) -> None:
@@ -682,28 +666,22 @@ class TestCheckReposExist:
         mock_urlopen.side_effect = URLError("Connection refused")
         r = check_repos_exist("ghp_tok", "onap", ["repo1"])
         assert r.passed is False
+        assert r.severity == "warning"
         assert "Network error" in r.message
 
     @patch("g2p_github.urlopen")
-    def test_null_nodes_handled(self, mock_urlopen: MagicMock) -> None:
-        """Handle null entries in the nodes array gracefully."""
-        mock_urlopen.return_value = _make_urlopen_response(
-            200,
-            {
-                "data": {
-                    "organization": {
-                        "repositories": {
-                            "nodes": [
-                                None,
-                                {"name": "repo1", "isArchived": False},
-                            ]
-                        }
-                    }
-                }
-            },
-        )
-        r = check_repos_exist("ghp_tok", "onap", ["repo1"])
-        assert r.passed is True
+    def test_multiple_repos_mixed(self, mock_urlopen: MagicMock) -> None:
+        """One found, one archived, one missing."""
+        mock_urlopen.side_effect = [
+            _make_urlopen_response(200, {"name": "repo1", "archived": False}),
+            _make_urlopen_response(200, {"name": "repo2", "archived": True}),
+            _make_http_error(404, "Not Found"),
+        ]
+        r = check_repos_exist("ghp_tok", "onap", ["repo1", "repo2", "repo3"])
+        assert r.passed is False
+        assert "repo3" in r.details["missing"]
+        assert "repo2" in r.details["archived"]
+        assert "repo1" in r.details["found"]
 
 
 # ===================================================================
@@ -840,21 +818,8 @@ class TestCheckGithubConfig:
             ),
             # ci-management merge
             _make_urlopen_response(200, {"workflows": []}),
-            # repos_exist GraphQL
-            _make_urlopen_response(
-                200,
-                {
-                    "data": {
-                        "organization": {
-                            "repositories": {
-                                "nodes": [
-                                    {"name": "ci-management", "isArchived": False}
-                                ]
-                            }
-                        }
-                    },
-                },
-            ),
+            # repos_exist REST (one call per repo)
+            _make_urlopen_response(200, {"name": "ci-management", "archived": False}),
         ]
         config = _minimal_config(validate_repos=["ci-management"])
         results = check_github_config(config)
@@ -924,7 +889,7 @@ class TestFormatCheckResults:
 
     def test_info_severity_not_annotated(self) -> None:
         results = [
-            G2PCheckResult("repos_exist", False, "Not found", "info"),
+            G2PCheckResult("some_check", False, "Info message", "info"),
         ]
         annotations, has_fatal = format_check_results(results, "error")
         assert annotations == []

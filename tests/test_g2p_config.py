@@ -585,6 +585,40 @@ class TestG2PConfigCheck:
             "g2p_remote_auth_group" in record.message for record in caplog.records
         )
 
+    def test_auth_group_without_github_is_warning(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """Non-empty auth group missing 'github' warns about detection."""
+        cfg = G2PConfig(
+            enabled=True,
+            github_owner="test",
+            github_token="ghp_valid",
+            remote_auth_group="Some Other Group",
+        )
+        with caplog.at_level(logging.WARNING):
+            errors = cfg.check()
+        assert not any("auth_group" in e for e in errors)
+        assert any(
+            "does not contain 'github'" in record.message for record in caplog.records
+        )
+
+    def test_auth_group_with_github_no_warning(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """Auth group containing 'github' should not warn."""
+        cfg = G2PConfig(
+            enabled=True,
+            github_owner="test",
+            github_token="ghp_valid",
+            remote_auth_group="GitHub Replication",
+        )
+        with caplog.at_level(logging.WARNING):
+            errors = cfg.check()
+        assert not any("auth_group" in e for e in errors)
+        assert not any(
+            "does not contain 'github'" in record.message for record in caplog.records
+        )
+
 
 # ===================================================================
 # G2PConfig.effective_remote_url

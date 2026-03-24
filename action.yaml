@@ -354,28 +354,28 @@ outputs:
     value: ${{ steps.collect-outputs.outputs.ssh_host_keys }}
   g2p_enabled:
     description: "Whether G2P integration ran"
-    value: ${{ steps.configure-g2p.outputs.g2p_enabled }}
+    value: ${{ steps.configure-g2p.outputs.g2p_enabled || steps.g2p-defaults.outputs.g2p_enabled }}
   g2p_config_path:
     description: "Path to generated INI inside container"
-    value: ${{ steps.configure-g2p.outputs.g2p_config_path }}
+    value: ${{ steps.configure-g2p.outputs.g2p_config_path || steps.g2p-defaults.outputs.g2p_config_path }}
   g2p_hooks_enabled:
     description: "JSON array of hooks that got symlinks"
-    value: ${{ steps.configure-g2p.outputs.g2p_hooks_enabled }}
+    value: ${{ steps.configure-g2p.outputs.g2p_hooks_enabled || steps.g2p-defaults.outputs.g2p_hooks_enabled }}
   g2p_github_owner:
     description: "Configured GitHub owner"
-    value: ${{ steps.configure-g2p.outputs.g2p_github_owner }}
+    value: ${{ steps.configure-g2p.outputs.g2p_github_owner || steps.g2p-defaults.outputs.g2p_github_owner }}
   g2p_remote_name_style:
     description: "Configured repository name style"
-    value: ${{ steps.configure-g2p.outputs.g2p_remote_name_style }}
+    value: ${{ steps.configure-g2p.outputs.g2p_remote_name_style || steps.g2p-defaults.outputs.g2p_remote_name_style }}
   g2p_validation_results:
     description: "JSON array of GitHub check results"
-    value: ${{ steps.configure-g2p.outputs.g2p_validation_results }}
+    value: ${{ steps.configure-g2p.outputs.g2p_validation_results || steps.g2p-defaults.outputs.g2p_validation_results }}
   g2p_token_provided:
     description: "Whether a GitHub token was supplied"
-    value: ${{ steps.configure-g2p.outputs.g2p_token_provided }}
+    value: ${{ steps.configure-g2p.outputs.g2p_token_provided || steps.g2p-defaults.outputs.g2p_token_provided }}
   g2p_ssh_public_key:
     description: "Public key for downstream deploy-key setup"
-    value: ${{ steps.configure-g2p.outputs.g2p_ssh_public_key }}
+    value: ${{ steps.configure-g2p.outputs.g2p_ssh_public_key || steps.g2p-defaults.outputs.g2p_ssh_public_key }}
 
 runs:
   using: "composite"
@@ -650,6 +650,22 @@ runs:
         # Verify replication success (Python)
         python3 "${{ github.action_path }}/scripts/verify-replication.py"
 
+    # Set default G2P outputs when disabled
+    - name: "Set G2P defaults (disabled)"
+      if: inputs.g2p_enable != 'true'
+      id: g2p-defaults
+      shell: bash
+      run: |
+        # G2P is disabled — write safe defaults
+        echo "g2p_enabled=false" >> "$GITHUB_OUTPUT"
+        echo "g2p_config_path=" >> "$GITHUB_OUTPUT"
+        echo "g2p_hooks_enabled=[]" >> "$GITHUB_OUTPUT"
+        echo "g2p_github_owner=" >> "$GITHUB_OUTPUT"
+        echo "g2p_remote_name_style=" >> "$GITHUB_OUTPUT"
+        echo "g2p_validation_results=[]" >> "$GITHUB_OUTPUT"
+        echo "g2p_token_provided=false" >> "$GITHUB_OUTPUT"
+        echo "g2p_ssh_public_key=" >> "$GITHUB_OUTPUT"
+
     # Configure G2P (gerrit_to_platform)
     - name: "Configure G2P integration"
       if: inputs.g2p_enable == 'true'
@@ -672,8 +688,7 @@ runs:
         DEBUG: ${{ inputs.debug }}
       run: |
         # Configure gerrit_to_platform inside containers (Python)
-        "$GERRIT_SCRIPTS_VENV/bin/python" \
-          "${{ github.action_path }}/scripts/configure-g2p.py"
+        python3 "${{ github.action_path }}/scripts/configure-g2p.py"
 
     # Collect outputs
     - name: "Collect outputs"

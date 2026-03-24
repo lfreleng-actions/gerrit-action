@@ -28,6 +28,7 @@ import logging
 import os
 import subprocess
 import tempfile
+import uuid
 from dataclasses import dataclass, field
 from io import StringIO
 from pathlib import Path
@@ -92,14 +93,15 @@ class G2PSetupResult:
         config_path: Path to the generated INI inside the container.
         hooks_enabled: Hook names that received symlinks.
         ssh_public_key: Public key (for downstream deploy-key setup).
-        replication_remote_appended: Whether the g2p detection remote
-            was appended to ``replication.config``.
+        replication_remote_configured: Whether the g2p detection
+            remote is present in ``replication.config`` (either
+            already existing or newly appended).
     """
 
     config_path: str = ""
     hooks_enabled: list[str] = field(default_factory=list)
     ssh_public_key: str = ""
-    replication_remote_appended: bool = False
+    replication_remote_configured: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -222,6 +224,8 @@ def generate_ssh_keypair() -> tuple[str, str]:
             )
         except subprocess.CalledProcessError as exc:
             raise G2PSetupError(f"ssh-keygen failed: {exc.stderr.strip()}") from exc
+        except subprocess.TimeoutExpired as exc:
+            raise G2PSetupError("ssh-keygen timed out after 30 seconds") from exc
         except FileNotFoundError as exc:
             raise G2PSetupError("ssh-keygen not found on PATH") from exc
 
@@ -296,17 +300,22 @@ def _write_file_in_container(
         tmp_path = tmp.name
 
     try:
-        # Ensure parent directory exists
+        # Ensure parent directory exists (as root — gerrit user may
+        # lack permission to create arbitrary parent directories).
         parent = str(Path(path).parent)
         docker.exec_cmd(
             cid,
             f"mkdir -p {parent}",
             check=True,
+            user="0",
         )
 
+        # docker cp creates files owned by root regardless of the
+        # container's USER directive, so chmod/chown must also run
+        # as root to modify the newly copied file.
         docker.cp(tmp_path, f"{cid}:{path}")
-        docker.exec_cmd(cid, f"chmod {mode} {path}")
-        docker.exec_cmd(cid, f"chown {owner} {path}")
+        docker.exec_cmd(cid, f"chmod {mode} {path}", user="0")
+        docker.exec_cmd(cid, f"chown {owner} {path}", user="0")
     finally:
         os.unlink(tmp_path)
 
@@ -319,8 +328,10 @@ def _append_file_in_container(
 ) -> None:
     """Append content to an existing file inside a container.
 
-    Uses a heredoc via ``docker exec sh -c`` to avoid temp files for
-    small payloads.
+    Creates a local temporary file, copies it into the container with
+    ``docker cp``, then appends it to *path* using
+    ``cat >> … && rm -f`` inside the container.  The temporary files
+    (local and in-container) are removed after the operation.
 
     Parameters
     ----------
@@ -333,19 +344,20 @@ def _append_file_in_container(
     content:
         Content to append.
     """
-    # Use printf to avoid interpretation of escape sequences.
-    # The content is passed via stdin through docker exec.
     with tempfile.NamedTemporaryFile(mode="w", suffix=".tmp", delete=False) as tmp:
         tmp.write(content)
         tmp_path = tmp.name
 
     try:
-        # Copy to a temp location in the container, then append
-        container_tmp = "/tmp/g2p_append.tmp"
+        # Copy to a temp location in the container, then append.
+        # docker cp creates the temp file owned by root (0600), so
+        # the cat/rm must run as root to read and clean it up.
+        container_tmp = f"/tmp/g2p_append_{uuid.uuid4().hex}.tmp"
         docker.cp(tmp_path, f"{cid}:{container_tmp}")
         docker.exec_cmd(
             cid,
             f"cat {container_tmp} >> {path} && rm -f {container_tmp}",
+            user="0",
         )
     finally:
         os.unlink(tmp_path)
@@ -369,8 +381,8 @@ def setup_g2p_config_dir(
     cid:
         Container ID or name.
     """
-    docker.exec_cmd(cid, f"mkdir -p {G2P_CONFIG_DIR}")
-    docker.exec_cmd(cid, f"chown -R gerrit:gerrit {G2P_CONFIG_DIR}")
+    docker.exec_cmd(cid, f"mkdir -p {G2P_CONFIG_DIR}", user="0")
+    docker.exec_cmd(cid, f"chown -R gerrit:gerrit {G2P_CONFIG_DIR}", user="0")
     logger.debug("Created g2p config directory: %s", G2P_CONFIG_DIR)
 
 
@@ -426,10 +438,12 @@ def setup_g2p_replication_symlink(
     docker.exec_cmd(
         cid,
         f"ln -sf {GERRIT_REPLICATION_CONFIG} {G2P_REPLICATION_SYMLINK}",
+        user="0",
     )
     docker.exec_cmd(
         cid,
         f"chown -h gerrit:gerrit {G2P_REPLICATION_SYMLINK}",
+        user="0",
     )
     logger.info(
         "Symlinked %s -> %s",
@@ -443,7 +457,10 @@ def setup_g2p_replication_remote(
     cid: str,
     config: G2PConfig,
 ) -> bool:
-    """Append the g2p platform detection remote to replication.config.
+    """Ensure the g2p platform detection remote is in replication.config.
+
+    Appends the section when absent; leaves it untouched when already
+    present.
 
     Parameters
     ----------
@@ -457,8 +474,8 @@ def setup_g2p_replication_remote(
     Returns
     -------
     bool
-        *True* if the section was appended, *False* if skipped
-        (e.g. no effective URL).
+        *True* if the remote is configured (already present or newly
+        appended), *False* if skipped (e.g. no effective URL).
     """
     section = generate_g2p_replication_section(config)
     if not section:
@@ -468,10 +485,10 @@ def setup_g2p_replication_remote(
     # Check the section doesn't already exist
     existing = docker.exec_cmd(
         cid,
-        f"grep -c 'github-g2p' {GERRIT_REPLICATION_CONFIG} 2>/dev/null || echo 0",
+        f"grep -q '^\\[remote \"github-g2p\"\\]' {GERRIT_REPLICATION_CONFIG} 2>/dev/null && echo found || echo missing",
         check=False,
     )
-    if existing.strip() != "0":
+    if existing.strip() == "found":
         logger.info(
             "G2P detection remote already present in %s",
             GERRIT_REPLICATION_CONFIG,
@@ -510,7 +527,7 @@ def setup_g2p_hooks(
     enabled: list[str] = []
 
     # Ensure the hooks directory exists
-    docker.exec_cmd(cid, f"mkdir -p {GERRIT_HOOKS_DIR}")
+    docker.exec_cmd(cid, f"mkdir -p {GERRIT_HOOKS_DIR}", user="0")
 
     for hook_name in config.hooks:
         target_bin = f"{GERRIT_TOOLS_VENV_BIN}/{hook_name}"
@@ -528,10 +545,12 @@ def setup_g2p_hooks(
         docker.exec_cmd(
             cid,
             f"ln -sf {target_bin} {hook_path}",
+            user="0",
         )
         docker.exec_cmd(
             cid,
             f"chown -h gerrit:gerrit {hook_path}",
+            user="0",
         )
         enabled.append(hook_name)
         logger.info("Hook symlink: %s -> %s", hook_path, target_bin)
@@ -571,11 +590,12 @@ def setup_g2p_ssh(
         steps).  Empty string if no key was configured.
     """
     public_key = ""
+    key_deployed = False
 
     # Ensure .ssh directory exists with correct permissions
-    docker.exec_cmd(cid, f"mkdir -p {SSH_DIR}")
-    docker.exec_cmd(cid, f"chmod 700 {SSH_DIR}")
-    docker.exec_cmd(cid, f"chown gerrit:gerrit {SSH_DIR}")
+    docker.exec_cmd(cid, f"mkdir -p {SSH_DIR}", user="0")
+    docker.exec_cmd(cid, f"chmod 700 {SSH_DIR}", user="0")
+    docker.exec_cmd(cid, f"chown gerrit:gerrit {SSH_DIR}", user="0")
 
     # -- Private key -----------------------------------------------------
     key_path = f"{SSH_DIR}/g2p_github_key"
@@ -589,6 +609,7 @@ def setup_g2p_ssh(
             mode="0600",
             owner="gerrit:gerrit",
         )
+        key_deployed = True
         logger.info("Deployed provided SSH private key to %s", key_path)
 
         # Try to derive public key from the private key
@@ -617,64 +638,67 @@ def setup_g2p_ssh(
                 mode="0600",
                 owner="gerrit:gerrit",
             )
+            key_deployed = True
             logger.info("Generated and deployed SSH keypair to %s", key_path)
         except G2PSetupError as exc:
             logger.warning("SSH keypair generation failed: %s", exc)
 
     # -- Known hosts -----------------------------------------------------
-    host_keys = config.github_known_hosts or fetch_github_host_keys()
-
     known_hosts_path = f"{SSH_DIR}/known_hosts"
 
     # Check if github.com is already in known_hosts
     existing = docker.exec_cmd(
         cid,
-        f"grep -c 'github.com' {known_hosts_path} 2>/dev/null || echo 0",
+        f"grep -q 'github.com' {known_hosts_path} 2>/dev/null && echo found || echo missing",
         check=False,
     )
-    if existing.strip() == "0":
+    if existing.strip() != "found":
+        host_keys = config.github_known_hosts or fetch_github_host_keys()
         _append_file_in_container(
             docker,
             cid,
             known_hosts_path,
             host_keys + "\n",
         )
-        docker.exec_cmd(cid, f"chmod 644 {known_hosts_path}")
-        docker.exec_cmd(cid, f"chown gerrit:gerrit {known_hosts_path}")
+        docker.exec_cmd(cid, f"chmod 644 {known_hosts_path}", user="0")
+        docker.exec_cmd(cid, f"chown gerrit:gerrit {known_hosts_path}", user="0")
         logger.info("Added github.com to %s", known_hosts_path)
     else:
         logger.info("github.com already in %s", known_hosts_path)
 
     # -- SSH client config -----------------------------------------------
-    ssh_config_path = f"{SSH_DIR}/config"
-    ssh_config_block = (
-        "\n"
-        "# G2P: GitHub SSH configuration\n"
-        "Host github.com\n"
-        "  User git\n"
-        f"  IdentityFile {key_path}\n"
-        "  IdentitiesOnly yes\n"
-        "  StrictHostKeyChecking yes\n"
-    )
-
-    # Check if there's already a github.com Host block
-    existing_config = docker.exec_cmd(
-        cid,
-        f"grep -c 'Host github.com' {ssh_config_path} 2>/dev/null || echo 0",
-        check=False,
-    )
-    if existing_config.strip() == "0":
-        _append_file_in_container(
-            docker,
-            cid,
-            ssh_config_path,
-            ssh_config_block,
+    if key_deployed:
+        ssh_config_path = f"{SSH_DIR}/config"
+        ssh_config_block = (
+            "\n"
+            "# G2P: GitHub SSH configuration\n"
+            "Host github.com\n"
+            "  User git\n"
+            f"  IdentityFile {key_path}\n"
+            "  IdentitiesOnly yes\n"
+            "  StrictHostKeyChecking yes\n"
         )
-        docker.exec_cmd(cid, f"chmod 644 {ssh_config_path}")
-        docker.exec_cmd(cid, f"chown gerrit:gerrit {ssh_config_path}")
-        logger.info("Added github.com SSH config to %s", ssh_config_path)
+
+        # Check if there's already a github.com Host block
+        existing_config = docker.exec_cmd(
+            cid,
+            f"grep -q 'Host github.com' {ssh_config_path} 2>/dev/null && echo found || echo missing",
+            check=False,
+        )
+        if existing_config.strip() != "found":
+            _append_file_in_container(
+                docker,
+                cid,
+                ssh_config_path,
+                ssh_config_block,
+            )
+            docker.exec_cmd(cid, f"chmod 644 {ssh_config_path}", user="0")
+            docker.exec_cmd(cid, f"chown gerrit:gerrit {ssh_config_path}", user="0")
+            logger.info("Added github.com SSH config to %s", ssh_config_path)
+        else:
+            logger.info("github.com SSH config already present in %s", ssh_config_path)
     else:
-        logger.info("github.com SSH config already present in %s", ssh_config_path)
+        logger.info("No SSH key deployed; skipping SSH client config")
 
     return public_key
 
@@ -732,7 +756,7 @@ def setup_g2p(
         result.config_path = setup_g2p_ini(docker, cid, config)
 
         # Step 3: Replication remote
-        result.replication_remote_appended = setup_g2p_replication_remote(
+        result.replication_remote_configured = setup_g2p_replication_remote(
             docker,
             cid,
             config,

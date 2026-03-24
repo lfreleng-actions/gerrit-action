@@ -124,7 +124,17 @@ def _github_request(
     -------
     tuple[int, dict | list | str]
         HTTP status code and the parsed JSON response (or raw text on
-        parse failure).
+        parse failure).  ``HTTPError`` responses are caught and
+        returned as ``(status, body)``; other network-level failures
+        propagate as exceptions.
+
+    Raises
+    ------
+    URLError
+        On network-level failures (DNS resolution, connection refused,
+        timeout, etc.).  Callers must handle this — each check
+        function catches ``URLError`` and returns an appropriate
+        :class:`G2PCheckResult`.
     """
     headers = {
         "Authorization": f"Bearer {token}",
@@ -272,10 +282,13 @@ def check_org_access(token: str, owner: str) -> G2PCheckResult:
 
     if status == 404:
         # Could be a user account instead of an org — try /users
+        user_status = 0
+        user_error = ""
         try:
             user_status, _ = _github_request(f"{GITHUB_API_BASE}/users/{owner}", token)
-        except URLError:
+        except URLError as user_exc:
             user_status = 0
+            user_error = str(user_exc)
 
         if user_status == 200:
             return G2PCheckResult(
@@ -286,11 +299,22 @@ def check_org_access(token: str, owner: str) -> G2PCheckResult:
                 details={"account_type": "user"},
             )
 
+        # Build a message that includes the user-check outcome
+        msg = f"Organisation '{owner}' not found (HTTP 404)"
+        if user_error:
+            msg += f"; user check also failed: {user_error}"
+        elif user_status != 0:
+            msg += f"; user check returned HTTP {user_status}"
+
         return G2PCheckResult(
             check_name="org_access",
             passed=False,
-            message=f"Organisation '{owner}' not found (HTTP 404)",
+            message=msg,
             severity="error",
+            details={
+                "org_status": 404,
+                "user_status": user_status,
+            },
         )
 
     return G2PCheckResult(
@@ -335,11 +359,35 @@ def check_magic_repo(token: str, owner: str) -> G2PCheckResult:
             severity="info",
         )
 
+    if status == 404:
+        return G2PCheckResult(
+            check_name="magic_repo",
+            passed=False,
+            message=(
+                f"Repository '{owner}/.github' not found"
+                " — required workflows will not work"
+            ),
+            severity="warning",
+        )
+
+    if status in (401, 403):
+        return G2PCheckResult(
+            check_name="magic_repo",
+            passed=False,
+            message=(
+                f"Unable to access repository '{owner}/.github' "
+                f"(HTTP {status} — authentication or permission issue). "
+                "Required workflows will be inaccessible."
+            ),
+            severity="error",
+        )
+
     return G2PCheckResult(
         check_name="magic_repo",
         passed=False,
         message=(
-            f"Repository '{owner}/.github' not found — required workflows will not work"
+            f"Failed to check repository '{owner}/.github' "
+            f"(HTTP {status}). Required workflows may not work."
         ),
         severity="warning",
     )
@@ -374,7 +422,7 @@ def check_workflows(
         Passed if at least one matching active workflow is found.
     """
     check_name = f"workflows_{repo}_{search_filter}"
-    url = f"{GITHUB_API_BASE}/repos/{owner}/{repo}/actions/workflows"
+    url = f"{GITHUB_API_BASE}/repos/{owner}/{repo}/actions/workflows?per_page=100"
 
     try:
         status, data = _github_request(url, token)
@@ -474,7 +522,10 @@ def check_repos_exist(
     owner: str,
     repos: list[str],
 ) -> G2PCheckResult:
-    """Check that specified repositories exist using GraphQL.
+    """Check that specified repositories exist via the REST API.
+
+    Makes individual ``GET /repos/{owner}/{repo}`` calls for each
+    repository in the list.
 
     Parameters
     ----------
@@ -498,61 +549,41 @@ def check_repos_exist(
             severity="info",
         )
 
-    query = """
-    query ValidateOrgRepos($owner: String!, $repos: [String!]!) {
-      organization(login: $owner) {
-        repositories(first: 100, names: $repos) {
-          nodes {
-            name
-            isArchived
-          }
-        }
-      }
-    }
-    """
+    found_names: set[str] = set()
+    missing: list[str] = []
+    archived: list[str] = []
 
-    try:
-        status, data = _graphql_query(token, query, {"owner": owner, "repos": repos})
-    except URLError as exc:
-        return G2PCheckResult(
-            check_name="repos_exist",
-            passed=False,
-            message=f"Network error checking repositories: {exc}",
-            severity="info",
-        )
+    for repo in repos:
+        url = f"{GITHUB_API_BASE}/repos/{owner}/{repo}"
+        try:
+            status, data = _github_request(url, token)
+        except URLError as exc:
+            return G2PCheckResult(
+                check_name="repos_exist",
+                passed=False,
+                message=f"Network error checking repositories: {exc}",
+                severity="warning",
+            )
 
-    if status != 200:
-        return G2PCheckResult(
-            check_name="repos_exist",
-            passed=False,
-            message=f"GraphQL query failed (HTTP {status})",
-            severity="info",
-            details={"status": status},
-        )
+        if status == 404:
+            missing.append(repo)
+            continue
 
-    errors = data.get("errors", [])
-    if errors:
-        return G2PCheckResult(
-            check_name="repos_exist",
-            passed=False,
-            message=f"GraphQL errors: {errors}",
-            severity="info",
-            details={"errors": errors},
-        )
+        if status != 200:
+            return G2PCheckResult(
+                check_name="repos_exist",
+                passed=False,
+                message=f"HTTP {status} checking repo '{repo}'",
+                severity="warning",
+                details={"status": status, "repo": repo},
+            )
 
-    org_data = (data.get("data") or {}).get("organization")
-    if not org_data:
-        return G2PCheckResult(
-            check_name="repos_exist",
-            passed=False,
-            message=f"Organisation '{owner}' not found via GraphQL",
-            severity="info",
-        )
-
-    found_repos = org_data.get("repositories", {}).get("nodes", [])
-    found_names = {r["name"] for r in found_repos if r}
-    missing = [r for r in repos if r not in found_names]
-    archived = [r["name"] for r in found_repos if r and r.get("isArchived")]
+        if isinstance(data, dict):
+            found_names.add(data.get("name", repo))
+            if data.get("archived", False):
+                archived.append(data.get("name", repo))
+        else:
+            found_names.add(repo)
 
     details: dict[str, Any] = {
         "found": sorted(found_names),
@@ -565,7 +596,7 @@ def check_repos_exist(
             check_name="repos_exist",
             passed=False,
             message=f"Repositories not found: {missing}",
-            severity="info",
+            severity="warning",
             details=details,
         )
 
@@ -728,7 +759,6 @@ def format_check_results(
             # mode == "skip" should never reach here
         elif result.severity == "warning":
             annotations.append(f"::warning::{result.message}")
-            logger.warning("%s", result)
         else:
             logger.info("%s", result)
 

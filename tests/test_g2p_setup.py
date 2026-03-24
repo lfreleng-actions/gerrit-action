@@ -87,19 +87,19 @@ class TestG2PSetupResult:
         assert result.config_path == ""
         assert result.hooks_enabled == []
         assert result.ssh_public_key == ""
-        assert result.replication_remote_appended is False
+        assert result.replication_remote_configured is False
 
     def test_with_values(self) -> None:
         result = G2PSetupResult(
             config_path="/var/gerrit/.config/gerrit_to_platform/gerrit_to_platform.ini",
             hooks_enabled=["patchset-created", "comment-added"],
             ssh_public_key="ssh-ed25519 AAAA...",
-            replication_remote_appended=True,
+            replication_remote_configured=True,
         )
         assert result.config_path.endswith(".ini")
         assert len(result.hooks_enabled) == 2
         assert result.ssh_public_key.startswith("ssh-ed25519")
-        assert result.replication_remote_appended is True
+        assert result.replication_remote_configured is True
 
 
 # ===================================================================
@@ -363,6 +363,12 @@ class TestGenerateSshKeypair:
             generate_ssh_keypair()
 
     @patch("g2p_setup.subprocess.run")
+    def test_keygen_timeout_raises(self, mock_run: MagicMock) -> None:
+        mock_run.side_effect = subprocess.TimeoutExpired("ssh-keygen", 30)
+        with pytest.raises(G2PSetupError, match="timed out"):
+            generate_ssh_keypair()
+
+    @patch("g2p_setup.subprocess.run")
     def test_keygen_not_found_raises(self, mock_run: MagicMock) -> None:
         mock_run.side_effect = FileNotFoundError("ssh-keygen")
         with pytest.raises(G2PSetupError, match="ssh-keygen not found"):
@@ -493,6 +499,27 @@ class TestWriteFileInContainer:
         assert any("chmod 0644" in c for c in exec_calls)
         assert any("chown root:root" in c for c in exec_calls)
 
+    def test_runs_mkdir_chmod_chown_as_root(self) -> None:
+        """Post-docker-cp ops must run as root (docker cp creates root-owned files)."""
+        docker = _make_docker_mock()
+        _write_file_in_container(
+            docker,
+            CID,
+            "/var/gerrit/test.txt",
+            "content",
+            mode="0600",
+            owner="gerrit:gerrit",
+        )
+        for call in docker.exec_cmd.call_args_list:
+            cmd_str = call[0][1]
+            kwargs = call[1] if len(call) > 1 else {}
+            # All exec_cmd calls in _write_file_in_container should
+            # pass user="0" so they run as root inside the container.
+            if any(op in cmd_str for op in ("mkdir -p", "chmod", "chown")):
+                assert kwargs.get("user") == "0", (
+                    f"Expected user='0' for command: {cmd_str}"
+                )
+
 
 # ===================================================================
 # _append_file_in_container
@@ -519,6 +546,23 @@ class TestAppendFileInContainer:
         _append_file_in_container(docker, CID, "/test.txt", "data")
         cp_call = docker.cp.call_args[0][0]
         assert not os.path.exists(cp_call)
+
+    def test_runs_cat_rm_as_root(self) -> None:
+        """cat/rm must run as root since docker cp creates root-owned files."""
+        docker = _make_docker_mock()
+        _append_file_in_container(
+            docker,
+            CID,
+            "/var/gerrit/etc/replication.config",
+            "extra\n",
+        )
+        for call in docker.exec_cmd.call_args_list:
+            cmd_str = call[0][1]
+            kwargs = call[1] if len(call) > 1 else {}
+            if "cat" in cmd_str and ">>" in cmd_str:
+                assert kwargs.get("user") == "0", (
+                    f"Expected user='0' for command: {cmd_str}"
+                )
 
 
 # ===================================================================
@@ -615,7 +659,7 @@ class TestSetupG2pReplicationRemote:
     """Tests for appending the g2p detection remote."""
 
     def test_appends_section(self) -> None:
-        docker = _make_docker_mock(exec_cmd_return="0")
+        docker = _make_docker_mock(exec_cmd_return="missing")
         config = G2PConfig(
             enabled=True,
             github_owner="onap",
@@ -627,8 +671,8 @@ class TestSetupG2pReplicationRemote:
 
     def test_skips_when_already_present(self) -> None:
         docker = _make_docker_mock()
-        # grep returns "1" meaning one match found
-        docker.exec_cmd.return_value = "1"
+        # grep -q finds match, returns "found"
+        docker.exec_cmd.return_value = "found"
         config = G2PConfig(
             enabled=True,
             github_owner="onap",
@@ -872,18 +916,18 @@ class TestSetupG2pSsh:
 
     def test_skips_known_hosts_when_already_present(self) -> None:
         docker = _make_docker_mock()
-        # First exec_cmd calls will vary — we handle grep returning "1"
-        # for github.com presence checks
+        # First exec_cmd calls will vary — we handle grep -q returning
+        # "found" for github.com presence checks
         call_count = 0
 
         def side_effect(cid: str, cmd: str, **kwargs: Any) -> str:
             nonlocal call_count
             call_count += 1
-            if "grep -c 'github.com'" in cmd and "known_hosts" in cmd:
-                return "1"
-            if "grep -c 'Host github.com'" in cmd:
-                return "1"
-            return "0"
+            if "grep -q 'github.com'" in cmd and "known_hosts" in cmd:
+                return "found"
+            if "grep -q 'Host github.com'" in cmd:
+                return "found"
+            return "missing"
 
         docker.exec_cmd.side_effect = side_effect
         config = G2PConfig(
@@ -975,7 +1019,7 @@ class TestSetupG2p:
         assert result.config_path == G2P_INI_PATH
         assert result.hooks_enabled == ["patchset-created", "comment-added"]
         assert result.ssh_public_key == "ssh-ed25519 AAAAkey"
-        assert result.replication_remote_appended is True
+        assert result.replication_remote_configured is True
 
     @patch("g2p_setup.setup_g2p_ssh")
     @patch("g2p_setup.setup_g2p_hooks")
@@ -1001,7 +1045,7 @@ class TestSetupG2p:
         config = G2PConfig(enabled=True, github_owner="test")
 
         result = setup_g2p(config, docker, CID)
-        assert result.replication_remote_appended is False
+        assert result.replication_remote_configured is False
         assert result.hooks_enabled == []
         assert result.ssh_public_key == ""
 

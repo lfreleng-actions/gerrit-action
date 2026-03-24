@@ -171,13 +171,15 @@ class G2PConfig:
         Returns
         -------
         G2PConfig
-            A frozen, validated configuration instance.
+            A frozen configuration instance constructed from environment
+            variables. Required-field validation is performed separately
+            by :meth:`G2PConfig.check`.
 
         Raises
         ------
         ConfigError
-            If a required value is missing or unparsable (e.g. invalid
-            JSON in ``G2P_COMMENT_MAPPINGS``).
+            If an environment value is unparsable (e.g. invalid JSON in
+            ``G2P_COMMENT_MAPPINGS``).
         """
         env = os.environ.get
 
@@ -289,6 +291,12 @@ class G2PConfig:
             logger.warning(
                 "g2p_remote_auth_group is empty; platform detection "
                 "may not work correctly"
+            )
+        elif "github" not in self.remote_auth_group.lower():
+            logger.warning(
+                "g2p_remote_auth_group %r does not contain 'github'; "
+                "platform detection may not work correctly",
+                self.remote_auth_group,
             )
 
         return errors

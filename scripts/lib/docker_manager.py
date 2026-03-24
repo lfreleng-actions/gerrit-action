@@ -421,6 +421,7 @@ class DockerManager:
         command: str,
         timeout: int = 30,
         check: bool = True,
+        user: str | None = None,
     ) -> str:
         """Execute a command inside a running container.
 
@@ -434,14 +435,22 @@ class DockerManager:
             Maximum seconds to wait.
         check:
             If *True*, raise :class:`DockerError` on non-zero exit.
+        user:
+            Optional user to run the command as (passed to
+            ``docker exec -u``).  For example, ``"0"`` or
+            ``"root"`` to run as root.
 
         Returns
         -------
         str
             Trimmed stdout of the command.
         """
+        cmd: list[str] = ["exec"]
+        if user is not None:
+            cmd.extend(["-u", user])
+        cmd.extend([cid, "sh", "-c", command])
         result = self.run_cmd(
-            ["exec", cid, "sh", "-c", command],
+            cmd,
             timeout=timeout,
             check=check,
         )

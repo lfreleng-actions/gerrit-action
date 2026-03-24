@@ -615,12 +615,18 @@ class TestGerritDevClientAuthentication:
         self, mock_requests: MockSession
     ) -> None:
         """Test become_admin tries multiple account IDs in pass 1."""
-        # First account fails, second succeeds
-        call_count = 0
+        # First account fails, second succeeds.
+        # become_account now pre-accesses the base URL (OOTB dismiss)
+        # and then hits /login/ with allow_redirects=False, so we need
+        # to handle both the OOTB pre-access and the login calls.
+        login_call_count = 0
 
         def mock_get(url: str, **kwargs: Any) -> MockResponse:
-            nonlocal call_count
-            call_count += 1
+            nonlocal login_call_count
+            # OOTB pre-access and XSRF fetch: base URL without /login/
+            if "/login/" not in url:
+                return MockResponse(status_code=200, url=url)
+            login_call_count += 1
             if "1000000" in url:
                 return MockResponse(status_code=404, url=url)
             mock_requests.set_cookies(
@@ -637,7 +643,7 @@ class TestGerritDevClientAuthentication:
         result = client.become_admin()
 
         assert result == 1  # Second account ID tried
-        assert call_count == 2
+        assert login_call_count == 2
 
     def test_become_admin_bootstraps_on_fresh_instance(
         self, mock_requests: MockSession
@@ -649,14 +655,17 @@ class TestGerritDevClientAuthentication:
         BecomeAnyAccountLoginServlet's ``action=create_account`` endpoint
         to bootstrap the first account.
         """
-        get_count = 0
+        login_get_count = 0
         post_count = 0
 
         def mock_get(url: str, **kwargs: Any) -> MockResponse:
-            nonlocal get_count
-            get_count += 1
+            nonlocal login_get_count
+            # OOTB pre-access and XSRF fetch: base URL without /login/
+            if "/login/" not in url and "accounts/" not in url:
+                return MockResponse(status_code=200, url=url)
             # Pass 1 login attempts: no accounts exist → no cookie
             if "/login/" in url:
+                login_get_count += 1
                 return MockResponse(status_code=200, url=url)
             # GET /a/accounts/self after bootstrap succeeds
             if "accounts/self" in url:
@@ -689,7 +698,7 @@ class TestGerritDevClientAuthentication:
 
         assert result == 1000000
         # Pass 1: 2 failed login GETs (account 1000000, account 1)
-        assert get_count >= 2
+        assert login_get_count >= 2
         # Pass 2: 1 bootstrap POST
         assert post_count == 1
 
@@ -703,17 +712,20 @@ class TestGerritDevClientAuthentication:
         redirect mismatch).  Pass 3 retries known account IDs after a
         brief pause and succeeds because the account now exists.
         """
-        get_count = 0
+        login_get_count = 0
         post_count = 0
 
         def mock_get(url: str, **kwargs: Any) -> MockResponse:
-            nonlocal get_count
-            get_count += 1
-            # Pass 1 (calls 1-2): no accounts exist
-            if get_count <= 2 and "/login/" in url:
+            nonlocal login_get_count
+            # OOTB pre-access and XSRF fetch: base URL without /login/
+            if "/login/" not in url:
+                return MockResponse(status_code=200, url=url)
+            login_get_count += 1
+            # Pass 1 (first 2 login calls): no accounts exist
+            if login_get_count <= 2:
                 return MockResponse(status_code=200, url=url)
             # Pass 3 (after bootstrap side-effect): account 1000000 exists
-            if "/login/" in url and "1000000" in url:
+            if "1000000" in url:
                 mock_requests.set_cookies(
                     [
                         ("GerritAccount", "session"),
@@ -746,6 +758,7 @@ class TestGerritDevClientAuthentication:
         """Test become_admin raises GerritAuthError when everything fails."""
 
         def mock_get(url: str, **kwargs: Any) -> MockResponse:
+            # All requests return 200 but never set cookies → auth fails
             return MockResponse(status_code=200, url=url)
 
         def mock_post(url: str, **kwargs: Any) -> MockResponse:

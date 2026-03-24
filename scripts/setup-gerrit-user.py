@@ -420,7 +420,10 @@ def run_loop_instances(
                 last_error = e
                 # Only retry on transient failures: network errors
                 # (no status code) or specific HTTP codes.
-                _transient = {429, 500, 502, 503, 504}
+                # 401/403 are included because the Gerrit auth subsystem
+                # may not be fully ready immediately after the container
+                # passes its health check (which hits a public endpoint).
+                _transient = {401, 403, 429, 500, 502, 503, 504}
                 is_transient = e.status_code is None or e.status_code in _transient
                 if is_transient and attempt < max_attempts:
                     logger.warning(

@@ -241,6 +241,73 @@ class GerritDevClient:
                 return str(cookie.value)
         return None
 
+    def _dismiss_ootb_redirect(self) -> None:
+        """Pre-access the Gerrit base URL to clear the OOTB first-time redirect.
+
+        On a **fresh** Gerrit instance the ``FirstTimeRedirect`` servlet
+        filter intercepts every request (including ``/login/``) and
+        redirects it to ``httpd.firstTimeRedirectUrl`` *before* the
+        ``BecomeAnyAccountLoginServlet`` has a chance to run.  This
+        means the session cookie is never set on the first login
+        attempt.
+
+        Fetching the base URL once satisfies the OOTB filter so that
+        subsequent requests (in particular ``/login/``) are handled
+        normally by the Gerrit servlets.
+        """
+        base_page_url = self.base_url + "/"
+        logger.debug(
+            "Pre-accessing %s to dismiss OOTB first-time redirect", base_page_url
+        )
+        try:
+            self.session.get(
+                base_page_url,
+                allow_redirects=True,
+                timeout=self.timeout,
+                verify=self.verify_ssl,
+            )
+        except Exception as exc:
+            # Non-fatal: the main login flow will surface any real errors.
+            logger.debug("OOTB pre-access failed (non-fatal): %s", exc)
+
+    def _ensure_xsrf_token(self) -> None:
+        """Fetch the Gerrit index page to obtain the XSRF_TOKEN cookie.
+
+        The XSRF token is set by the PolyGerrit front-end page.  When
+        the login redirect chain does not end on the main Gerrit page
+        (e.g. because it lands on a 404 from the OOTB plugin-manager
+        intro page), the token cookie is never set.
+
+        This method explicitly fetches the base URL while the session
+        already carries the ``GerritAccount`` cookie, which causes
+        Gerrit to emit the ``XSRF_TOKEN`` cookie in the response.
+        """
+        if self._xsrf_token:
+            return  # Already have one
+
+        base_page_url = self.base_url + "/"
+        logger.debug(
+            "XSRF token missing after login; fetching %s to obtain it",
+            base_page_url,
+        )
+        try:
+            self.session.get(
+                base_page_url,
+                allow_redirects=True,
+                timeout=self.timeout,
+                verify=self.verify_ssl,
+            )
+            self._xsrf_token = self._extract_xsrf_token()
+            if self._xsrf_token:
+                logger.debug("XSRF token obtained from base page ✅")
+            else:
+                logger.warning(
+                    "XSRF token still missing after fetching base page; "
+                    "write operations may fail"
+                )
+        except Exception as exc:
+            logger.warning("Failed to fetch base page for XSRF token: %s", exc)
+
     def become_account(self, account_id: int) -> bool:
         """
         Authenticate by "becoming" the specified account.
@@ -248,6 +315,15 @@ class GerritDevClient:
         In DEVELOPMENT_BECOME_ANY_ACCOUNT mode, Gerrit allows becoming any
         account by visiting /login/?account_id=<id>. This sets session cookies
         including the XSRF token needed for write operations.
+
+        On a fresh Gerrit instance the OOTB ``FirstTimeRedirect`` filter
+        can intercept the login request, so we first dismiss it by
+        fetching the base URL.  The login request itself is made with
+        ``allow_redirects=False`` to capture the ``Set-Cookie`` header
+        directly from the 302 response, avoiding redirect chains that
+        may strip the context path and land on a 404.  After obtaining
+        the session cookie we explicitly fetch the base page to acquire
+        the XSRF token (which is set by the PolyGerrit front-end).
 
         After obtaining the session cookie, this method verifies that the
         cookie would actually be transmitted by preparing (but not sending)
@@ -267,15 +343,27 @@ class GerritDevClient:
         Raises:
             GerritAuthError: If authentication fails
         """
+        # --- Dismiss OOTB first-time redirect on fresh instances -----------
+        # The FirstTimeRedirect filter intercepts *all* requests (including
+        # /login/) on the very first access.  Pre-fetching the base URL
+        # satisfies the filter so that /login/ is handled normally.
+        self._dismiss_ootb_redirect()
+
         # Login endpoint lives under the same context path as all other endpoints.
         # When Gerrit is configured with httpd.listenUrl that includes a path
         # (e.g., http://*:8080/r/), the login endpoint is at /r/login/, not /login/.
         login_url = f"{self.base_url}/login/?account_id={account_id}"
         logger.debug(f"Becoming account {account_id} via {login_url}")
 
+        # --- Do NOT follow redirects ----------------------------------------
+        # The login servlet returns a 302 with Set-Cookie in the *first*
+        # response.  Following redirects can land on pages outside the
+        # context path (e.g. /plugins/plugin-manager/static/intro.html)
+        # which returns 404 and may confuse cookie handling.  We only
+        # need the Set-Cookie header from the 302 itself.
         response = self.session.get(
             login_url,
-            allow_redirects=True,
+            allow_redirects=False,
             timeout=self.timeout,
             verify=self.verify_ssl,
         )
@@ -283,14 +371,9 @@ class GerritDevClient:
         # Log detailed response information for debugging authentication
         # failures (e.g. OOTB redirect issues, context-path mismatches).
         logger.debug(
-            f"Login response: HTTP {response.status_code}, final URL: {response.url}"
+            f"Login response: HTTP {response.status_code}, "
+            f"Location: {response.headers.get('Location', '(none)')}"
         )
-        if response.history:
-            for i, r in enumerate(response.history):
-                logger.debug(
-                    f"  redirect [{i}]: HTTP {r.status_code} -> "
-                    f"{r.headers.get('Location', '(no Location header)')}"
-                )
         cookie_details = [(c.name, c.domain, c.path) for c in self.session.cookies]
         logger.debug(f"Session cookies after login: {cookie_details}")
 
@@ -302,13 +385,20 @@ class GerritDevClient:
         if not has_account_cookie:
             raise GerritAuthError(
                 f"Failed to become account {account_id}: no session cookie set "
-                f"(HTTP {response.status_code}, final URL: {response.url})",
+                f"(HTTP {response.status_code}, "
+                f"Location: {response.headers.get('Location', '(none)')})",
                 status_code=response.status_code,
             )
 
-        # Extract and store XSRF token
+        # Extract and store XSRF token (may be missing at this point)
         self._xsrf_token = self._extract_xsrf_token()
         self._account_id = account_id
+
+        # --- Ensure XSRF token is available ---------------------------------
+        # The XSRF_TOKEN cookie is set by the PolyGerrit front-end page,
+        # not by the login servlet itself.  Since we no longer follow the
+        # redirect chain, we must explicitly fetch the base page.
+        self._ensure_xsrf_token()
 
         logger.debug(
             f"Successfully became account {account_id}, "
@@ -518,15 +608,22 @@ class GerritDevClient:
         Raises:
             GerritAuthError: If account creation or authentication fails.
         """
+        # Dismiss the OOTB first-time redirect before the bootstrap POST,
+        # just as we do in become_account().
+        self._dismiss_ootb_redirect()
+
         login_url = f"{self.base_url}/login/"
         logger.info("Creating first account via login servlet (action=create_account)")
         logger.debug(f"POST {login_url} data=action=create_account")
 
         try:
+            # Use allow_redirects=False to capture the Set-Cookie header
+            # from the 302 response directly, avoiding redirect chains
+            # that may strip the context path.
             response = self.session.post(
                 login_url,
                 data={"action": "create_account"},
-                allow_redirects=True,
+                allow_redirects=False,
                 timeout=self.timeout,
                 verify=self.verify_ssl,
             )
@@ -537,14 +634,8 @@ class GerritDevClient:
 
         logger.debug(
             f"Bootstrap response: HTTP {response.status_code}, "
-            f"final URL: {response.url}"
+            f"Location: {response.headers.get('Location', '(none)')}"
         )
-        if response.history:
-            for i, r in enumerate(response.history):
-                logger.debug(
-                    f"  redirect [{i}]: HTTP {r.status_code} -> "
-                    f"{r.headers.get('Location', '(no Location header)')}"
-                )
         cookie_names = [c.name for c in self.session.cookies]
         logger.debug(f"Session cookies after bootstrap: {cookie_names}")
 
@@ -555,12 +646,14 @@ class GerritDevClient:
         if not has_account_cookie:
             raise GerritAuthError(
                 "Bootstrap account creation did not set a session cookie "
-                f"(HTTP {response.status_code}, final URL: {response.url})",
+                f"(HTTP {response.status_code}, "
+                f"Location: {response.headers.get('Location', '(none)')})",
                 status_code=response.status_code,
             )
 
-        # Extract XSRF token (needed for subsequent write operations)
+        # Extract XSRF token and fetch base page if needed
         self._xsrf_token = self._extract_xsrf_token()
+        self._ensure_xsrf_token()
 
         # Discover the account ID of the account we just created
         try:

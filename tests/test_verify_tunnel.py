@@ -183,7 +183,7 @@ class TestDiagnoseHost:
 
         # Simulate successful TCP connect
         mock_sock = MagicMock()
-        mock_socket_mod.socket.return_value = mock_sock
+        mock_socket_mod.create_connection.return_value = mock_sock
 
         diag = verify_tunnel.diagnose_host("bore.pub", 8080)
 
@@ -216,9 +216,7 @@ class TestDiagnoseHost:
             (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("1.2.3.4", 8080)),
         ]
 
-        mock_sock = MagicMock()
-        mock_sock.connect.side_effect = OSError("Connection refused")
-        mock_socket_mod.socket.return_value = mock_sock
+        mock_socket_mod.create_connection.side_effect = OSError("Connection refused")
 
         diag = verify_tunnel.diagnose_host("bore.pub", 8080)
 

@@ -60,7 +60,12 @@ class TestWriteOutput:
         write_output("instances", value)
 
         content = github_output.read_text()
-        assert content == "instances<<EOF\nline1\nline2\nline3\nEOF\n"
+        lines = content.split("\n")
+        assert lines[0].startswith("instances<<ghadelim_")
+        delim = lines[0].removeprefix("instances<<")
+        assert lines[1:4] == ["line1", "line2", "line3"]
+        assert lines[4] == delim
+        assert lines[5] == ""
 
     def test_multiple_writes_append(
         self, github_output: Path, monkeypatch: pytest.MonkeyPatch
@@ -241,9 +246,8 @@ class TestWritePrettyJsonOutput:
         write_pretty_json_output("data", {"a": 1, "b": 2})
 
         content = github_output.read_text()
-        # Multi-line JSON uses heredoc syntax
-        assert "data<<EOF\n" in content
-        assert "EOF\n" in content
+        # Multi-line JSON uses unique heredoc delimiter
+        assert "data<<ghadelim_" in content
         # Indented
         assert '"a": 1' in content
 
@@ -255,7 +259,7 @@ class TestWritePrettyJsonOutput:
         write_pretty_json_output("items", [1, 2, 3])
 
         content = github_output.read_text()
-        assert "items<<EOF\n" in content
+        assert "items<<ghadelim_" in content
         # Each item on its own line
         assert "  1" in content
 

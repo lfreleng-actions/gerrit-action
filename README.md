@@ -23,6 +23,8 @@ Gerrit instances in CI/CD workflows.
 - 🧹 **Automatic cleanup** - Graceful shutdown and cleanup on workflow completion
 - 🏥 **Health checking** - Automated service availability verification
 - 📊 **Comprehensive outputs** - Full instance metadata and access URLs
+- 🔗 **Gerrit to Platform** - Optional `gerrit_to_platform` integration
+  for dispatching GitHub Actions workflows from Gerrit events
 
 ## Quick Start
 
@@ -173,18 +175,54 @@ These inputs configure Gerrit with public tunnel URLs for remote access.
 > Other tunnels (like [Tailscale](https://tailscale.com)) provide a stable IP
 > that can be used directly with the local ports.
 
+### G2P (Gerrit to Platform) Inputs
+
+These inputs configure
+[gerrit_to_platform](https://gerrit.linuxfoundation.org/infra/admin/repos/releng/gerrit_to_platform)
+inside running Gerrit containers, enabling them to dispatch GitHub
+Actions workflows in response to Gerrit events (patchset uploads,
+comment-added, change merges).
+
+<!-- markdownlint-disable MD013 -->
+
+| Name                   | Required | Default                                                      | Description                                                                  |
+| ---------------------- | -------- | ------------------------------------------------------------ | ---------------------------------------------------------------------------- |
+| g2p_enable             | False    | `false`                                                      | Enable G2P integration                                                       |
+| g2p_github_token       | False    |                                                              | GitHub PAT for workflow dispatch (see [G2P Token Scopes](#g2p-token-scopes)) |
+| g2p_github_owner       | False    |                                                              | Target GitHub organisation or user (required when `g2p_enable` is true)      |
+| g2p_remote_name_style  | False    | `dash`                                                       | How Gerrit project names map to GitHub repos: `dash`, `underscore`, `slash`  |
+| g2p_remote_url         | False    |                                                              | Override remote URL pattern (auto-generated from `g2p_github_owner`)         |
+| g2p_remote_auth_group  | False    | `GitHub Replication`                                         | Gerrit authGroup for the replication remote (must contain "github")          |
+| g2p_comment_mappings   | False    | `{"recheck":"verify","reverify":"verify","remerge":"merge"}` | JSON mapping of comment keywords to workflow filters                         |
+| g2p_hooks              | False    | `patchset-created,comment-added,change-merged`               | Comma-separated Gerrit hooks to enable                                       |
+| g2p_validation_mode    | False    | `warn`                                                       | Behaviour when GitHub checks fail: `error`, `warn`, or `skip`                |
+| g2p_validate_workflows | False    | `true`                                                       | Check that the target org has matching Gerrit workflows                      |
+| g2p_validate_repos     | False    |                                                              | Comma-separated repos to verify exist in the target org                      |
+| g2p_ssh_private_key    | False    |                                                              | SSH private key for GitHub push-based replication                            |
+| g2p_github_known_hosts | False    |                                                              | SSH known\_hosts entries for github.com (auto-fetched if omitted)            |
+
+<!-- markdownlint-enable MD013 -->
+
 ## Outputs
 
 <!-- markdownlint-disable MD013 -->
 
-| Name          | Description                                  | Example                                          |
-| ------------- | -------------------------------------------- | ------------------------------------------------ |
-| container_ids | JSON array of running container IDs          | `["abc123", "def456"]`                           |
-| container_ips | JSON array of container IP addresses         | `["172.17.0.2", "172.17.0.3"]`                   |
-| instances     | JSON object mapping slug to instance details | See [Instances Output](#instances-output)        |
-| gerrit_urls   | Comma-separated list of Gerrit HTTP URLs     | `http://172.17.0.2:8080,http://172.17.0.3:8080`  |
-| api_paths     | JSON object mapping slug to API path details | `{"onap": {"api_path": "/r", "api_url": "..."}}` |
-| ssh_host_keys | JSON object mapping slug to SSH host keys    | `{"onap": {"ssh_host_ed25519_key": "..."}}`      |
+| Name                   | Description                                  | Example                                          |
+| ---------------------- | -------------------------------------------- | ------------------------------------------------ |
+| container_ids          | JSON array of running container IDs          | `["abc123", "def456"]`                           |
+| container_ips          | JSON array of container IP addresses         | `["172.17.0.2", "172.17.0.3"]`                   |
+| instances              | JSON object mapping slug to instance details | See [Instances Output](#instances-output)        |
+| gerrit_urls            | Comma-separated list of Gerrit HTTP URLs     | `http://172.17.0.2:8080,http://172.17.0.3:8080`  |
+| api_paths              | JSON object mapping slug to API path details | `{"onap": {"api_path": "/r", "api_url": "..."}}` |
+| ssh_host_keys          | JSON object mapping slug to SSH host keys    | `{"onap": {"ssh_host_ed25519_key": "..."}}`      |
+| g2p_enabled            | Whether G2P integration ran                  | `true` / `false`                                 |
+| g2p_config_path        | Path to generated INI inside container       | `/var/gerrit/.config/.../gerrit_to_platform.ini` |
+| g2p_hooks_enabled      | JSON array of hooks that got symlinks        | `["patchset-created","comment-added"]`           |
+| g2p_github_owner       | Configured GitHub owner                      | `modeseven-gerrit-onap`                          |
+| g2p_remote_name_style  | Configured repository name style             | `dash`                                           |
+| g2p_validation_results | JSON array of GitHub check results           | `[{"check_name":"token_valid","passed":true}]`   |
+| g2p_token_provided     | Whether a GitHub token was supplied          | `true` / `false`                                 |
+| g2p_ssh_public_key     | Public key for downstream deploy-key setup   | `ssh-ed25519 AAAA...`                            |
 
 <!-- markdownlint-enable MD013 -->
 
@@ -699,6 +737,97 @@ Test SSH connection manually:
 ssh -i gerrit_key -p 29418 git@gerrit.example.org
 ```
 
+## Gerrit to Platform (G2P) Integration
+
+The [gerrit\_to\_platform](https://gerrit.linuxfoundation.org/infra/admin/repos/releng/gerrit_to_platform)
+package enables a Gerrit instance to dispatch GitHub Actions workflows
+in response to Gerrit events. When `g2p_enable` is set to `true`, this
+action configures the deployed Gerrit container(s) with the files and
+symlinks that `gerrit_to_platform` needs:
+
+- **`gerrit_to_platform.ini`** — application config with the GitHub
+  token and comment-keyword-to-workflow-filter mappings
+- **`replication.config` remote** — a detection-only remote that tells
+  `gerrit_to_platform` which platform, organisation, and repository
+  naming convention to use
+- **Gerrit hook symlinks** — `patchset-created`, `comment-added`, and
+  `change-merged` linked to the g2p console scripts
+- **SSH configuration** — keypair and `known_hosts` for github.com
+
+### G2P Token Scopes
+
+The `g2p_github_token` input requires a GitHub Personal Access Token.
+Either a **classic** or **fine-grained** token can be used depending
+on your access requirements.
+
+#### Classic Token (cross-organisation access)
+
+Use a classic token when the Gerrit instance dispatches workflows
+across **multiple organisations** (fine-grained tokens are scoped
+to a single owner).
+
+<!-- markdownlint-disable MD013 -->
+
+| Scope      | Why it is needed                                                                                                                                                                                                                                                                                                   |
+| ---------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `workflow` | Trigger workflow dispatch events — the core function of `gerrit_to_platform` (`POST /repos/{owner}/{repo}/actions/workflows/{id}/dispatches`). Selecting this scope automatically grants `repo` (full control of private repositories), which is also needed for listing workflows and repos across organisations. |
+| `read:org` | Read organisation and team membership — required for `GET /orgs/{owner}` during validation checks.                                                                                                                                                                                                                 |
+
+<!-- markdownlint-enable MD013 -->
+
+> **Note:** The `workflow` scope automatically selects `repo` (full
+> control of private repositories) in the GitHub UI. If the target
+> organisation contains only public repositories, you can deselect
+> `repo` and select only the `public_repo` sub-scope instead.
+
+![Classic token permissions](examples/classic_token_permissions.png)
+
+#### Fine-Grained Token (single organisation)
+
+Use a fine-grained token when dispatching workflows within a
+**single organisation**. Set the resource owner to the target
+organisation and grant these permissions:
+
+- **Actions** — Read and write (workflow dispatch)
+- **Contents** — Read-only (list workflows and repositories)
+- **Metadata** — Read-only (granted automatically)
+- **Organization administration** — Read-only (validation checks)
+
+### G2P Usage Example
+
+```yaml
+- name: "Start Gerrit with G2P"
+  uses: lfreleng-actions/gerrit-action@main
+  with:
+    gerrit_setup: ${{ vars.GERRIT_SETUP }}
+    ssh_private_key: ${{ secrets.GERRIT_SSH_KEY }}
+    exit: false
+    # G2P integration
+    g2p_enable: true
+    g2p_github_token: ${{ secrets.G2P_GITHUB_TOKEN }}
+    g2p_github_owner: my-gerrit-org
+    g2p_remote_name_style: dash
+    g2p_validation_mode: warn
+```
+
+### G2P Validation Modes
+
+| Mode    | Behaviour                                    |
+| ------- | -------------------------------------------- |
+| `error` | Fail the step if any GitHub-side check fails |
+| `warn`  | Log warnings but continue (default)          |
+| `skip`  | Skip all GitHub-side checks entirely         |
+
+### How Platform Detection Works
+
+`gerrit_to_platform` reads the Gerrit `replication.config` to discover
+which platform hosts the target repositories. The action appends a
+detection-only remote named `github-g2p` whose `authGroup` must contain
+the string **github** (case-insensitive) for detection to succeed. The
+`remoteNameStyle` setting (`dash`, `underscore`, or `slash`) controls
+how Gerrit project names (e.g. `foo/bar`) are converted to GitHub
+repository names (e.g. `foo-bar`).
+
 ## Advanced Configuration
 
 ### Custom Gerrit Configuration
@@ -730,6 +859,9 @@ Containers use Docker's default bridge network. For custom networking:
 3. **Network Isolation**: Consider using private runners for sensitive data
 4. **Authentication**: Prefer SSH over HTTP basic auth
 5. **Cleanup**: Ensure containers stop to avoid data leakage
+6. **G2P Tokens**: Use a dedicated PAT with the minimum scopes listed
+   in [G2P Token Scopes](#g2p-token-scopes); never commit tokens to
+   source control
 
 ## Limitations
 

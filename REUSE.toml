@@ -9,7 +9,8 @@ version = 1
 path = [
       "pyrightconfig.json",
       "uv.lock",
-      "tests/fixtures/*.json"
+      "tests/fixtures/*.json",
+      "examples/*.png"
 ]
 SPDX-License-Identifier = "Apache-2.0"
 SPDX-FileCopyrightText = "2025 The Linux Foundation"

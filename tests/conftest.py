@@ -14,6 +14,13 @@ from unittest.mock import patch
 import pytest
 
 # ---------------------------------------------------------------------------
+# Fixture file paths
+# ---------------------------------------------------------------------------
+
+FIXTURES_DIR = Path(__file__).parent / "fixtures"
+"""Path to the ``tests/fixtures/`` directory."""
+
+# ---------------------------------------------------------------------------
 # Environment helpers
 # ---------------------------------------------------------------------------
 
@@ -64,6 +71,20 @@ def clean_env(monkeypatch: pytest.MonkeyPatch) -> pytest.MonkeyPatch:
         "GITHUB_STEP_SUMMARY",
         "GITHUB_ACTIONS",
         "GERRIT_URL",
+        # G2P (gerrit_to_platform) variables
+        "G2P_ENABLE",
+        "G2P_GITHUB_TOKEN",
+        "G2P_GITHUB_OWNER",
+        "G2P_REMOTE_NAME_STYLE",
+        "G2P_REMOTE_URL",
+        "G2P_REMOTE_AUTH_GROUP",
+        "G2P_COMMENT_MAPPINGS",
+        "G2P_HOOKS",
+        "G2P_VALIDATION_MODE",
+        "G2P_VALIDATE_WORKFLOWS",
+        "G2P_VALIDATE_REPOS",
+        "G2P_SSH_PRIVATE_KEY",
+        "G2P_GITHUB_KNOWN_HOSTS",
     ]
     for var in env_vars:
         monkeypatch.delenv(var, raising=False)
@@ -234,6 +255,43 @@ def mock_docker(mock_subprocess_run):
 
     docker = DockerManager()
     return docker, mock_subprocess_run
+
+
+# ---------------------------------------------------------------------------
+# Requests mock helpers
+# ---------------------------------------------------------------------------
+
+
+# ---------------------------------------------------------------------------
+# G2P fixture helpers
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture()
+def g2p_fixture_path() -> Path:
+    """Return the path to the G2P test fixtures directory."""
+    return FIXTURES_DIR
+
+
+@pytest.fixture()
+def g2p_workflows_response() -> dict[str, Any]:
+    """Load the mock GitHub workflows API response fixture."""
+    path = FIXTURES_DIR / "g2p_github_workflows_response.json"
+    return json.loads(path.read_text(encoding="utf-8"))  # type: ignore[no-any-return]
+
+
+@pytest.fixture()
+def g2p_org_response() -> dict[str, Any]:
+    """Load the mock GitHub org API response fixture."""
+    path = FIXTURES_DIR / "g2p_github_org_response.json"
+    return json.loads(path.read_text(encoding="utf-8"))  # type: ignore[no-any-return]
+
+
+@pytest.fixture()
+def g2p_user_response() -> dict[str, Any]:
+    """Load the mock GitHub user API response fixture."""
+    path = FIXTURES_DIR / "g2p_github_user_response.json"
+    return json.loads(path.read_text(encoding="utf-8"))  # type: ignore[no-any-return]
 
 
 # ---------------------------------------------------------------------------

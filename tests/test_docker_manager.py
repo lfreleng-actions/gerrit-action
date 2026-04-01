@@ -536,6 +536,32 @@ class TestExec:
         _, kwargs = mock.call_args
         assert kwargs["timeout"] == 99
 
+    def test_exec_cmd_with_user(self) -> None:
+        """Verify -u flag is passed when user parameter is set."""
+        with patch(
+            "subprocess.run",
+            return_value=_cp(stdout="root\n"),
+        ) as mock:
+            dm = DockerManager()
+            result = dm.exec_cmd("abc", "whoami", user="0")
+
+        assert result == "root"
+        cmd = mock.call_args[0][0]
+        assert cmd == ["docker", "exec", "-u", "0", "abc", "sh", "-c", "whoami"]
+
+    def test_exec_cmd_without_user(self) -> None:
+        """Verify no -u flag when user parameter is omitted."""
+        with patch(
+            "subprocess.run",
+            return_value=_cp(stdout="gerrit\n"),
+        ) as mock:
+            dm = DockerManager()
+            result = dm.exec_cmd("abc", "whoami")
+
+        assert result == "gerrit"
+        cmd = mock.call_args[0][0]
+        assert cmd == ["docker", "exec", "abc", "sh", "-c", "whoami"]
+
     def test_exec_test_true(self) -> None:
         with patch("subprocess.run", return_value=_cp(returncode=0)):
             dm = DockerManager()

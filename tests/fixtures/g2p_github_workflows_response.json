@@ -1,0 +1,29 @@
+{
+  "total_count": 4,
+  "workflows": [
+    {
+      "id": 1001,
+      "name": "Gerrit Verify",
+      "path": ".github/workflows/gerrit-verify.yaml",
+      "state": "active"
+    },
+    {
+      "id": 1002,
+      "name": "Gerrit Required Verify",
+      "path": ".github/workflows/gerrit-required-verify.yaml",
+      "state": "active"
+    },
+    {
+      "id": 1003,
+      "name": "Gerrit Merge",
+      "path": ".github/workflows/gerrit-merge.yaml",
+      "state": "active"
+    },
+    {
+      "id": 1004,
+      "name": "CI Build",
+      "path": ".github/workflows/ci-build.yaml",
+      "state": "active"
+    }
+  ]
+}

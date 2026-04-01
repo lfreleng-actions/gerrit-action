@@ -92,3 +92,36 @@ class ApiPathError(GerritActionError):
 
 class PluginError(GerritActionError):
     """A required Gerrit plugin is missing or failed to load."""
+
+
+# ---------------------------------------------------------------------------
+# G2P (gerrit_to_platform) errors
+# ---------------------------------------------------------------------------
+
+
+class G2PError(GerritActionError):
+    """Base exception for G2P operations."""
+
+
+class G2PConfigError(G2PError):
+    """G2P configuration is invalid or incomplete."""
+
+
+class G2PCheckError(G2PError):
+    """A GitHub-side check failed in strict (error) mode.
+
+    Attributes:
+        failed_checks: Names of the checks that did not pass.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        failed_checks: list[str] | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.failed_checks: list[str] = failed_checks or []
+
+
+class G2PSetupError(G2PError):
+    """Failed to set up G2P inside the Gerrit container."""

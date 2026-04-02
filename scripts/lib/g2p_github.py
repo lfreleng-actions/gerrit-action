@@ -1185,7 +1185,7 @@ def provision_org_variable(
         method = "POST"
 
     try:
-        status, resp_data = _github_request(url, token, method=method, body=body)
+        status, _ = _github_request(url, token, method=method, body=body)
     except URLError as exc:
         return G2PCheckResult(
             check_name=f"provision_variable_{variable_name}",
@@ -1287,12 +1287,12 @@ def provision_org_config(
                 )
 
     # Provision missing variables
+    ssh_host = gerrit_info.get("ssh_host")
+    ssh_port = gerrit_info.get("ssh_port")
+    gerrit_server = f"{ssh_host}:{ssh_port}" if ssh_host and ssh_port else ""
+
     variable_map: dict[str, str] = {
-        "GERRIT_SERVER": (
-            f"{gerrit_info.get('ssh_host', '')}:{gerrit_info.get('ssh_port', '')}"
-            if gerrit_info.get("ssh_host")
-            else ""
-        ),
+        "GERRIT_SERVER": gerrit_server,
         "GERRIT_SSH_USER": gerrit_info.get("ssh_user", ""),
         "GERRIT_KNOWN_HOSTS": gerrit_info.get("known_hosts", ""),
         "GERRIT_URL": gerrit_info.get("http_url", ""),
@@ -1543,11 +1543,17 @@ def format_check_results_summary(
         "|-------|--------|---------|",
     ]
 
+    def _md_table_cell(text: str) -> str:
+        """Escape characters that break Markdown table cells."""
+        return text.replace("|", r"\|").replace("\n", "<br>")
+
     for r in results:
         status = "PASS ✅" if r.passed else "FAIL ❌"
         if not r.passed and r.severity == "warning":
             status = "WARN ⚠️"
-        lines.append(f"| {r.check_name} | {status} | {r.message} |")
+        name = _md_table_cell(r.check_name)
+        msg = _md_table_cell(r.message)
+        lines.append(f"| {name} | {status} | {msg} |")
 
     lines.append("")
 

@@ -104,8 +104,13 @@ def decode_org_tokens(
     if not b64_value.strip():
         return {}
 
+    # Normalize input: remove all whitespace so wrapped base64
+    # (e.g. line-wrapped by macOS/Linux or GitHub secrets) still
+    # decodes correctly with validate=True.
+    normalized = "".join(b64_value.split())
+
     try:
-        decoded = base64.b64decode(b64_value, validate=True).decode("utf-8")
+        decoded = base64.b64decode(normalized, validate=True).decode("utf-8")
     except Exception as exc:
         raise ConfigError(
             f"Failed to decode g2p_org_token_map — bad base64: {exc}"

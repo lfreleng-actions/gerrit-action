@@ -961,6 +961,17 @@ class TestDecodeOrgTokens:
         result = decode_org_tokens(b64)
         assert result == {}
 
+    def test_wrapped_base64(self) -> None:
+        """Line-wrapped base64 (e.g. from macOS/Linux) decodes."""
+        import base64
+
+        data = json.dumps([{"github_org": "org-a", "token": "ghp_aaa"}])
+        raw_b64 = base64.b64encode(data.encode()).decode()
+        # Simulate line-wrapping every 20 chars
+        wrapped = "\n".join(raw_b64[i : i + 20] for i in range(0, len(raw_b64), 20))
+        result = decode_org_tokens(wrapped)
+        assert result == {"org-a": "ghp_aaa"}
+
 
 # ===================================================================
 # resolve_org_token

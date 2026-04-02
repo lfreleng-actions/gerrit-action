@@ -15,11 +15,13 @@ from g2p_config import (
     DEFAULT_REMOTE_AUTH_GROUP,
     VALID_HOOKS,
     VALID_NAME_STYLES,
+    VALID_ORG_SETUP_MODES,
     VALID_VALIDATION_MODES,
     G2PConfig,
     _parse_comment_mappings,
     _parse_csv,
     _str_to_bool,
+    decode_org_tokens,
 )
 
 # ---------------------------------------------------------------------------
@@ -40,6 +42,8 @@ ALL_G2P_ENV_VARS = [
     "G2P_VALIDATE_REPOS",
     "G2P_SSH_PRIVATE_KEY",
     "G2P_GITHUB_KNOWN_HOSTS",
+    "G2P_ORG_SETUP",
+    "G2P_ORG_TOKEN_MAP",
 ]
 
 
@@ -58,6 +62,7 @@ def minimal_g2p_env(
     """Set the minimum viable G2P environment (enabled + owner)."""
     clean_g2p_env.setenv("G2P_ENABLE", "true")
     clean_g2p_env.setenv("G2P_GITHUB_OWNER", "onap")
+    clean_g2p_env.setenv("G2P_ORG_SETUP", "verify")
     return clean_g2p_env
 
 
@@ -86,6 +91,8 @@ def full_g2p_env(
         "G2P_GITHUB_KNOWN_HOSTS",
         "github.com ssh-ed25519 AAAAC3...",
     )
+    minimal_g2p_env.setenv("G2P_ORG_SETUP", "verify")
+    minimal_g2p_env.setenv("G2P_ORG_TOKEN_MAP", "")
     return minimal_g2p_env
 
 
@@ -802,3 +809,215 @@ class TestConstants:
     def test_default_remote_auth_group_contains_github(self) -> None:
         """Auth group must contain 'github' for platform detection."""
         assert "github" in DEFAULT_REMOTE_AUTH_GROUP.lower()
+
+    def test_valid_org_setup_modes_tuple(self) -> None:
+        assert isinstance(VALID_ORG_SETUP_MODES, tuple)
+        assert len(VALID_ORG_SETUP_MODES) == 3
+        assert "provision" in VALID_ORG_SETUP_MODES
+        assert "verify" in VALID_ORG_SETUP_MODES
+        assert "skip" in VALID_ORG_SETUP_MODES
+
+
+# ===================================================================
+# Org setup configuration
+# ===================================================================
+
+
+class TestOrgSetupConfig:
+    """Tests for org_setup and org_token_map fields."""
+
+    def test_default_org_setup(self) -> None:
+        config = G2PConfig()
+        assert config.org_setup == "verify"
+
+    def test_default_org_token_map(self) -> None:
+        config = G2PConfig()
+        assert config.org_token_map == ""
+
+    def test_org_setup_from_env(self, clean_g2p_env: pytest.MonkeyPatch) -> None:
+        clean_g2p_env.setenv("G2P_ENABLE", "true")
+        clean_g2p_env.setenv("G2P_GITHUB_OWNER", "test-org")
+        clean_g2p_env.setenv("G2P_ORG_SETUP", "provision")
+        config = G2PConfig.from_environment()
+        assert config.org_setup == "provision"
+
+    def test_org_setup_normalised_to_lowercase(
+        self, clean_g2p_env: pytest.MonkeyPatch
+    ) -> None:
+        clean_g2p_env.setenv("G2P_ENABLE", "true")
+        clean_g2p_env.setenv("G2P_GITHUB_OWNER", "test-org")
+        clean_g2p_env.setenv("G2P_ORG_SETUP", "VERIFY")
+        config = G2PConfig.from_environment()
+        assert config.org_setup == "verify"
+
+    def test_org_setup_default_when_unset(
+        self, clean_g2p_env: pytest.MonkeyPatch
+    ) -> None:
+        clean_g2p_env.setenv("G2P_ENABLE", "true")
+        clean_g2p_env.setenv("G2P_GITHUB_OWNER", "test-org")
+        config = G2PConfig.from_environment()
+        assert config.org_setup == "verify"
+
+    def test_org_token_map_from_env(self, clean_g2p_env: pytest.MonkeyPatch) -> None:
+        clean_g2p_env.setenv("G2P_ENABLE", "true")
+        clean_g2p_env.setenv("G2P_GITHUB_OWNER", "test-org")
+        clean_g2p_env.setenv("G2P_ORG_TOKEN_MAP", "dGVzdA==")
+        config = G2PConfig.from_environment()
+        assert config.org_token_map == "dGVzdA=="
+
+    def test_invalid_org_setup_check(self) -> None:
+        config = G2PConfig(
+            enabled=True,
+            github_owner="test-org",
+            org_setup="invalid",
+        )
+        errors = config.check()
+        assert any("g2p_org_setup" in e for e in errors)
+
+    def test_all_valid_org_setup_modes(self) -> None:
+        for mode in ("provision", "verify", "skip"):
+            config = G2PConfig(
+                enabled=True,
+                github_owner="test-org",
+                org_setup=mode,
+            )
+            errors = config.check()
+            assert not any("g2p_org_setup" in e for e in errors)
+
+    def test_provision_without_token_map_warns(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        config = G2PConfig(
+            enabled=True,
+            github_owner="test-org",
+            github_token="ghp_test",
+            org_setup="provision",
+            org_token_map="",
+        )
+        with caplog.at_level(logging.WARNING):
+            config.check()
+        assert any("g2p_org_token_map" in r.message for r in caplog.records)
+
+
+# ===================================================================
+# decode_org_tokens
+# ===================================================================
+
+
+class TestDecodeOrgTokens:
+    """Tests for the decode_org_tokens helper function."""
+
+    def test_valid_input(self) -> None:
+        import base64
+
+        data = json.dumps(
+            [
+                {"github_org": "org-a", "token": "ghp_aaa"},
+                {"github_org": "org-b", "token": "ghp_bbb"},
+            ]
+        )
+        b64 = base64.b64encode(data.encode()).decode()
+        result = decode_org_tokens(b64)
+        assert result == {"org-a": "ghp_aaa", "org-b": "ghp_bbb"}
+
+    def test_empty_string(self) -> None:
+        result = decode_org_tokens("")
+        assert result == {}
+
+    def test_whitespace_only(self) -> None:
+        result = decode_org_tokens("   ")
+        assert result == {}
+
+    def test_bad_base64(self) -> None:
+        with pytest.raises(ConfigError, match="bad base64"):
+            decode_org_tokens("not-valid-base64!!!")
+
+    def test_bad_json(self) -> None:
+        import base64
+
+        b64 = base64.b64encode(b"not json").decode()
+        with pytest.raises(ConfigError, match="bad JSON"):
+            decode_org_tokens(b64)
+
+    def test_not_array(self) -> None:
+        import base64
+
+        b64 = base64.b64encode(b'{"key": "value"}').decode()
+        with pytest.raises(ConfigError, match="JSON array"):
+            decode_org_tokens(b64)
+
+    def test_missing_fields(self) -> None:
+        import base64
+
+        data = json.dumps([{"github_org": "org-a"}])
+        b64 = base64.b64encode(data.encode()).decode()
+        with pytest.raises(ConfigError, match="github_org.*token"):
+            decode_org_tokens(b64)
+
+    def test_empty_array(self) -> None:
+        import base64
+
+        b64 = base64.b64encode(b"[]").decode()
+        result = decode_org_tokens(b64)
+        assert result == {}
+
+
+# ===================================================================
+# resolve_org_token
+# ===================================================================
+
+
+class TestResolveOrgToken:
+    """Tests for the G2PConfig.resolve_org_token method."""
+
+    def test_found_in_map(self) -> None:
+        import base64
+
+        data = json.dumps(
+            [
+                {"github_org": "test-org", "token": "ghp_org_token"},
+            ]
+        )
+        b64 = base64.b64encode(data.encode()).decode()
+        config = G2PConfig(
+            enabled=True,
+            github_owner="test-org",
+            github_token="ghp_fallback",
+            org_token_map=b64,
+        )
+        assert config.resolve_org_token() == "ghp_org_token"
+
+    def test_not_found_falls_back(self) -> None:
+        import base64
+
+        data = json.dumps(
+            [
+                {"github_org": "other-org", "token": "ghp_other"},
+            ]
+        )
+        b64 = base64.b64encode(data.encode()).decode()
+        config = G2PConfig(
+            enabled=True,
+            github_owner="test-org",
+            github_token="ghp_fallback",
+            org_token_map=b64,
+        )
+        assert config.resolve_org_token() == "ghp_fallback"
+
+    def test_no_map_falls_back(self) -> None:
+        config = G2PConfig(
+            enabled=True,
+            github_owner="test-org",
+            github_token="ghp_fallback",
+            org_token_map="",
+        )
+        assert config.resolve_org_token() == "ghp_fallback"
+
+    def test_bad_map_falls_back(self) -> None:
+        config = G2PConfig(
+            enabled=True,
+            github_owner="test-org",
+            github_token="ghp_fallback",
+            org_token_map="bad-base64!!!",
+        )
+        assert config.resolve_org_token() == "ghp_fallback"

@@ -1288,6 +1288,60 @@ class TestGerritDevClientGroupManagement:
         assert len(result) == 2
         assert result[0]["username"] == "admin"
 
+    def test_verify_group_membership_true(
+        self, authenticated_session: MockSession
+    ) -> None:
+        """Test _verify_group_membership returns True when user is a member."""
+        with patch("requests.Session", return_value=authenticated_session):
+            client = GerritDevClient("http://localhost:8080")
+            client._xsrf_token = "test-token"
+
+            authenticated_session.add_response(
+                "GET",
+                "/a/groups/Administrators/members",
+                MockResponse(json_data=SAMPLE_GROUP_MEMBERS),
+            )
+
+            result = client._verify_group_membership(1000000, "Administrators")
+
+        assert result is True
+
+    def test_verify_group_membership_false(
+        self, authenticated_session: MockSession
+    ) -> None:
+        """Test _verify_group_membership returns False for non-member."""
+        with patch("requests.Session", return_value=authenticated_session):
+            client = GerritDevClient("http://localhost:8080")
+            client._xsrf_token = "test-token"
+
+            authenticated_session.add_response(
+                "GET",
+                "/a/groups/Administrators/members",
+                MockResponse(json_data=SAMPLE_GROUP_MEMBERS),
+            )
+
+            result = client._verify_group_membership(9999, "Administrators")
+
+        assert result is False
+
+    def test_verify_group_membership_api_error(
+        self, authenticated_session: MockSession
+    ) -> None:
+        """Test _verify_group_membership returns False on API error."""
+        with patch("requests.Session", return_value=authenticated_session):
+            client = GerritDevClient("http://localhost:8080")
+            client._xsrf_token = "test-token"
+
+            authenticated_session.add_response(
+                "GET",
+                "/a/groups/Administrators/members",
+                MockResponse(status_code=500, text="Internal Server Error"),
+            )
+
+            result = client._verify_group_membership(1000000, "Administrators")
+
+        assert result is False
+
 
 class TestGerritDevClientHighLevelOperations:
     """Tests for GerritDevClient high-level operations."""
@@ -1326,6 +1380,13 @@ class TestGerritDevClientHighLevelOperations:
                 MockResponse(status_code=201, json_data=SAMPLE_ACCOUNT_CREATED),
             )
 
+            # Verify membership after add
+            authenticated_session.add_response(
+                "GET",
+                "/a/groups/Administrators/members",
+                MockResponse(json_data=SAMPLE_GROUP_MEMBERS),
+            )
+
             # Cache flush (will fail, but that's OK)
             authenticated_session.add_response(
                 "POST",
@@ -1341,6 +1402,178 @@ class TestGerritDevClientHighLevelOperations:
             )
 
         assert result["_account_id"] == 1000001
+
+    @patch("gerrit_api.time.sleep")
+    def test_add_to_admins_with_retry_succeeds_first_attempt(
+        self, mock_sleep: Any, authenticated_session: MockSession
+    ) -> None:
+        """Test _add_to_admins_with_retry succeeds on the first attempt."""
+        with patch("requests.Session", return_value=authenticated_session):
+            client = GerritDevClient("http://localhost:8080")
+            client._xsrf_token = "test-token"
+
+            authenticated_session.add_response(
+                "PUT",
+                "/a/groups/Administrators/members/1000001",
+                MockResponse(status_code=201, json_data=SAMPLE_ACCOUNT_CREATED),
+            )
+
+            authenticated_session.add_response(
+                "GET",
+                "/a/groups/Administrators/members",
+                MockResponse(json_data=SAMPLE_GROUP_MEMBERS),
+            )
+
+            # Should not raise
+            client._add_to_admins_with_retry("testuser", 1000001)
+
+        mock_sleep.assert_not_called()
+
+    @patch("gerrit_api.time.sleep")
+    def test_add_to_admins_with_retry_succeeds_after_retry(
+        self, mock_sleep: Any, authenticated_session: MockSession
+    ) -> None:
+        """Test _add_to_admins_with_retry succeeds after one failed attempt."""
+        with patch("requests.Session", return_value=authenticated_session):
+            client = GerritDevClient("http://localhost:8080")
+            client._xsrf_token = "test-token"
+
+            authenticated_session.add_response(
+                "GET",
+                "/a/groups/Administrators/members",
+                MockResponse(json_data=SAMPLE_GROUP_MEMBERS),
+            )
+
+            with patch.object(
+                client,
+                "add_to_group",
+                side_effect=[
+                    GerritAPIError("Forbidden", status_code=403),
+                    SAMPLE_ACCOUNT_CREATED,
+                ],
+            ):
+                client._add_to_admins_with_retry("testuser", 1000001)
+
+        mock_sleep.assert_called_once()
+
+    @patch("gerrit_api.time.sleep")
+    def test_add_to_admins_with_retry_raises_after_exhaustion(
+        self, mock_sleep: Any, authenticated_session: MockSession
+    ) -> None:
+        """Test _add_to_admins_with_retry raises after all attempts fail."""
+        with patch("requests.Session", return_value=authenticated_session):
+            client = GerritDevClient("http://localhost:8080")
+            client._xsrf_token = "test-token"
+
+            with (
+                patch.object(
+                    client,
+                    "add_to_group",
+                    side_effect=GerritAPIError("Server Error", status_code=500),
+                ),
+                pytest.raises(GerritAPIError, match="Failed to add"),
+            ):
+                client._add_to_admins_with_retry("testuser", 1000001)
+
+        assert mock_sleep.call_count == 2
+
+    @patch("gerrit_api.time.sleep")
+    def test_add_to_admins_with_retry_verification_failure_retries(
+        self, mock_sleep: Any, authenticated_session: MockSession
+    ) -> None:
+        """Test retry when add succeeds but verification fails."""
+        with patch("requests.Session", return_value=authenticated_session):
+            client = GerritDevClient("http://localhost:8080")
+            client._xsrf_token = "test-token"
+
+            authenticated_session.add_response(
+                "PUT",
+                "/a/groups/Administrators/members/1000001",
+                MockResponse(status_code=201, json_data=SAMPLE_ACCOUNT_CREATED),
+            )
+
+            # Verification always returns empty list
+            authenticated_session.add_response(
+                "GET",
+                "/a/groups/Administrators/members",
+                MockResponse(json_data=[]),
+            )
+
+            with pytest.raises(GerritAPIError, match="Verification failed"):
+                client._add_to_admins_with_retry("testuser", 1000001)
+
+        assert mock_sleep.call_count == 2
+
+    @patch("gerrit_api.time.sleep")
+    def test_add_to_admins_conflict_still_verifies(
+        self, mock_sleep: Any, authenticated_session: MockSession
+    ) -> None:
+        """Test conflict (already member) still verifies membership."""
+        with patch("requests.Session", return_value=authenticated_session):
+            client = GerritDevClient("http://localhost:8080")
+            client._xsrf_token = "test-token"
+
+            authenticated_session.add_response(
+                "GET",
+                "/a/groups/Administrators/members",
+                MockResponse(json_data=SAMPLE_GROUP_MEMBERS),
+            )
+
+            with patch.object(
+                client,
+                "add_to_group",
+                side_effect=GerritConflictError("Already exists", status_code=409),
+            ):
+                # Should not raise — user already a member
+                client._add_to_admins_with_retry("admin", 1000000)
+
+        mock_sleep.assert_not_called()
+
+    @patch("gerrit_api.time.sleep")
+    def test_setup_user_raises_on_admin_group_failure(
+        self, mock_sleep: Any, authenticated_session: MockSession
+    ) -> None:
+        """Test setup_user_with_ssh_keys raises when admin add fails."""
+        with patch("requests.Session", return_value=authenticated_session):
+            client = GerritDevClient("http://localhost:8080")
+            client._xsrf_token = "test-token"
+
+            # Account doesn't exist
+            authenticated_session.add_response(
+                "GET",
+                "/a/accounts/newuser",
+                MockResponse(status_code=404, text="Not found"),
+            )
+
+            # Create account
+            authenticated_session.add_response(
+                "PUT",
+                "/a/accounts/newuser",
+                MockResponse(status_code=201, json_data=SAMPLE_ACCOUNT_CREATED),
+            )
+
+            # Add SSH key
+            authenticated_session.add_response(
+                "POST",
+                "/a/accounts/1000001/sshkeys",
+                MockResponse(status_code=201, json_data=SAMPLE_SSH_KEY),
+            )
+
+            # add_to_group always fails
+            with (
+                patch.object(
+                    client,
+                    "add_to_group",
+                    side_effect=GerritAPIError("Server Error", status_code=500),
+                ),
+                pytest.raises(GerritAPIError),
+            ):
+                client.setup_user_with_ssh_keys(
+                    username="newuser",
+                    ssh_keys=["ssh-ed25519 AAAAC3NzaC1lZDI1NTE5... test@example.com"],
+                    name="New User",
+                    email="newuser@example.com",
+                )
 
 
 class TestGerritExceptions:

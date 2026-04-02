@@ -14,6 +14,9 @@ from g2p_config import (
 )
 from g2p_github import (
     GITHUB_API_BASE,
+    OPTIONAL_ORG_SECRETS,
+    REQUIRED_ORG_SECRETS,
+    REQUIRED_ORG_VARIABLES,
     REQUIRED_WORKFLOW_INPUTS,
     G2PCheckResult,
     _filter_workflows,
@@ -22,10 +25,14 @@ from g2p_github import (
     check_github_config,
     check_magic_repo,
     check_org_access,
+    check_org_secrets,
+    check_org_variables,
     check_repos_exist,
     check_token_valid,
+    check_workflow_inputs,
     check_workflows,
     format_check_results,
+    format_check_results_summary,
     results_to_json,
 )
 
@@ -84,6 +91,7 @@ def _minimal_config(**overrides: Any) -> G2PConfig:
         "validation_mode": "warn",
         "validate_workflows": True,
         "validate_repos": [],
+        "org_setup": "skip",
     }
     defaults.update(overrides)
     return G2PConfig(**defaults)
@@ -974,3 +982,528 @@ class TestConstants:
         assert "GERRIT_REFSPEC" in REQUIRED_WORKFLOW_INPUTS
         assert "GERRIT_CHANGE_ID" in REQUIRED_WORKFLOW_INPUTS
         assert "GERRIT_EVENT_TYPE" in REQUIRED_WORKFLOW_INPUTS
+
+
+# ===================================================================
+# check_org_secrets
+# ===================================================================
+
+
+class TestCheckOrgSecrets:
+    """Tests for the org secrets audit check."""
+
+    @patch("g2p_github.urlopen")
+    def test_all_required_present(self, mock_urlopen: MagicMock) -> None:
+        mock_urlopen.return_value = _make_urlopen_response(
+            200,
+            {
+                "total_count": 2,
+                "secrets": [
+                    {"name": "GERRIT_SSH_PRIVKEY"},
+                    {"name": "OTHER_SECRET"},
+                ],
+            },
+        )
+        result = check_org_secrets("ghp_token", "test-org")
+        assert result.passed is True
+        assert result.check_name == "org_secrets"
+        assert "GERRIT_SSH_PRIVKEY" not in result.details.get("missing_required", [])
+
+    @patch("g2p_github.urlopen")
+    def test_required_missing(self, mock_urlopen: MagicMock) -> None:
+        mock_urlopen.return_value = _make_urlopen_response(
+            200,
+            {
+                "total_count": 1,
+                "secrets": [{"name": "UNRELATED"}],
+            },
+        )
+        result = check_org_secrets("ghp_token", "test-org")
+        assert result.passed is False
+        assert result.severity == "error"
+        assert "GERRIT_SSH_PRIVKEY" in result.details["missing_required"]
+
+    @patch("g2p_github.urlopen")
+    def test_empty_secrets(self, mock_urlopen: MagicMock) -> None:
+        mock_urlopen.return_value = _make_urlopen_response(
+            200, {"total_count": 0, "secrets": []}
+        )
+        result = check_org_secrets("ghp_token", "test-org")
+        assert result.passed is False
+        assert result.severity == "error"
+
+    @patch("g2p_github.urlopen")
+    def test_permission_denied_403(self, mock_urlopen: MagicMock) -> None:
+        mock_urlopen.side_effect = _make_http_error(403, {"message": "Forbidden"})
+        result = check_org_secrets("ghp_token", "test-org")
+        assert result.passed is False
+        assert result.severity == "warning"
+        assert "insufficient permissions" in result.message
+
+    @patch("g2p_github.urlopen")
+    def test_network_error(self, mock_urlopen: MagicMock) -> None:
+        from urllib.error import URLError
+
+        mock_urlopen.side_effect = URLError("Connection refused")
+        result = check_org_secrets("ghp_token", "test-org")
+        assert result.passed is False
+        assert result.severity == "warning"
+
+    @patch("g2p_github.urlopen")
+    def test_optional_missing_still_passes(self, mock_urlopen: MagicMock) -> None:
+        mock_urlopen.return_value = _make_urlopen_response(
+            200,
+            {
+                "total_count": 1,
+                "secrets": [{"name": "GERRIT_SSH_PRIVKEY"}],
+            },
+        )
+        result = check_org_secrets("ghp_token", "test-org")
+        assert result.passed is True
+        assert "GERRIT_SSH_PRIVKEY_G2G" in result.details.get("missing_optional", [])
+
+
+# ===================================================================
+# check_org_variables
+# ===================================================================
+
+
+class TestCheckOrgVariables:
+    """Tests for the org variables audit check."""
+
+    @patch("g2p_github.urlopen")
+    def test_all_present_and_populated(self, mock_urlopen: MagicMock) -> None:
+        mock_urlopen.return_value = _make_urlopen_response(
+            200,
+            {
+                "total_count": 4,
+                "variables": [
+                    {"name": "GERRIT_SERVER", "value": "host:29418"},
+                    {"name": "GERRIT_SSH_USER", "value": "lfci"},
+                    {"name": "GERRIT_KNOWN_HOSTS", "value": "host ssh-ed25519 AAA"},
+                    {"name": "GERRIT_URL", "value": "https://gerrit.example.org/r/"},
+                ],
+            },
+        )
+        result = check_org_variables("ghp_token", "test-org")
+        assert result.passed is True
+        assert result.check_name == "org_variables"
+
+    @patch("g2p_github.urlopen")
+    def test_some_missing(self, mock_urlopen: MagicMock) -> None:
+        mock_urlopen.return_value = _make_urlopen_response(
+            200,
+            {
+                "total_count": 2,
+                "variables": [
+                    {"name": "GERRIT_SERVER", "value": "host:29418"},
+                    {"name": "GERRIT_SSH_USER", "value": "lfci"},
+                ],
+            },
+        )
+        result = check_org_variables("ghp_token", "test-org")
+        assert result.passed is False
+        assert result.severity == "error"
+        assert "GERRIT_KNOWN_HOSTS" in result.details["missing"]
+        assert "GERRIT_URL" in result.details["missing"]
+
+    @patch("g2p_github.urlopen")
+    def test_empty_values_warned(self, mock_urlopen: MagicMock) -> None:
+        mock_urlopen.return_value = _make_urlopen_response(
+            200,
+            {
+                "total_count": 4,
+                "variables": [
+                    {"name": "GERRIT_SERVER", "value": "host:29418"},
+                    {"name": "GERRIT_SSH_USER", "value": ""},
+                    {"name": "GERRIT_KNOWN_HOSTS", "value": "data"},
+                    {"name": "GERRIT_URL", "value": "url"},
+                ],
+            },
+        )
+        result = check_org_variables("ghp_token", "test-org")
+        assert result.passed is False
+        assert result.severity == "warning"
+        assert "GERRIT_SSH_USER" in result.details["empty"]
+
+    @patch("g2p_github.urlopen")
+    def test_permission_denied_403(self, mock_urlopen: MagicMock) -> None:
+        mock_urlopen.side_effect = _make_http_error(403, {"message": "Forbidden"})
+        result = check_org_variables("ghp_token", "test-org")
+        assert result.passed is False
+        assert result.severity == "warning"
+        assert "insufficient permissions" in result.message
+
+    @patch("g2p_github.urlopen")
+    def test_network_error(self, mock_urlopen: MagicMock) -> None:
+        from urllib.error import URLError
+
+        mock_urlopen.side_effect = URLError("Connection refused")
+        result = check_org_variables("ghp_token", "test-org")
+        assert result.passed is False
+        assert result.severity == "warning"
+
+    @patch("g2p_github.urlopen")
+    def test_none_present(self, mock_urlopen: MagicMock) -> None:
+        mock_urlopen.return_value = _make_urlopen_response(
+            200, {"total_count": 0, "variables": []}
+        )
+        result = check_org_variables("ghp_token", "test-org")
+        assert result.passed is False
+        assert result.severity == "error"
+        assert len(result.details["missing"]) == 4
+
+    @patch("g2p_github.urlopen")
+    def test_unexpected_status(self, mock_urlopen: MagicMock) -> None:
+        mock_urlopen.side_effect = _make_http_error(500, "Internal Server Error")
+        result = check_org_variables("ghp_token", "test-org")
+        assert result.passed is False
+        assert "500" in result.message
+
+
+# ===================================================================
+# check_workflow_inputs
+# ===================================================================
+
+
+class TestCheckWorkflowInputs:
+    """Tests for the workflow inputs check."""
+
+    @patch("g2p_github.urlopen")
+    def test_all_inputs_present(self, mock_urlopen: MagicMock) -> None:
+        workflow_text = (
+            "on:\n"
+            "  workflow_dispatch:\n"
+            "    inputs:\n"
+            "      GERRIT_BRANCH:\n"
+            "        required: true\n"
+            "        type: string\n"
+            "      GERRIT_CHANGE_ID:\n"
+            "        required: true\n"
+            "        type: string\n"
+            "      GERRIT_CHANGE_NUMBER:\n"
+            "        required: true\n"
+            "        type: string\n"
+            "      GERRIT_CHANGE_URL:\n"
+            "        required: true\n"
+            "        type: string\n"
+            "      GERRIT_EVENT_TYPE:\n"
+            "        required: true\n"
+            "        type: string\n"
+            "      GERRIT_PATCHSET_NUMBER:\n"
+            "        required: true\n"
+            "        type: string\n"
+            "      GERRIT_PATCHSET_REVISION:\n"
+            "        required: true\n"
+            "        type: string\n"
+            "      GERRIT_PROJECT:\n"
+            "        required: true\n"
+            "        type: string\n"
+            "      GERRIT_REFSPEC:\n"
+            "        required: true\n"
+            "        type: string\n"
+            "jobs: {}\n"
+        )
+        graphql_resp = {
+            "data": {
+                "repository": {
+                    "object": {
+                        "text": workflow_text,
+                    }
+                }
+            }
+        }
+        mock_urlopen.return_value = _make_urlopen_response(200, graphql_resp)
+        result = check_workflow_inputs(
+            "ghp_token",
+            "test-org",
+            ".github",
+            ".github/workflows/gerrit-verify.yaml",
+        )
+        assert result.passed is True
+
+    @patch("g2p_github.urlopen")
+    def test_missing_inputs(self, mock_urlopen: MagicMock) -> None:
+        workflow_text = (
+            "on:\n"
+            "  workflow_dispatch:\n"
+            "    inputs:\n"
+            "      GERRIT_BRANCH:\n"
+            "        required: true\n"
+            "      GERRIT_PROJECT:\n"
+            "        required: true\n"
+        )
+        graphql_resp = {
+            "data": {
+                "repository": {
+                    "object": {
+                        "text": workflow_text,
+                    }
+                }
+            }
+        }
+        mock_urlopen.return_value = _make_urlopen_response(200, graphql_resp)
+        result = check_workflow_inputs(
+            "ghp_token",
+            "test-org",
+            ".github",
+            ".github/workflows/gerrit-verify.yaml",
+        )
+        assert result.passed is False
+        assert result.severity == "warning"
+        assert len(result.details["missing"]) == 7
+
+    @patch("g2p_github.urlopen")
+    def test_no_workflow_dispatch(self, mock_urlopen: MagicMock) -> None:
+        workflow_text = "on:\n  push:\n    branches:\n      - main\n"
+        graphql_resp = {
+            "data": {
+                "repository": {
+                    "object": {
+                        "text": workflow_text,
+                    }
+                }
+            }
+        }
+        mock_urlopen.return_value = _make_urlopen_response(200, graphql_resp)
+        result = check_workflow_inputs(
+            "ghp_token",
+            "test-org",
+            ".github",
+            ".github/workflows/gerrit-verify.yaml",
+        )
+        assert result.passed is False
+        assert len(result.details["missing"]) == 9
+
+    @patch("g2p_github.urlopen")
+    def test_network_error(self, mock_urlopen: MagicMock) -> None:
+        from urllib.error import URLError
+
+        mock_urlopen.side_effect = URLError("Connection refused")
+        result = check_workflow_inputs(
+            "ghp_token",
+            "test-org",
+            ".github",
+            ".github/workflows/gerrit-verify.yaml",
+        )
+        assert result.passed is False
+        assert result.severity == "warning"
+
+    @patch("g2p_github.urlopen")
+    def test_file_not_found(self, mock_urlopen: MagicMock) -> None:
+        graphql_resp = {
+            "data": {
+                "repository": {
+                    "object": None,
+                }
+            }
+        }
+        mock_urlopen.return_value = _make_urlopen_response(200, graphql_resp)
+        result = check_workflow_inputs(
+            "ghp_token",
+            "test-org",
+            ".github",
+            ".github/workflows/nonexistent.yaml",
+        )
+        assert result.passed is False
+        assert result.severity == "warning"
+
+
+# ===================================================================
+# format_check_results_summary
+# ===================================================================
+
+
+class TestFormatCheckResultsSummary:
+    """Tests for the step summary renderer."""
+
+    def test_all_pass_verify_mode(self) -> None:
+        results = [
+            G2PCheckResult(
+                check_name="org_secrets",
+                passed=True,
+                message="All secrets present",
+            ),
+            G2PCheckResult(
+                check_name="org_variables",
+                passed=True,
+                message="All variables present",
+            ),
+        ]
+        summary = format_check_results_summary(results, "test-org", "verify")
+        assert "## G2P Organisation Audit: `test-org`" in summary
+        assert "PASS" in summary
+        assert "verify" in summary
+
+    def test_failures_verify_mode(self) -> None:
+        results = [
+            G2PCheckResult(
+                check_name="org_secrets",
+                passed=False,
+                message="Missing GERRIT_SSH_PRIVKEY",
+                severity="error",
+            ),
+        ]
+        summary = format_check_results_summary(results, "test-org", "verify")
+        assert "FAIL" in summary
+        assert "### Absent Items" in summary
+        assert "GERRIT_SSH_PRIVKEY" in summary
+
+    def test_provision_mode_with_items(self) -> None:
+        results = [
+            G2PCheckResult(
+                check_name="org_secrets",
+                passed=True,
+                message="All present",
+            ),
+        ]
+        provisioned = [
+            "Created secret GERRIT_SSH_PRIVKEY",
+            "Created variable GERRIT_SERVER",
+        ]
+        summary = format_check_results_summary(
+            results, "test-org", "provision", provisioned
+        )
+        assert "provision" in summary
+        assert "### Provisioned Items" in summary
+        assert "GERRIT_SSH_PRIVKEY" in summary
+        assert "GERRIT_SERVER" in summary
+
+    def test_empty_results(self) -> None:
+        summary = format_check_results_summary([], "test-org", "skip")
+        assert "## G2P Organisation Audit:" in summary
+
+
+# ===================================================================
+# check_github_config with org audit
+# ===================================================================
+
+
+class TestCheckGithubConfigWithOrgAudit:
+    """Tests for check_github_config including org audit."""
+
+    @patch("g2p_github.urlopen")
+    def test_org_audit_runs_in_verify_mode(self, mock_urlopen: MagicMock) -> None:
+        mock_urlopen.side_effect = [
+            # token check
+            _make_urlopen_response(200, {"login": "bot"}),
+            # org check
+            _make_urlopen_response(200, {"login": "test-org"}),
+            # magic repo
+            _make_urlopen_response(200, {"name": ".github"}),
+            # .github verify workflows
+            _make_urlopen_response(
+                200,
+                {
+                    "workflows": [
+                        {
+                            "path": ".github/workflows/gerrit-verify.yaml",
+                            "state": "active",
+                        },
+                    ]
+                },
+            ),
+            # .github merge workflows
+            _make_urlopen_response(
+                200,
+                {
+                    "workflows": [
+                        {
+                            "path": ".github/workflows/gerrit-merge.yaml",
+                            "state": "active",
+                        },
+                    ]
+                },
+            ),
+            # org secrets check
+            _make_urlopen_response(
+                200,
+                {
+                    "total_count": 1,
+                    "secrets": [{"name": "GERRIT_SSH_PRIVKEY"}],
+                },
+            ),
+            # org variables check
+            _make_urlopen_response(
+                200,
+                {
+                    "total_count": 4,
+                    "variables": [
+                        {"name": "GERRIT_SERVER", "value": "host:29418"},
+                        {"name": "GERRIT_SSH_USER", "value": "user"},
+                        {"name": "GERRIT_KNOWN_HOSTS", "value": "key"},
+                        {"name": "GERRIT_URL", "value": "url"},
+                    ],
+                },
+            ),
+        ]
+        config = _minimal_config(org_setup="verify")
+        results = check_github_config(config)
+        check_names = [r.check_name for r in results]
+        assert "org_secrets" in check_names
+        assert "org_variables" in check_names
+        assert all(r.passed for r in results)
+
+    @patch("g2p_github.urlopen")
+    def test_org_audit_skipped_when_skip(self, mock_urlopen: MagicMock) -> None:
+        mock_urlopen.side_effect = [
+            # token check
+            _make_urlopen_response(200, {"login": "bot"}),
+            # org check
+            _make_urlopen_response(200, {"login": "test-org"}),
+            # magic repo
+            _make_urlopen_response(200, {"name": ".github"}),
+            # .github verify workflows
+            _make_urlopen_response(
+                200,
+                {
+                    "workflows": [
+                        {
+                            "path": ".github/workflows/gerrit-verify.yaml",
+                            "state": "active",
+                        },
+                    ]
+                },
+            ),
+            # .github merge workflows
+            _make_urlopen_response(
+                200,
+                {
+                    "workflows": [
+                        {
+                            "path": ".github/workflows/gerrit-merge.yaml",
+                            "state": "active",
+                        },
+                    ]
+                },
+            ),
+        ]
+        config = _minimal_config(org_setup="skip")
+        results = check_github_config(config)
+        check_names = [r.check_name for r in results]
+        assert "org_secrets" not in check_names
+        assert "org_variables" not in check_names
+
+
+# ===================================================================
+# New constants for org audit
+# ===================================================================
+
+
+class TestOrgAuditConstants:
+    """Tests for the org audit constants."""
+
+    def test_required_org_secrets(self) -> None:
+        assert "GERRIT_SSH_PRIVKEY" in REQUIRED_ORG_SECRETS
+
+    def test_optional_org_secrets(self) -> None:
+        assert "GERRIT_SSH_PRIVKEY_G2G" in OPTIONAL_ORG_SECRETS
+
+    def test_required_org_variables(self) -> None:
+        assert "GERRIT_SERVER" in REQUIRED_ORG_VARIABLES
+        assert "GERRIT_SSH_USER" in REQUIRED_ORG_VARIABLES
+        assert "GERRIT_KNOWN_HOSTS" in REQUIRED_ORG_VARIABLES
+        assert "GERRIT_URL" in REQUIRED_ORG_VARIABLES
+
+    def test_required_org_variables_count(self) -> None:
+        assert len(REQUIRED_ORG_VARIABLES) == 4

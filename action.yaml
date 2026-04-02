@@ -322,6 +322,24 @@ inputs:
       Auto-fetched via ssh-keyscan when not provided.
     required: false
     default: ''
+  g2p_org_setup:
+    description: |
+      Controls GitHub org verification and auto-provisioning.
+      Options:
+        provision - Audit and auto-create absent config
+        verify   - Audit and report only (default)
+        skip     - Do not audit org configuration
+    required: false
+    default: 'verify'
+  g2p_org_token_map:
+    description: |
+      Base64-encoded JSON array mapping GitHub org names
+      to PATs for org-level provisioning. Required when
+      g2p_org_setup is 'provision'. Each entry needs:
+      {"github_org": "org-name", "token": "ghp_xxx"}
+      See docs/GITHUB-ORG-VERIFY-CONFIG.md for details.
+    required: false
+    default: ''
 
 outputs:
   container_ids:
@@ -376,6 +394,18 @@ outputs:
   g2p_ssh_public_key:
     description: "Public key for downstream deploy-key setup"
     value: ${{ steps.configure-g2p.outputs.g2p_ssh_public_key || steps.g2p-defaults.outputs.g2p_ssh_public_key }}
+  g2p_org_audit_results:
+    description: >-
+      JSON array of org-level audit check results.
+    value: >-
+      ${{ steps.configure-g2p.outputs.g2p_org_audit_results
+         || steps.g2p-defaults.outputs.g2p_org_audit_results }}
+  g2p_org_provisioned:
+    description: >-
+      Whether org auto-provisioning ran successfully.
+    value: >-
+      ${{ steps.configure-g2p.outputs.g2p_org_provisioned
+         || steps.g2p-defaults.outputs.g2p_org_provisioned }}
 
 runs:
   using: "composite"
@@ -665,6 +695,8 @@ runs:
         echo "g2p_validation_results=[]" >> "$GITHUB_OUTPUT"
         echo "g2p_token_provided=false" >> "$GITHUB_OUTPUT"
         echo "g2p_ssh_public_key=" >> "$GITHUB_OUTPUT"
+        echo "g2p_org_audit_results=[]" >> "$GITHUB_OUTPUT"
+        echo "g2p_org_provisioned=false" >> "$GITHUB_OUTPUT"
 
     # Configure G2P (gerrit_to_platform)
     - name: "Configure G2P integration"
@@ -685,6 +717,8 @@ runs:
         G2P_VALIDATE_REPOS: ${{ inputs.g2p_validate_repos }}
         G2P_SSH_PRIVATE_KEY: ${{ inputs.g2p_ssh_private_key }}
         G2P_GITHUB_KNOWN_HOSTS: ${{ inputs.g2p_github_known_hosts }}
+        G2P_ORG_SETUP: ${{ inputs.g2p_org_setup }}
+        G2P_ORG_TOKEN_MAP: ${{ inputs.g2p_org_token_map }}
         DEBUG: ${{ inputs.debug }}
       run: |
         # Configure gerrit_to_platform inside containers (Python)

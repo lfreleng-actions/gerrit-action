@@ -1,0 +1,33 @@
+{
+  "total_count": 4,
+  "variables": [
+    {
+      "name": "GERRIT_SERVER",
+      "value": "gerrit.onap.org",
+      "created_at": "2025-01-15T00:00:00Z",
+      "updated_at": "2025-01-15T00:00:00Z",
+      "visibility": "all"
+    },
+    {
+      "name": "GERRIT_SSH_USER",
+      "value": "lfci",
+      "created_at": "2025-01-15T00:00:00Z",
+      "updated_at": "2025-01-15T00:00:00Z",
+      "visibility": "all"
+    },
+    {
+      "name": "GERRIT_KNOWN_HOSTS",
+      "value": "gerrit.onap.org ssh-ed25519 AAAA...",
+      "created_at": "2025-01-15T00:00:00Z",
+      "updated_at": "2025-01-15T00:00:00Z",
+      "visibility": "all"
+    },
+    {
+      "name": "GERRIT_URL",
+      "value": "https://gerrit.onap.org/r/",
+      "created_at": "2025-01-15T00:00:00Z",
+      "updated_at": "2025-01-15T00:00:00Z",
+      "visibility": "all"
+    }
+  ]
+}

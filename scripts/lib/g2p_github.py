@@ -60,6 +60,20 @@ REQUIRED_WORKFLOW_INPUTS: tuple[str, ...] = (
 )
 """Standard ``GERRIT_*`` inputs every g2p workflow must accept."""
 
+REQUIRED_ORG_SECRETS: tuple[str, ...] = ("GERRIT_SSH_PRIVKEY",)
+"""Secrets that must exist at the org level."""
+
+OPTIONAL_ORG_SECRETS: tuple[str, ...] = ("GERRIT_SSH_PRIVKEY_G2G",)
+"""Secrets that are recommended but not required."""
+
+REQUIRED_ORG_VARIABLES: tuple[str, ...] = (
+    "GERRIT_SERVER",
+    "GERRIT_SSH_USER",
+    "GERRIT_KNOWN_HOSTS",
+    "GERRIT_URL",
+)
+"""Variables that must exist at the org level."""
+
 _HTTP_TIMEOUT = 30
 """Default timeout in seconds for HTTP calls."""
 
@@ -613,6 +627,671 @@ def check_repos_exist(
     )
 
 
+def check_org_secrets(
+    token: str,
+    owner: str,
+) -> G2PCheckResult:
+    """Check the org has required Actions secrets.
+
+    Uses REST: ``GET /orgs/{owner}/actions/secrets``
+    Falls back gracefully on 403 (insufficient permissions).
+
+    Parameters
+    ----------
+    token:
+        GitHub PAT.
+    owner:
+        GitHub organisation login.
+
+    Returns
+    -------
+    G2PCheckResult
+        Passed if all required secret names exist.
+    """
+    url = f"{GITHUB_API_BASE}/orgs/{owner}/actions/secrets"
+
+    try:
+        status, data = _github_request(url, token)
+    except URLError as exc:
+        return G2PCheckResult(
+            check_name="org_secrets",
+            passed=False,
+            message=f"Network error checking org secrets: {exc}",
+            severity="warning",
+        )
+
+    if status == 403:
+        return G2PCheckResult(
+            check_name="org_secrets",
+            passed=False,
+            message=(
+                f"Cannot audit org secrets for '{owner}' — "
+                "insufficient permissions (needs read:org or "
+                "Organization Secrets read scope)"
+            ),
+            severity="warning",
+        )
+
+    if status != 200:
+        return G2PCheckResult(
+            check_name="org_secrets",
+            passed=False,
+            message=(f"Failed to list org secrets for '{owner}' (HTTP {status})"),
+            severity="warning",
+            details={"status": status},
+        )
+
+    if not isinstance(data, dict):
+        return G2PCheckResult(
+            check_name="org_secrets",
+            passed=False,
+            message="Unexpected response format from org secrets API",
+            severity="warning",
+        )
+
+    secret_names: set[str] = {s["name"] for s in data.get("secrets", []) if "name" in s}
+
+    missing_required = [s for s in REQUIRED_ORG_SECRETS if s not in secret_names]
+    missing_optional = [s for s in OPTIONAL_ORG_SECRETS if s not in secret_names]
+    found = [
+        s for s in (*REQUIRED_ORG_SECRETS, *OPTIONAL_ORG_SECRETS) if s in secret_names
+    ]
+
+    details: dict[str, Any] = {
+        "missing_required": missing_required,
+        "missing_optional": missing_optional,
+        "found": found,
+    }
+
+    if missing_required:
+        return G2PCheckResult(
+            check_name="org_secrets",
+            passed=False,
+            message=(
+                f"Org '{owner}' is missing required secret(s): {missing_required}"
+            ),
+            severity="error",
+            details=details,
+        )
+
+    msg = f"All required org secrets present in '{owner}'"
+    severity = "info"
+    if missing_optional:
+        msg += f" (optional missing: {missing_optional})"
+        severity = "warning"
+
+    return G2PCheckResult(
+        check_name="org_secrets",
+        passed=True,
+        message=msg,
+        severity=severity,
+        details=details,
+    )
+
+
+def check_org_variables(
+    token: str,
+    owner: str,
+) -> G2PCheckResult:
+    """Check the org has required Actions variables.
+
+    Uses REST: ``GET /orgs/{owner}/actions/variables``
+    Also checks that variable values are non-empty.
+
+    Parameters
+    ----------
+    token:
+        GitHub PAT.
+    owner:
+        GitHub organisation login.
+
+    Returns
+    -------
+    G2PCheckResult
+        Passed if all required variables exist and hold data.
+    """
+    url = f"{GITHUB_API_BASE}/orgs/{owner}/actions/variables"
+
+    try:
+        status, data = _github_request(url, token)
+    except URLError as exc:
+        return G2PCheckResult(
+            check_name="org_variables",
+            passed=False,
+            message=f"Network error checking org variables: {exc}",
+            severity="warning",
+        )
+
+    if status == 403:
+        return G2PCheckResult(
+            check_name="org_variables",
+            passed=False,
+            message=(
+                f"Cannot audit org variables for '{owner}' — "
+                "insufficient permissions (needs read:org or "
+                "Organization Variables read scope)"
+            ),
+            severity="warning",
+        )
+
+    if status != 200:
+        return G2PCheckResult(
+            check_name="org_variables",
+            passed=False,
+            message=(f"Failed to list org variables for '{owner}' (HTTP {status})"),
+            severity="warning",
+            details={"status": status},
+        )
+
+    if not isinstance(data, dict):
+        return G2PCheckResult(
+            check_name="org_variables",
+            passed=False,
+            message="Unexpected response format from org variables API",
+            severity="warning",
+        )
+
+    var_map: dict[str, str] = {
+        v["name"]: v.get("value", "") for v in data.get("variables", []) if "name" in v
+    }
+
+    missing = [v for v in REQUIRED_ORG_VARIABLES if v not in var_map]
+    empty = [
+        v for v in REQUIRED_ORG_VARIABLES if v in var_map and not var_map[v].strip()
+    ]
+    found = [v for v in REQUIRED_ORG_VARIABLES if v in var_map]
+
+    details: dict[str, Any] = {
+        "missing": missing,
+        "empty": empty,
+        "found": found,
+    }
+
+    if missing:
+        return G2PCheckResult(
+            check_name="org_variables",
+            passed=False,
+            message=(f"Org '{owner}' is missing required variable(s): {missing}"),
+            severity="error",
+            details=details,
+        )
+
+    if empty:
+        return G2PCheckResult(
+            check_name="org_variables",
+            passed=False,
+            message=(f"Org '{owner}' has empty variable(s): {empty}"),
+            severity="warning",
+            details=details,
+        )
+
+    return G2PCheckResult(
+        check_name="org_variables",
+        passed=True,
+        message=(f"All required org variables present and populated in '{owner}'"),
+        severity="info",
+        details=details,
+    )
+
+
+def check_workflow_inputs(
+    token: str,
+    owner: str,
+    repo: str,
+    workflow_path: str,
+) -> G2PCheckResult:
+    """Verify a workflow file has required GERRIT_* inputs.
+
+    Uses GraphQL to fetch file content, then parses the YAML
+    to check for required ``workflow_dispatch`` inputs.
+
+    Parameters
+    ----------
+    token:
+        GitHub PAT.
+    owner:
+        GitHub org or user.
+    repo:
+        Repository name.
+    workflow_path:
+        Path to the workflow file (e.g.
+        ``.github/workflows/gerrit-verify.yaml``).
+
+    Returns
+    -------
+    G2PCheckResult
+        Passed if all required inputs are present.
+    """
+    check_name = f"workflow_inputs_{repo}_{workflow_path.split('/')[-1]}"
+
+    query = """
+    query WorkflowContent($owner: String!, $repo: String!, $expr: String!) {
+      repository(owner: $owner, name: $repo) {
+        object(expression: $expr) {
+          ... on Blob {
+            text
+          }
+        }
+      }
+    }
+    """
+    variables = {
+        "owner": owner,
+        "repo": repo,
+        "expr": f"HEAD:{workflow_path}",
+    }
+
+    try:
+        status, data = _graphql_query(token, query, variables)
+    except URLError as exc:
+        return G2PCheckResult(
+            check_name=check_name,
+            passed=False,
+            message=f"Network error fetching workflow content: {exc}",
+            severity="warning",
+        )
+
+    if status != 200:
+        return G2PCheckResult(
+            check_name=check_name,
+            passed=False,
+            message=(f"Failed to fetch workflow content (HTTP {status})"),
+            severity="warning",
+            details={"status": status},
+        )
+
+    # Navigate the GraphQL response
+    repo_data = data.get("data", {}).get("repository", {})
+    obj = repo_data.get("object")
+    if not obj or "text" not in obj:
+        return G2PCheckResult(
+            check_name=check_name,
+            passed=False,
+            message=(
+                f"Could not retrieve content of {workflow_path} in {owner}/{repo}"
+            ),
+            severity="warning",
+        )
+
+    # Parse the YAML content
+    try:
+        import yaml
+
+        workflow = yaml.safe_load(obj["text"])
+    except Exception as exc:
+        return G2PCheckResult(
+            check_name=check_name,
+            passed=False,
+            message=(f"Failed to parse {workflow_path}: {exc}"),
+            severity="warning",
+        )
+
+    if not isinstance(workflow, dict):
+        return G2PCheckResult(
+            check_name=check_name,
+            passed=False,
+            message=f"Workflow {workflow_path} is not a valid YAML mapping",
+            severity="warning",
+        )
+
+    # Extract workflow_dispatch inputs
+    on_block = workflow.get("on", workflow.get(True, {}))
+    if isinstance(on_block, dict):
+        dispatch = on_block.get("workflow_dispatch", {})
+    else:
+        dispatch = {}
+
+    if not isinstance(dispatch, dict):
+        dispatch = {}
+
+    inputs = dispatch.get("inputs", {})
+    if not isinstance(inputs, dict):
+        inputs = {}
+
+    input_names = set(inputs.keys())
+    missing = [name for name in REQUIRED_WORKFLOW_INPUTS if name not in input_names]
+
+    details: dict[str, Any] = {
+        "missing": missing,
+        "found": [name for name in REQUIRED_WORKFLOW_INPUTS if name in input_names],
+        "workflow_path": workflow_path,
+    }
+
+    if missing:
+        return G2PCheckResult(
+            check_name=check_name,
+            passed=False,
+            message=(
+                f"Workflow {workflow_path} in {owner}/{repo} "
+                f"is missing required input(s): {missing}"
+            ),
+            severity="warning",
+            details=details,
+        )
+
+    return G2PCheckResult(
+        check_name=check_name,
+        passed=True,
+        message=(
+            f"Workflow {workflow_path} has all "
+            f"{len(REQUIRED_WORKFLOW_INPUTS)} required inputs"
+        ),
+        severity="info",
+        details=details,
+    )
+
+
+def provision_org_secret(
+    token: str,
+    owner: str,
+    secret_name: str,
+    secret_value: str,
+) -> G2PCheckResult:
+    """Create or update an org-level Actions secret.
+
+    Fetches the org public key, encrypts the value with PyNaCl,
+    and PUTs the encrypted secret.
+
+    Parameters
+    ----------
+    token:
+        GitHub PAT with org admin scope.
+    owner:
+        GitHub organisation login.
+    secret_name:
+        Name of the secret to create/update.
+    secret_value:
+        Plaintext value to encrypt and store.
+
+    Returns
+    -------
+    G2PCheckResult
+        Passed if the secret was created/updated successfully.
+    """
+    # Step 1: Fetch the org public key
+    key_url = f"{GITHUB_API_BASE}/orgs/{owner}/actions/secrets/public-key"
+    try:
+        status, key_data = _github_request(key_url, token)
+    except URLError as exc:
+        return G2PCheckResult(
+            check_name=f"provision_secret_{secret_name}",
+            passed=False,
+            message=f"Network error fetching org public key: {exc}",
+            severity="error",
+        )
+
+    if status != 200 or not isinstance(key_data, dict):
+        return G2PCheckResult(
+            check_name=f"provision_secret_{secret_name}",
+            passed=False,
+            message=(f"Failed to fetch org public key for '{owner}' (HTTP {status})"),
+            severity="error",
+        )
+
+    key_id = key_data.get("key_id", "")
+    public_key_b64 = key_data.get("key", "")
+    if not key_id or not public_key_b64:
+        return G2PCheckResult(
+            check_name=f"provision_secret_{secret_name}",
+            passed=False,
+            message="Org public key response missing key_id or key",
+            severity="error",
+        )
+
+    # Step 2: Encrypt the secret value
+    try:
+        import base64
+
+        from nacl.public import (  # pyright: ignore[reportMissingImports]
+            PublicKey,
+            SealedBox,
+        )
+
+        public_key_bytes = base64.b64decode(public_key_b64)
+        sealed_box = SealedBox(PublicKey(public_key_bytes))
+        encrypted = sealed_box.encrypt(
+            secret_value.encode("utf-8"),
+        )
+        encrypted_b64 = base64.b64encode(encrypted).decode("utf-8")
+    except ImportError:
+        return G2PCheckResult(
+            check_name=f"provision_secret_{secret_name}",
+            passed=False,
+            message=(
+                "PyNaCl is required for secret provisioning — "
+                "install with: pip install PyNaCl"
+            ),
+            severity="error",
+        )
+    except Exception as exc:
+        return G2PCheckResult(
+            check_name=f"provision_secret_{secret_name}",
+            passed=False,
+            message=f"Failed to encrypt secret value: {exc}",
+            severity="error",
+        )
+
+    # Step 3: PUT the encrypted secret
+    put_url = f"{GITHUB_API_BASE}/orgs/{owner}/actions/secrets/{secret_name}"
+    body = json.dumps(
+        {
+            "encrypted_value": encrypted_b64,
+            "key_id": key_id,
+            "visibility": "all",
+        }
+    ).encode("utf-8")
+
+    try:
+        status, _ = _github_request(put_url, token, method="PUT", body=body)
+    except URLError as exc:
+        return G2PCheckResult(
+            check_name=f"provision_secret_{secret_name}",
+            passed=False,
+            message=f"Network error creating secret: {exc}",
+            severity="error",
+        )
+
+    if status in (201, 204):
+        return G2PCheckResult(
+            check_name=f"provision_secret_{secret_name}",
+            passed=True,
+            message=f"Created/updated org secret '{secret_name}'",
+            severity="info",
+        )
+
+    return G2PCheckResult(
+        check_name=f"provision_secret_{secret_name}",
+        passed=False,
+        message=(f"Failed to create org secret '{secret_name}' (HTTP {status})"),
+        severity="error",
+        details={"status": status},
+    )
+
+
+def provision_org_variable(
+    token: str,
+    owner: str,
+    variable_name: str,
+    variable_value: str,
+    *,
+    exists: bool = False,
+) -> G2PCheckResult:
+    """Create or update an org-level Actions variable.
+
+    Uses POST for new variables and PATCH for existing ones.
+
+    Parameters
+    ----------
+    token:
+        GitHub PAT with org admin scope.
+    owner:
+        GitHub organisation login.
+    variable_name:
+        Name of the variable.
+    variable_value:
+        Value to set.
+    exists:
+        Whether the variable already exists (use PATCH).
+
+    Returns
+    -------
+    G2PCheckResult
+        Passed if the variable was created/updated.
+    """
+    body_dict: dict[str, str] = {
+        "name": variable_name,
+        "value": variable_value,
+        "visibility": "all",
+    }
+    body = json.dumps(body_dict).encode("utf-8")
+
+    if exists:
+        url = f"{GITHUB_API_BASE}/orgs/{owner}/actions/variables/{variable_name}"
+        method = "PATCH"
+    else:
+        url = f"{GITHUB_API_BASE}/orgs/{owner}/actions/variables"
+        method = "POST"
+
+    try:
+        status, resp_data = _github_request(url, token, method=method, body=body)
+    except URLError as exc:
+        return G2PCheckResult(
+            check_name=f"provision_variable_{variable_name}",
+            passed=False,
+            message=f"Network error creating variable: {exc}",
+            severity="error",
+        )
+
+    # POST returns 201, PATCH returns 204 (no content)
+    if status in (201, 204):
+        action = "Updated" if exists else "Created"
+        return G2PCheckResult(
+            check_name=f"provision_variable_{variable_name}",
+            passed=True,
+            message=(f"{action} org variable '{variable_name}'"),
+            severity="info",
+        )
+
+    # 409 on POST means it already exists — retry with PATCH
+    if status == 409 and not exists:
+        logger.info(
+            "Variable '%s' already exists; switching to PATCH",
+            variable_name,
+        )
+        return provision_org_variable(
+            token,
+            owner,
+            variable_name,
+            variable_value,
+            exists=True,
+        )
+
+    return G2PCheckResult(
+        check_name=f"provision_variable_{variable_name}",
+        passed=False,
+        message=(
+            f"Failed to create/update org variable '{variable_name}' (HTTP {status})"
+        ),
+        severity="error",
+        details={"status": status},
+    )
+
+
+def provision_org_config(
+    config: G2PConfig,
+    audit_results: list[G2PCheckResult],
+    gerrit_info: dict[str, str],
+    org_token: str | None = None,
+) -> list[G2PCheckResult]:
+    """Auto-provision absent org configuration.
+
+    Inspects audit results to determine what is missing, then
+    creates secrets and variables as needed.
+
+    Parameters
+    ----------
+    config:
+        G2P configuration.
+    audit_results:
+        Results from the audit phase.
+    gerrit_info:
+        Dict with keys: ``ssh_private_key``, ``ssh_host``,
+        ``ssh_port``, ``ssh_user``, ``http_url``,
+        ``known_hosts``.
+    org_token:
+        Elevated-permission token for org write ops.
+        Falls back to ``config.github_token``.
+
+    Returns
+    -------
+    list[G2PCheckResult]
+        Results of provisioning operations.
+    """
+    token = org_token or config.github_token
+    owner = config.github_owner
+    results: list[G2PCheckResult] = []
+
+    # Find the failed audit checks
+    secrets_check = next(
+        (r for r in audit_results if r.check_name == "org_secrets"),
+        None,
+    )
+    variables_check = next(
+        (r for r in audit_results if r.check_name == "org_variables"),
+        None,
+    )
+
+    # Provision missing secrets
+    if secrets_check and not secrets_check.passed:
+        missing = secrets_check.details.get("missing_required", [])
+        for secret_name in missing:
+            value = gerrit_info.get("ssh_private_key", "")
+            if secret_name == "GERRIT_SSH_PRIVKEY" and value:
+                results.append(provision_org_secret(token, owner, secret_name, value))
+            else:
+                logger.warning(
+                    "No value available for secret '%s'",
+                    secret_name,
+                )
+
+    # Provision missing variables
+    variable_map: dict[str, str] = {
+        "GERRIT_SERVER": (
+            f"{gerrit_info.get('ssh_host', '')}:{gerrit_info.get('ssh_port', '')}"
+            if gerrit_info.get("ssh_host")
+            else ""
+        ),
+        "GERRIT_SSH_USER": gerrit_info.get("ssh_user", ""),
+        "GERRIT_KNOWN_HOSTS": gerrit_info.get("known_hosts", ""),
+        "GERRIT_URL": gerrit_info.get("http_url", ""),
+    }
+
+    if variables_check and not variables_check.passed:
+        missing_vars = variables_check.details.get("missing", [])
+        empty_vars = variables_check.details.get("empty", [])
+        vars_to_provision = missing_vars + empty_vars
+
+        for var_name in vars_to_provision:
+            value = variable_map.get(var_name, "")
+            if not value:
+                logger.warning(
+                    "No value available for variable '%s'",
+                    var_name,
+                )
+                continue
+            results.append(
+                provision_org_variable(
+                    token,
+                    owner,
+                    var_name,
+                    value,
+                    exists=var_name in empty_vars,
+                )
+            )
+
+    return results
+
+
 # ---------------------------------------------------------------------------
 # Aggregate check runner
 # ---------------------------------------------------------------------------
@@ -714,6 +1393,14 @@ def check_github_config(
             )
         )
 
+    # -- Check 8: Org secrets -------------------------------------------
+    if config.org_setup != "skip":
+        results.append(check_org_secrets(config.github_token, config.github_owner))
+
+    # -- Check 9: Org variables -----------------------------------------
+    if config.org_setup != "skip":
+        results.append(check_org_variables(config.github_token, config.github_owner))
+
     return results
 
 
@@ -790,3 +1477,74 @@ def results_to_json(results: list[G2PCheckResult]) -> str:
         ],
         indent=2,
     )
+
+
+def format_check_results_summary(
+    results: list[G2PCheckResult],
+    owner: str,
+    mode: str,
+    provisioned: list[str] | None = None,
+) -> str:
+    """Render check results as a Markdown summary table.
+
+    Parameters
+    ----------
+    results:
+        Check outcomes from the audit phase.
+    owner:
+        GitHub org name (for the heading).
+    mode:
+        The ``g2p_org_setup`` mode value.
+    provisioned:
+        Descriptions of items auto-provisioned
+        (used when mode is ``'provision'``).
+
+    Returns
+    -------
+    str
+        Markdown content for ``$GITHUB_STEP_SUMMARY``.
+    """
+    lines: list[str] = [
+        f"## G2P Organisation Audit: `{owner}`",
+        "",
+        "| Check | Status | Details |",
+        "|-------|--------|---------|",
+    ]
+
+    for r in results:
+        status = "PASS ✅" if r.passed else "FAIL ❌"
+        if not r.passed and r.severity == "warning":
+            status = "WARN ⚠️"
+        lines.append(f"| {r.check_name} | {status} | {r.message} |")
+
+    lines.append("")
+
+    if mode == "provision":
+        lines.append("**Mode:** `provision` — auto-provisioning enabled.")
+    elif mode == "verify":
+        lines.append("**Mode:** `verify` — reporting only, no changes made.")
+    else:
+        lines.append(f"**Mode:** `{mode}`")
+
+    lines.append("")
+
+    if provisioned:
+        lines.append("### Provisioned Items")
+        lines.append("")
+        for item in provisioned:
+            lines.append(f"- {item}")
+        lines.append("")
+
+    # List absent items when in verify mode
+    if mode == "verify":
+        absent: list[str] = []
+        for r in results:
+            if not r.passed and r.severity == "error":
+                absent.append(f"- **{r.check_name}**: {r.message}")
+        if absent:
+            lines.append("### Absent Items")
+            lines.append("")
+            lines.extend(absent)
+            lines.append("")
+
+    return "\n".join(lines)

@@ -51,6 +51,8 @@ ALL_G2P_ENV_VARS = [
     "G2P_VALIDATE_REPOS",
     "G2P_SSH_PRIVATE_KEY",
     "G2P_GITHUB_KNOWN_HOSTS",
+    "G2P_ORG_SETUP",
+    "G2P_ORG_TOKEN_MAP",
 ]
 
 
@@ -81,6 +83,7 @@ def _set_onap_env(mp: pytest.MonkeyPatch) -> None:
     )
     mp.setenv("G2P_HOOKS", "patchset-created,comment-added,change-merged")
     mp.setenv("G2P_VALIDATION_MODE", "warn")
+    mp.setenv("G2P_ORG_SETUP", "skip")
 
 
 def _set_fdio_env(mp: pytest.MonkeyPatch) -> None:
@@ -99,12 +102,14 @@ def _set_fdio_env(mp: pytest.MonkeyPatch) -> None:
             }
         ),
     )
+    mp.setenv("G2P_ORG_SETUP", "skip")
 
 
 def _set_minimal_env(mp: pytest.MonkeyPatch) -> None:
     """Set the minimum viable G2P environment."""
     mp.setenv("G2P_ENABLE", "true")
     mp.setenv("G2P_GITHUB_OWNER", "test-org")
+    mp.setenv("G2P_ORG_SETUP", "skip")
 
 
 def _make_docker_mock(

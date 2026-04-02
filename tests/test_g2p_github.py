@@ -33,6 +33,9 @@ from g2p_github import (
     check_workflows,
     format_check_results,
     format_check_results_summary,
+    provision_org_config,
+    provision_org_secret,
+    provision_org_variable,
     results_to_json,
 )
 
@@ -997,9 +1000,10 @@ class TestCheckOrgSecrets:
         mock_urlopen.return_value = _make_urlopen_response(
             200,
             {
-                "total_count": 2,
+                "total_count": 3,
                 "secrets": [
                     {"name": "GERRIT_SSH_PRIVKEY"},
+                    {"name": "GERRIT_SSH_PRIVKEY_G2G"},
                     {"name": "OTHER_SECRET"},
                 ],
             },
@@ -1008,6 +1012,9 @@ class TestCheckOrgSecrets:
         assert result.passed is True
         assert result.check_name == "org_secrets"
         assert "GERRIT_SSH_PRIVKEY" not in result.details.get("missing_required", [])
+        assert "GERRIT_SSH_PRIVKEY_G2G" not in result.details.get(
+            "missing_optional", []
+        )
 
     @patch("g2p_github.urlopen")
     def test_required_missing(self, mock_urlopen: MagicMock) -> None:
@@ -1050,7 +1057,7 @@ class TestCheckOrgSecrets:
         assert result.severity == "warning"
 
     @patch("g2p_github.urlopen")
-    def test_optional_missing_still_passes(self, mock_urlopen: MagicMock) -> None:
+    def test_optional_missing_warns(self, mock_urlopen: MagicMock) -> None:
         mock_urlopen.return_value = _make_urlopen_response(
             200,
             {
@@ -1059,7 +1066,8 @@ class TestCheckOrgSecrets:
             },
         )
         result = check_org_secrets("ghp_token", "test-org")
-        assert result.passed is True
+        assert result.passed is False
+        assert result.severity == "warning"
         assert "GERRIT_SSH_PRIVKEY_G2G" in result.details.get("missing_optional", [])
 
 
@@ -1419,8 +1427,11 @@ class TestCheckGithubConfigWithOrgAudit:
             _make_urlopen_response(
                 200,
                 {
-                    "total_count": 1,
-                    "secrets": [{"name": "GERRIT_SSH_PRIVKEY"}],
+                    "total_count": 2,
+                    "secrets": [
+                        {"name": "GERRIT_SSH_PRIVKEY"},
+                        {"name": "GERRIT_SSH_PRIVKEY_G2G"},
+                    ],
                 },
             ),
             # org variables check
@@ -1507,3 +1518,468 @@ class TestOrgAuditConstants:
 
     def test_required_org_variables_count(self) -> None:
         assert len(REQUIRED_ORG_VARIABLES) == 4
+
+
+# ===================================================================
+# Provisioning function tests
+# ===================================================================
+
+
+def _make_fake_nacl_modules() -> tuple[MagicMock, MagicMock, dict[str, Any]]:
+    """Build fake nacl modules for testing encryption path.
+
+    Returns a tuple of (mock_public_key_cls, mock_sealed_box_cls,
+    modules_dict) where modules_dict can be passed to
+    patch.dict("sys.modules", ...).
+    """
+    from types import ModuleType
+
+    mock_nacl = ModuleType("nacl")
+    mock_nacl_public = ModuleType("nacl.public")
+
+    mock_pk_cls = MagicMock(name="PublicKey")
+    mock_sb_cls = MagicMock(name="SealedBox")
+    mock_sb_instance = MagicMock()
+    mock_sb_instance.encrypt.return_value = b"encrypted_bytes"
+    mock_sb_cls.return_value = mock_sb_instance
+
+    mock_nacl_public.PublicKey = mock_pk_cls  # type: ignore[attr-defined]
+    mock_nacl_public.SealedBox = mock_sb_cls  # type: ignore[attr-defined]
+
+    modules = {"nacl": mock_nacl, "nacl.public": mock_nacl_public}
+    return mock_pk_cls, mock_sb_cls, modules
+
+
+class TestProvisionOrgSecret:
+    """Tests for provision_org_secret."""
+
+    @patch("g2p_github.urlopen")
+    def test_success_created(self, mock_urlopen: MagicMock) -> None:
+        """Secret created successfully (201)."""
+        _, _, nacl_mods = _make_fake_nacl_modules()
+        key_resp = _make_urlopen_response(
+            200,
+            {"key_id": "keyid123", "key": "dGVzdHB1YmtleQ=="},
+        )
+        put_resp = _make_urlopen_response(201, "")
+        mock_urlopen.side_effect = [key_resp, put_resp]
+        with patch.dict("sys.modules", nacl_mods):
+            result = provision_org_secret(
+                "ghp_tok", "test-org", "MY_SECRET", "secret_val"
+            )
+        assert result.passed is True
+        assert result.check_name == "provision_secret_MY_SECRET"
+        assert "Created/updated" in result.message
+
+    @patch("g2p_github.urlopen")
+    def test_success_updated(self, mock_urlopen: MagicMock) -> None:
+        """Secret updated successfully (204)."""
+        _, _, nacl_mods = _make_fake_nacl_modules()
+        key_resp = _make_urlopen_response(
+            200,
+            {"key_id": "keyid123", "key": "dGVzdHB1YmtleQ=="},
+        )
+        put_resp = _make_urlopen_response(204, "")
+        mock_urlopen.side_effect = [key_resp, put_resp]
+        with patch.dict("sys.modules", nacl_mods):
+            result = provision_org_secret(
+                "ghp_tok", "test-org", "MY_SECRET", "secret_val"
+            )
+        assert result.passed is True
+
+    @patch("g2p_github.urlopen")
+    def test_public_key_network_error(self, mock_urlopen: MagicMock) -> None:
+        """URLError when fetching the org public key."""
+        from urllib.error import URLError
+
+        mock_urlopen.side_effect = URLError("Connection refused")
+        result = provision_org_secret("ghp_tok", "test-org", "MY_SECRET", "val")
+        assert result.passed is False
+        assert "Network error fetching org public key" in result.message
+
+    @patch("g2p_github.urlopen")
+    def test_public_key_non_200(self, mock_urlopen: MagicMock) -> None:
+        """Non-200 status on the public-key fetch."""
+        mock_urlopen.side_effect = _make_http_error(403, {"message": "Forbidden"})
+        result = provision_org_secret("ghp_tok", "test-org", "MY_SECRET", "val")
+        assert result.passed is False
+        assert "Failed to fetch org public key" in result.message
+
+    @patch("g2p_github.urlopen")
+    def test_public_key_missing_key_id(self, mock_urlopen: MagicMock) -> None:
+        """Public key response missing key_id."""
+        mock_urlopen.return_value = _make_urlopen_response(
+            200, {"key_id": "", "key": "dGVzdHB1YmtleQ=="}
+        )
+        result = provision_org_secret("ghp_tok", "test-org", "MY_SECRET", "val")
+        assert result.passed is False
+        assert "missing key_id or key" in result.message
+
+    @patch("g2p_github.urlopen")
+    def test_public_key_missing_key(self, mock_urlopen: MagicMock) -> None:
+        """Public key response missing key value."""
+        mock_urlopen.return_value = _make_urlopen_response(
+            200, {"key_id": "keyid123", "key": ""}
+        )
+        result = provision_org_secret("ghp_tok", "test-org", "MY_SECRET", "val")
+        assert result.passed is False
+        assert "missing key_id or key" in result.message
+
+    @patch("g2p_github.urlopen")
+    def test_nacl_import_error(self, mock_urlopen: MagicMock) -> None:
+        """ImportError when PyNaCl is not installed."""
+        mock_urlopen.return_value = _make_urlopen_response(
+            200,
+            {"key_id": "keyid123", "key": "dGVzdHB1YmtleQ=="},
+        )
+        with patch.dict("sys.modules", {"nacl": None, "nacl.public": None}):
+            result = provision_org_secret("ghp_tok", "test-org", "MY_SECRET", "val")
+        assert result.passed is False
+        assert "PyNaCl is required" in result.message
+
+    @patch("g2p_github.urlopen")
+    def test_encryption_error(self, mock_urlopen: MagicMock) -> None:
+        """Generic exception during encryption."""
+        from types import ModuleType
+
+        mock_urlopen.return_value = _make_urlopen_response(
+            200,
+            {"key_id": "keyid123", "key": "dGVzdHB1YmtleQ=="},
+        )
+        mock_nacl = ModuleType("nacl")
+        mock_nacl_public = ModuleType("nacl.public")
+
+        def _bad_public_key(_data: bytes) -> None:
+            msg = "bad key data"
+            raise ValueError(msg)
+
+        mock_nacl_public.PublicKey = _bad_public_key  # type: ignore[attr-defined]
+        mock_nacl_public.SealedBox = MagicMock  # type: ignore[attr-defined]
+
+        mods = {"nacl": mock_nacl, "nacl.public": mock_nacl_public}
+        with patch.dict("sys.modules", mods):
+            result = provision_org_secret("ghp_tok", "test-org", "MY_SECRET", "val")
+        assert result.passed is False
+        assert "Failed to encrypt secret value" in result.message
+
+    @patch("g2p_github.urlopen")
+    def test_put_network_error(self, mock_urlopen: MagicMock) -> None:
+        """URLError on the PUT request."""
+        from urllib.error import URLError
+
+        _, _, nacl_mods = _make_fake_nacl_modules()
+        key_resp = _make_urlopen_response(
+            200,
+            {"key_id": "keyid123", "key": "dGVzdHB1YmtleQ=="},
+        )
+        mock_urlopen.side_effect = [
+            key_resp,
+            URLError("Connection reset"),
+        ]
+        with patch.dict("sys.modules", nacl_mods):
+            result = provision_org_secret("ghp_tok", "test-org", "MY_SECRET", "val")
+        assert result.passed is False
+        assert "Network error creating secret" in result.message
+
+    @patch("g2p_github.urlopen")
+    def test_put_failure_status(self, mock_urlopen: MagicMock) -> None:
+        """PUT returns unexpected status (e.g. 422)."""
+        _, _, nacl_mods = _make_fake_nacl_modules()
+        key_resp = _make_urlopen_response(
+            200,
+            {"key_id": "keyid123", "key": "dGVzdHB1YmtleQ=="},
+        )
+        put_resp = _make_urlopen_response(422, "")
+        mock_urlopen.side_effect = [key_resp, put_resp]
+        with patch.dict("sys.modules", nacl_mods):
+            result = provision_org_secret("ghp_tok", "test-org", "MY_SECRET", "val")
+        assert result.passed is False
+        assert "422" in result.message
+
+
+class TestProvisionOrgVariable:
+    """Tests for provision_org_variable."""
+
+    @patch("g2p_github.urlopen")
+    def test_create_new_variable(self, mock_urlopen: MagicMock) -> None:
+        """POST creates a new variable (201)."""
+        mock_urlopen.return_value = _make_urlopen_response(201, "")
+        result = provision_org_variable("ghp_tok", "test-org", "MY_VAR", "my_value")
+        assert result.passed is True
+        assert result.check_name == "provision_variable_MY_VAR"
+        assert "Created" in result.message
+
+    @patch("g2p_github.urlopen")
+    def test_update_existing_variable(self, mock_urlopen: MagicMock) -> None:
+        """PATCH updates an existing variable (204)."""
+        mock_urlopen.return_value = _make_urlopen_response(204, "")
+        result = provision_org_variable(
+            "ghp_tok", "test-org", "MY_VAR", "new_val", exists=True
+        )
+        assert result.passed is True
+        assert "Updated" in result.message
+
+    @patch("g2p_github.urlopen")
+    def test_conflict_409_retries_with_patch(self, mock_urlopen: MagicMock) -> None:
+        """POST 409 retries with PATCH and succeeds."""
+        post_resp = _make_urlopen_response(409, "")
+        patch_resp = _make_urlopen_response(204, "")
+        mock_urlopen.side_effect = [post_resp, patch_resp]
+        result = provision_org_variable("ghp_tok", "test-org", "MY_VAR", "val")
+        assert result.passed is True
+        assert "Updated" in result.message
+
+    @patch("g2p_github.urlopen")
+    def test_network_error(self, mock_urlopen: MagicMock) -> None:
+        """URLError during request."""
+        from urllib.error import URLError
+
+        mock_urlopen.side_effect = URLError("Connection refused")
+        result = provision_org_variable("ghp_tok", "test-org", "MY_VAR", "val")
+        assert result.passed is False
+        assert "Network error" in result.message
+
+    @patch("g2p_github.urlopen")
+    def test_unexpected_status(self, mock_urlopen: MagicMock) -> None:
+        """Unexpected HTTP status (e.g. 500)."""
+        mock_urlopen.side_effect = _make_http_error(500, "Internal Server Error")
+        result = provision_org_variable("ghp_tok", "test-org", "MY_VAR", "val")
+        assert result.passed is False
+        assert "500" in result.message
+
+    @patch("g2p_github.urlopen")
+    def test_409_on_patch_does_not_recurse(self, mock_urlopen: MagicMock) -> None:
+        """PATCH returning 409 falls through to error."""
+        mock_urlopen.return_value = _make_urlopen_response(409, "")
+        result = provision_org_variable(
+            "ghp_tok", "test-org", "MY_VAR", "val", exists=True
+        )
+        assert result.passed is False
+        assert "409" in result.message
+
+
+class TestProvisionOrgConfig:
+    """Tests for provision_org_config."""
+
+    @patch("g2p_github.provision_org_secret")
+    def test_provisions_missing_secret(self, mock_prov_secret: MagicMock) -> None:
+        """Calls provision_org_secret for missing GERRIT_SSH_PRIVKEY."""
+        mock_prov_secret.return_value = G2PCheckResult(
+            check_name="provision_secret_GERRIT_SSH_PRIVKEY",
+            passed=True,
+            message="Created/updated org secret 'GERRIT_SSH_PRIVKEY'",
+            severity="info",
+        )
+        config = _minimal_config(org_setup="provision")
+        audit = [
+            G2PCheckResult(
+                check_name="org_secrets",
+                passed=False,
+                message="Missing required secrets",
+                details={
+                    "missing_required": ["GERRIT_SSH_PRIVKEY"],
+                },
+            ),
+        ]
+        gerrit_info = {"ssh_private_key": "-----BEGIN OPENSSH-----"}
+        results = provision_org_config(config, audit, gerrit_info)
+        assert len(results) == 1
+        assert results[0].passed is True
+        mock_prov_secret.assert_called_once()
+
+    @patch("g2p_github.provision_org_variable")
+    def test_provisions_missing_variables(self, mock_prov_var: MagicMock) -> None:
+        """Calls provision_org_variable for each missing variable."""
+        mock_prov_var.return_value = G2PCheckResult(
+            check_name="provision_variable_GERRIT_URL",
+            passed=True,
+            message="Created org variable 'GERRIT_URL'",
+            severity="info",
+        )
+        config = _minimal_config(org_setup="provision")
+        audit = [
+            G2PCheckResult(
+                check_name="org_variables",
+                passed=False,
+                message="Missing variables",
+                details={"missing": ["GERRIT_URL"], "empty": []},
+            ),
+        ]
+        gerrit_info = {"http_url": "https://gerrit.example.org/r/"}
+        results = provision_org_config(config, audit, gerrit_info)
+        assert len(results) == 1
+        assert results[0].passed is True
+        mock_prov_var.assert_called_once_with(
+            "ghp_testtoken123",
+            "test-org",
+            "GERRIT_URL",
+            "https://gerrit.example.org/r/",
+            exists=False,
+        )
+
+    @patch("g2p_github.provision_org_variable")
+    def test_empty_var_uses_patch(self, mock_prov_var: MagicMock) -> None:
+        """Variables in the empty list use exists=True (PATCH)."""
+        mock_prov_var.return_value = G2PCheckResult(
+            check_name="provision_variable_GERRIT_URL",
+            passed=True,
+            message="Updated",
+            severity="info",
+        )
+        config = _minimal_config(org_setup="provision")
+        audit = [
+            G2PCheckResult(
+                check_name="org_variables",
+                passed=False,
+                message="Empty variables",
+                details={
+                    "missing": [],
+                    "empty": ["GERRIT_URL"],
+                },
+            ),
+        ]
+        gerrit_info = {"http_url": "https://gerrit.example.org/r/"}
+        results = provision_org_config(config, audit, gerrit_info)
+        assert len(results) == 1
+        mock_prov_var.assert_called_once_with(
+            "ghp_testtoken123",
+            "test-org",
+            "GERRIT_URL",
+            "https://gerrit.example.org/r/",
+            exists=True,
+        )
+
+    def test_no_audit_results_returns_empty(self) -> None:
+        """No audit results means nothing to provision."""
+        config = _minimal_config(org_setup="provision")
+        results = provision_org_config(config, [], {})
+        assert results == []
+
+    def test_all_passed_returns_empty(self) -> None:
+        """Passed audit results skip provisioning."""
+        config = _minimal_config(org_setup="provision")
+        audit = [
+            G2PCheckResult(
+                check_name="org_secrets",
+                passed=True,
+                message="All present",
+            ),
+            G2PCheckResult(
+                check_name="org_variables",
+                passed=True,
+                message="All present",
+            ),
+        ]
+        results = provision_org_config(config, audit, {})
+        assert results == []
+
+    def test_missing_secret_value_logs_warning(self) -> None:
+        """Secret name present but gerrit_info lacks the value."""
+        config = _minimal_config(org_setup="provision")
+        audit = [
+            G2PCheckResult(
+                check_name="org_secrets",
+                passed=False,
+                message="Missing",
+                details={
+                    "missing_required": ["GERRIT_SSH_PRIVKEY"],
+                },
+            ),
+        ]
+        # Empty gerrit_info — no ssh_private_key
+        results = provision_org_config(config, audit, {})
+        assert results == []
+
+    def test_missing_variable_value_skipped(self) -> None:
+        """Variable in missing list but no value in gerrit_info."""
+        config = _minimal_config(org_setup="provision")
+        audit = [
+            G2PCheckResult(
+                check_name="org_variables",
+                passed=False,
+                message="Missing",
+                details={
+                    "missing": ["GERRIT_SERVER"],
+                    "empty": [],
+                },
+            ),
+        ]
+        # No ssh_host in gerrit_info → GERRIT_SERVER maps to ""
+        results = provision_org_config(config, audit, {})
+        assert results == []
+
+    def test_uses_org_token_when_provided(self) -> None:
+        """Prefers org_token over config.github_token."""
+        config = _minimal_config(org_setup="provision")
+        audit = [
+            G2PCheckResult(
+                check_name="org_variables",
+                passed=False,
+                message="Missing",
+                details={
+                    "missing": ["GERRIT_URL"],
+                    "empty": [],
+                },
+            ),
+        ]
+        gerrit_info = {"http_url": "https://gerrit.example.org/r/"}
+        with patch("g2p_github.provision_org_variable") as mock_prov:
+            mock_prov.return_value = G2PCheckResult(
+                check_name="x", passed=True, message="ok"
+            )
+            provision_org_config(config, audit, gerrit_info, org_token="elevated_tok")
+            mock_prov.assert_called_once_with(
+                "elevated_tok",
+                "test-org",
+                "GERRIT_URL",
+                "https://gerrit.example.org/r/",
+                exists=False,
+            )
+
+    def test_gerrit_server_built_from_host_port(self) -> None:
+        """GERRIT_SERVER value constructed from ssh_host:ssh_port."""
+        config = _minimal_config(org_setup="provision")
+        audit = [
+            G2PCheckResult(
+                check_name="org_variables",
+                passed=False,
+                message="Missing",
+                details={
+                    "missing": ["GERRIT_SERVER"],
+                    "empty": [],
+                },
+            ),
+        ]
+        gerrit_info = {
+            "ssh_host": "gerrit.example.org",
+            "ssh_port": "29418",
+        }
+        with patch("g2p_github.provision_org_variable") as mock_prov:
+            mock_prov.return_value = G2PCheckResult(
+                check_name="x", passed=True, message="ok"
+            )
+            provision_org_config(config, audit, gerrit_info)
+            mock_prov.assert_called_once_with(
+                "ghp_testtoken123",
+                "test-org",
+                "GERRIT_SERVER",
+                "gerrit.example.org:29418",
+                exists=False,
+            )
+
+    def test_unknown_secret_name_skipped(self) -> None:
+        """Secret name not matching GERRIT_SSH_PRIVKEY is skipped."""
+        config = _minimal_config(org_setup="provision")
+        audit = [
+            G2PCheckResult(
+                check_name="org_secrets",
+                passed=False,
+                message="Missing",
+                details={
+                    "missing_required": ["UNKNOWN_SECRET"],
+                },
+            ),
+        ]
+        gerrit_info = {"ssh_private_key": "key_data"}
+        results = provision_org_config(config, audit, gerrit_info)
+        assert results == []

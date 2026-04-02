@@ -105,7 +105,7 @@ def decode_org_tokens(
         return {}
 
     try:
-        decoded = base64.b64decode(b64_value).decode("utf-8")
+        decoded = base64.b64decode(b64_value, validate=True).decode("utf-8")
     except Exception as exc:
         raise ConfigError(
             f"Failed to decode g2p_org_token_map — bad base64: {exc}"

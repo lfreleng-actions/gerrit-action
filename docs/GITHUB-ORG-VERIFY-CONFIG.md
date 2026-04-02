@@ -1407,8 +1407,8 @@ is an admin/owner of all target orgs.
 | Token lacks `admin:org` in `verify` mode | Warning: "Cannot audit org secrets/variables -- insufficient permissions" |
 | Token lacks `admin:org` in `provision` mode | Error: "Cannot provision org config -- token needs admin:org scope" |
 | `g2p_org_token_map` provided but no entry for this org | Warning: falls back to `g2p_github_token` |
-| `g2p_org_token_map` holds bad base64 | Error: "Failed to decode g2p_org_token_map -- bad base64" |
-| `g2p_org_token_map` holds correct base64 but bad JSON | Error: "Failed to parse g2p_org_token_map -- bad JSON" |
+| `g2p_org_token_map` holds bad base64 | Warning: falls back to `g2p_github_token` with message "Failed to decode g2p_org_token_map" |
+| `g2p_org_token_map` holds correct base64 but bad JSON | Warning: falls back to `g2p_github_token` with message "Failed to parse g2p_org_token_map" |
 | PyNaCl not available for secret encryption | Error: "PyNaCl is required for secret provisioning -- install with: pip install PyNaCl" |
 | Secret encryption fails | Error with details; secret not created |
 | Variable creation returns 409 (already exists) | Switch to PATCH (update) |

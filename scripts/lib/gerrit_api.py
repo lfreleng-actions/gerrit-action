@@ -1162,6 +1162,7 @@ class GerritDevClient:
         1. Creates the account if it doesn't exist
         2. Adds the provided SSH keys
         3. Optionally adds the user to Administrators group
+           (with retry and post-add verification)
         4. Flushes relevant caches
 
         Args:
@@ -1173,6 +1174,11 @@ class GerritDevClient:
 
         Returns:
             Account info dict
+
+        Raises:
+            GerritAPIError: If the user cannot be added to the
+                Administrators group after retries and the
+                add_to_admins flag is True.
         """
         logger.info(f"Setting up user: {username}")
 
@@ -1199,21 +1205,140 @@ class GerritDevClient:
                 added = self.add_ssh_keys(account_id, valid_keys)
                 logger.info(f"Added {len(added)} SSH keys")
 
-        # Add to Administrators group
+        # Add to Administrators group with retry and verification
         if add_to_admins:
-            try:
-                self.add_to_group(account_id, "Administrators")
-                logger.info(f"Added {username} to Administrators group")
-            except GerritConflictError:
-                logger.debug(f"{username} already in Administrators group")
-            except GerritAPIError as e:
-                logger.warning(f"Failed to add to Administrators: {e}")
+            self._add_to_admins_with_retry(username, account_id)
 
         # Flush caches
         self.flush_cache()
         logger.info(f"User {username} configured successfully")
 
         return account
+
+    def _add_to_admins_with_retry(
+        self,
+        username: str,
+        account_id: int,
+        max_attempts: int = 3,
+        retry_delay: float = 2.0,
+    ) -> None:
+        """Add an account to the Administrators group with retry.
+
+        Retries on transient failures (the Gerrit auth subsystem may
+        lag behind the health check on container startup).  After a
+        successful API call the membership is verified by listing the
+        group members and confirming the account ID is present.
+
+        Args:
+            username: Username (for log messages).
+            account_id: Gerrit account ID to add.
+            max_attempts: Maximum number of add attempts.
+            retry_delay: Initial delay between retries (doubles
+                each attempt).
+
+        Raises:
+            GerritAPIError: If the account cannot be added or
+                verified after all attempts.
+        """
+        group = "Administrators"
+        last_error: GerritAPIError | None = None
+        delay = retry_delay
+
+        for attempt in range(1, max_attempts + 1):
+            try:
+                self.add_to_group(account_id, group)
+                logger.info(
+                    "Added %s to %s group (attempt %d/%d)",
+                    username,
+                    group,
+                    attempt,
+                    max_attempts,
+                )
+            except GerritConflictError:
+                logger.debug(
+                    "%s already in %s group",
+                    username,
+                    group,
+                )
+            except GerritAPIError as exc:
+                last_error = exc
+                if attempt < max_attempts:
+                    logger.warning(
+                        "Attempt %d/%d to add %s to %s failed: %s (retrying in %.0fs)",
+                        attempt,
+                        max_attempts,
+                        username,
+                        group,
+                        exc,
+                        delay,
+                    )
+                    time.sleep(delay)
+                    delay *= 2
+                    continue
+                # Final attempt failed — fall through to raise
+                break
+
+            # --- Verify membership after a successful add -----------
+            if self._verify_group_membership(account_id, group):
+                logger.info(
+                    "Verified %s is in %s group ✅",
+                    username,
+                    group,
+                )
+                return
+
+            # Verification failed — treat as transient and retry
+            last_error = GerritAPIError(
+                f"Verification failed: {username} (account {account_id}) "
+                f"not found in {group} members after add_to_group "
+                f"reported success"
+            )
+            if attempt < max_attempts:
+                logger.warning(
+                    "Attempt %d/%d: %s not found in %s members "
+                    "after add (retrying in %.0fs)",
+                    attempt,
+                    max_attempts,
+                    username,
+                    group,
+                    delay,
+                )
+                time.sleep(delay)
+                delay *= 2
+                continue
+
+        # All attempts exhausted
+        raise GerritAPIError(
+            f"Failed to add {username} to {group} after "
+            f"{max_attempts} attempt(s): {last_error}"
+        )
+
+    def _verify_group_membership(
+        self,
+        account_id: int,
+        group: str,
+    ) -> bool:
+        """Check whether an account is a member of a group.
+
+        Args:
+            account_id: Gerrit account ID to look for.
+            group: Group name to inspect.
+
+        Returns:
+            True if the account is present in the group's member
+            list, False otherwise (including on API errors).
+        """
+        try:
+            members = self.list_group_members(group)
+            return any(m.get("_account_id") == account_id for m in members)
+        except GerritAPIError as exc:
+            logger.warning(
+                "Could not verify %s membership in %s: %s",
+                account_id,
+                group,
+                exc,
+            )
+            return False
 
 
 def validate_ssh_key(key: str) -> bool:

@@ -1087,7 +1087,7 @@ Add to the configure-g2p step's `env:` block:
          || steps.g2p-defaults.outputs.g2p_org_audit_results }}
   g2p_org_provisioned:
     description: >-
-      Whether org auto-provisioning ran.
+      Whether any org items were auto-provisioned (created/updated).
     value: >-
       ${{ steps.configure-g2p.outputs.g2p_org_provisioned
          || steps.g2p-defaults.outputs.g2p_org_provisioned }}

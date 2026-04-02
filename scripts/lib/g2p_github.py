@@ -648,48 +648,63 @@ def check_org_secrets(
     G2PCheckResult
         Passed if all required secret names exist.
     """
-    url = f"{GITHUB_API_BASE}/orgs/{owner}/actions/secrets"
+    secret_names: set[str] = set()
+    page = 1
 
-    try:
-        status, data = _github_request(url, token)
-    except URLError as exc:
-        return G2PCheckResult(
-            check_name="org_secrets",
-            passed=False,
-            message=f"Network error checking org secrets: {exc}",
-            severity="warning",
+    while True:
+        url = f"{GITHUB_API_BASE}/orgs/{owner}/actions/secrets?per_page=100&page={page}"
+
+        try:
+            status, data = _github_request(url, token)
+        except URLError as exc:
+            return G2PCheckResult(
+                check_name="org_secrets",
+                passed=False,
+                message=f"Network error checking org secrets: {exc}",
+                severity="warning",
+            )
+
+        if status == 403:
+            return G2PCheckResult(
+                check_name="org_secrets",
+                passed=False,
+                message=(
+                    f"Cannot audit org secrets for '{owner}' — "
+                    "insufficient permissions (needs read:org or "
+                    "Organization Secrets read scope)"
+                ),
+                severity="warning",
+            )
+
+        if status != 200:
+            return G2PCheckResult(
+                check_name="org_secrets",
+                passed=False,
+                message=(f"Failed to list org secrets for '{owner}' (HTTP {status})"),
+                severity="warning",
+                details={"status": status},
+            )
+
+        if not isinstance(data, dict):
+            return G2PCheckResult(
+                check_name="org_secrets",
+                passed=False,
+                message="Unexpected response format from org secrets API",
+                severity="warning",
+            )
+
+        page_secrets = data.get("secrets", [])
+        if not page_secrets:
+            break
+
+        secret_names.update(
+            s["name"] for s in page_secrets if isinstance(s, dict) and "name" in s
         )
 
-    if status == 403:
-        return G2PCheckResult(
-            check_name="org_secrets",
-            passed=False,
-            message=(
-                f"Cannot audit org secrets for '{owner}' — "
-                "insufficient permissions (needs read:org or "
-                "Organization Secrets read scope)"
-            ),
-            severity="warning",
-        )
+        if len(page_secrets) < 100:
+            break
 
-    if status != 200:
-        return G2PCheckResult(
-            check_name="org_secrets",
-            passed=False,
-            message=(f"Failed to list org secrets for '{owner}' (HTTP {status})"),
-            severity="warning",
-            details={"status": status},
-        )
-
-    if not isinstance(data, dict):
-        return G2PCheckResult(
-            check_name="org_secrets",
-            passed=False,
-            message="Unexpected response format from org secrets API",
-            severity="warning",
-        )
-
-    secret_names: set[str] = {s["name"] for s in data.get("secrets", []) if "name" in s}
+        page += 1
 
     missing_required = [s for s in REQUIRED_ORG_SECRETS if s not in secret_names]
     missing_optional = [s for s in OPTIONAL_ORG_SECRETS if s not in secret_names]
@@ -716,13 +731,15 @@ def check_org_secrets(
 
     msg = f"All required org secrets present in '{owner}'"
     severity = "info"
+    passed = True
     if missing_optional:
         msg += f" (optional missing: {missing_optional})"
         severity = "warning"
+        passed = False
 
     return G2PCheckResult(
         check_name="org_secrets",
-        passed=True,
+        passed=passed,
         message=msg,
         severity=severity,
         details=details,
@@ -750,50 +767,65 @@ def check_org_variables(
     G2PCheckResult
         Passed if all required variables exist and hold data.
     """
-    url = f"{GITHUB_API_BASE}/orgs/{owner}/actions/variables"
+    var_map: dict[str, str] = {}
+    page = 1
 
-    try:
-        status, data = _github_request(url, token)
-    except URLError as exc:
-        return G2PCheckResult(
-            check_name="org_variables",
-            passed=False,
-            message=f"Network error checking org variables: {exc}",
-            severity="warning",
+    while True:
+        url = (
+            f"{GITHUB_API_BASE}/orgs/{owner}/actions/variables?per_page=100&page={page}"
         )
 
-    if status == 403:
-        return G2PCheckResult(
-            check_name="org_variables",
-            passed=False,
-            message=(
-                f"Cannot audit org variables for '{owner}' — "
-                "insufficient permissions (needs read:org or "
-                "Organization Variables read scope)"
-            ),
-            severity="warning",
-        )
+        try:
+            status, data = _github_request(url, token)
+        except URLError as exc:
+            return G2PCheckResult(
+                check_name="org_variables",
+                passed=False,
+                message=f"Network error checking org variables: {exc}",
+                severity="warning",
+            )
 
-    if status != 200:
-        return G2PCheckResult(
-            check_name="org_variables",
-            passed=False,
-            message=(f"Failed to list org variables for '{owner}' (HTTP {status})"),
-            severity="warning",
-            details={"status": status},
-        )
+        if status == 403:
+            return G2PCheckResult(
+                check_name="org_variables",
+                passed=False,
+                message=(
+                    f"Cannot audit org variables for '{owner}' — "
+                    "insufficient permissions (needs read:org or "
+                    "Organization Variables read scope)"
+                ),
+                severity="warning",
+            )
 
-    if not isinstance(data, dict):
-        return G2PCheckResult(
-            check_name="org_variables",
-            passed=False,
-            message="Unexpected response format from org variables API",
-            severity="warning",
-        )
+        if status != 200:
+            return G2PCheckResult(
+                check_name="org_variables",
+                passed=False,
+                message=(f"Failed to list org variables for '{owner}' (HTTP {status})"),
+                severity="warning",
+                details={"status": status},
+            )
 
-    var_map: dict[str, str] = {
-        v["name"]: v.get("value", "") for v in data.get("variables", []) if "name" in v
-    }
+        if not isinstance(data, dict):
+            return G2PCheckResult(
+                check_name="org_variables",
+                passed=False,
+                message=("Unexpected response format from org variables API"),
+                severity="warning",
+            )
+
+        page_vars = data.get("variables", [])
+        if not page_vars:
+            break
+
+        for v in page_vars:
+            if isinstance(v, dict) and "name" in v:
+                var_map[v["name"]] = v.get("value", "")
+
+        if len(page_vars) < 100:
+            break
+
+        page += 1
 
     missing = [v for v in REQUIRED_ORG_VARIABLES if v not in var_map]
     empty = [

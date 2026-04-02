@@ -91,7 +91,7 @@ def _emit_g2p_outputs(
     org_audit_json:
         JSON string of org-level audit check results.
     org_provisioned:
-        Whether org auto-provisioning ran.
+        Whether any org-level items were actually provisioned.
     """
     write_output("g2p_enabled", "true")
     write_output("g2p_github_owner", config.github_owner)
@@ -190,46 +190,83 @@ def run() -> int:
     org_provisioned = False
     provisioned_items: list[str] = []
 
-    if g2p_config.org_setup != "skip" and g2p_config.validation_mode != "skip":
+    if g2p_config.org_setup != "skip":
         with log_group("G2P org-level audit"):
-            # The org checks are already included in check_results
-            # from check_github_config() above; extract them
-            org_results = (
-                [
+            # When validation ran, org checks are in check_results.
+            # Otherwise, run them standalone.
+            if check_results:
+                org_results = [
                     r
                     for r in check_results
                     if r.check_name in ("org_secrets", "org_variables")
                 ]
-                if g2p_config.validation_mode != "skip"
-                else []
-            )
+            else:
+                # Org audit requested but GitHub checks were
+                # skipped; run org checks directly
+                from g2p_github import (
+                    check_org_secrets,
+                    check_org_variables,
+                )
+
+                org_results = []
+                if g2p_config.github_token:
+                    org_results.append(
+                        check_org_secrets(
+                            g2p_config.github_token,
+                            g2p_config.github_owner,
+                        )
+                    )
+                    org_results.append(
+                        check_org_variables(
+                            g2p_config.github_token,
+                            g2p_config.github_owner,
+                        )
+                    )
+                else:
+                    msg = "Org audit requires a GitHub token; skipping org checks"
+                    logger.warning(msg)
+                    org_results.append(
+                        G2PCheckResult(
+                            check_name="org_audit",
+                            passed=False,
+                            message=msg,
+                            severity="warning",
+                        )
+                    )
 
             org_audit_json = results_to_json(org_results)
 
             # Auto-provision if mode is 'provision'
             if g2p_config.org_setup == "provision":
                 org_token = g2p_config.resolve_org_token()
-                # Build gerrit_info from available data
-                # (populated after containers start; empty here
-                # but the provisioning step runs after setup)
+                # gerrit_info will be populated after containers
+                # start (Step 5); provisioning runs here only if
+                # values are available from environment/config.
                 gerrit_info: dict[str, str] = {}
-                prov_results = provision_org_config(
-                    g2p_config,
-                    org_results,
-                    gerrit_info,
-                    org_token=org_token,
-                )
-                for pr in prov_results:
-                    if pr.passed:
-                        provisioned_items.append(pr.message)
-                    else:
-                        logger.warning("Provisioning failed: %s", pr.message)
-                org_provisioned = bool(provisioned_items)
+                if gerrit_info:
+                    prov_results = provision_org_config(
+                        g2p_config,
+                        org_results,
+                        gerrit_info,
+                        org_token=org_token,
+                    )
+                    for pr in prov_results:
+                        if pr.passed:
+                            provisioned_items.append(pr.message)
+                        else:
+                            logger.warning(
+                                "Provisioning failed: %s",
+                                pr.message,
+                            )
+                    org_provisioned = bool(provisioned_items)
+                else:
+                    logger.info(
+                        "Org provisioning deferred: Gerrit "
+                        "container info not yet available"
+                    )
 
             # Write step summary
-            all_summary_results = (
-                check_results if g2p_config.validation_mode != "skip" else []
-            )
+            all_summary_results = check_results if check_results else org_results
             summary_md = format_check_results_summary(
                 results=all_summary_results,
                 owner=g2p_config.github_owner,
@@ -240,11 +277,7 @@ def run() -> int:
 
             logger.info("Org audit complete (mode=%s)", g2p_config.org_setup)
     else:
-        logger.info(
-            "Org audit skipped (org_setup=%s, validation_mode=%s)",
-            g2p_config.org_setup,
-            g2p_config.validation_mode,
-        )
+        logger.info("Org audit skipped (org_setup=%s)", g2p_config.org_setup)
 
     # -- Step 4: Load running instances ----------------------------------
     action_config = ActionConfig.from_environment()

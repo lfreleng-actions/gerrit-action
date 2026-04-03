@@ -1558,7 +1558,7 @@ def format_check_results_summary(
     lines.append("")
 
     if mode == "provision":
-        lines.append("**Mode:** `provision` — auto-provisioning enabled.")
+        lines.append("**Mode:** `provision` — auto-provisioning requested (deferred).")
     elif mode == "verify":
         lines.append("**Mode:** `verify` — reporting only, no changes made.")
     else:

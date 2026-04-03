@@ -326,7 +326,7 @@ inputs:
     description: |
       Controls GitHub org verification and auto-provisioning.
       Options:
-        provision - Audit and auto-create absent config
+        provision - Audit-only (auto-provisioning deferred)
         verify   - Audit and report only (default)
         skip     - Do not audit org configuration
     required: false

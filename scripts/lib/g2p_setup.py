@@ -93,6 +93,7 @@ class G2PSetupResult:
         config_path: Path to the generated INI inside the container.
         hooks_enabled: Hook names that received symlinks.
         ssh_public_key: Public key (for downstream deploy-key setup).
+        ssh_private_key: SSH private key (for org-level secret provisioning).
         replication_remote_configured: Whether the g2p detection
             remote is present in ``replication.config`` (either
             already existing or newly appended).
@@ -101,6 +102,7 @@ class G2PSetupResult:
     config_path: str = ""
     hooks_enabled: list[str] = field(default_factory=list)
     ssh_public_key: str = ""
+    ssh_private_key: str = ""
     replication_remote_configured: bool = False
 
 
@@ -562,7 +564,7 @@ def setup_g2p_ssh(
     docker: DockerManager,
     cid: str,
     config: G2PConfig,
-) -> str:
+) -> tuple[str, str]:
     """Configure SSH for github.com inside the container.
 
     Handles:
@@ -585,11 +587,14 @@ def setup_g2p_ssh(
 
     Returns
     -------
-    str
-        The SSH public key (useful for deploy-key setup in downstream
-        steps).  Empty string if no key was configured.
+    tuple[str, str]
+        ``(public_key, private_key)`` — the SSH public key (for
+        deploy-key setup) and private key (for org-level secret
+        provisioning).  Either may be an empty string if no key
+        was configured.
     """
     public_key = ""
+    private_key = ""
     key_deployed = False
 
     # Ensure .ssh directory exists with correct permissions
@@ -700,7 +705,7 @@ def setup_g2p_ssh(
     else:
         logger.info("No SSH key deployed; skipping SSH client config")
 
-    return public_key
+    return public_key, private_key
 
 
 # ---------------------------------------------------------------------------
@@ -769,7 +774,11 @@ def setup_g2p(
         result.hooks_enabled = setup_g2p_hooks(docker, cid, config)
 
         # Step 6: SSH
-        result.ssh_public_key = setup_g2p_ssh(docker, cid, config)
+        result.ssh_public_key, result.ssh_private_key = setup_g2p_ssh(
+            docker,
+            cid,
+            config,
+        )
 
     except G2PSetupError:
         raise

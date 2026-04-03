@@ -34,6 +34,7 @@ import json
 import logging
 import sys
 from pathlib import Path
+from typing import Any
 
 # ---------------------------------------------------------------------------
 # Path setup – ensure ``scripts/lib`` is importable
@@ -56,6 +57,7 @@ from g2p_github import (  # noqa: E402
     check_github_config,
     format_check_results,
     format_check_results_summary,
+    provision_org_config,
     results_to_json,
 )
 from g2p_setup import G2PSetupResult, setup_g2p  # noqa: E402
@@ -118,6 +120,98 @@ def _emit_g2p_outputs(
 
     write_output("g2p_org_audit_results", org_audit_json)
     write_output("g2p_org_provisioned", str(org_provisioned).lower())
+
+
+# ---------------------------------------------------------------------------
+# Gerrit info builder (for org provisioning)
+# ---------------------------------------------------------------------------
+
+
+def _build_gerrit_info(
+    instances: dict[str, dict[str, Any]],
+    setup_results: list[G2PSetupResult],
+    action_config: ActionConfig,
+) -> dict[str, str]:
+    """Build the ``gerrit_info`` dict for org provisioning.
+
+    Extracts connection metadata from the first running instance
+    and the G2P setup results so that ``provision_org_config`` can
+    populate org-level secrets and variables.
+
+    The host and port values are derived from the same tunnel /
+    localhost logic used by ``start-instances.py`` so they point
+    at the *running container*, not the source Gerrit server.
+
+    Parameters
+    ----------
+    instances:
+        Loaded ``instances.json`` data.
+    setup_results:
+        Results from :func:`setup_g2p` for each container.
+    action_config:
+        The global :class:`ActionConfig`.
+
+    Returns
+    -------
+    dict[str, str]
+        Keys: ``ssh_private_key``, ``ssh_host``, ``ssh_port``,
+        ``ssh_user``, ``known_hosts``, ``http_url``.
+    """
+    info: dict[str, str] = {}
+
+    # Use first instance for connection metadata
+    if instances:
+        first_slug = sorted(instances.keys())[0]
+        meta = instances[first_slug]
+
+        # Resolve effective host/ports using the same logic as
+        # _resolve_tunnel() in start-instances.py: tunnel host +
+        # tunnel ports when configured, otherwise localhost +
+        # the container's mapped ports.
+        tunnel_host = action_config.tunnel_host
+        tunnel_ports = action_config.tunnel_ports
+        tc = tunnel_ports.get(first_slug) if tunnel_host else None
+
+        if tunnel_host and tc:
+            ssh_host = tunnel_host
+            ssh_port = str(tc.ssh_port)
+            http_port = str(tc.http_port)
+        else:
+            ssh_host = "localhost"
+            ssh_port = str(meta.get("ssh_port", ""))
+            http_port = str(meta.get("http_port", ""))
+
+        info["ssh_host"] = ssh_host
+        info["ssh_port"] = ssh_port
+        info["ssh_user"] = action_config.ssh_auth_username or "admin"
+
+        # HTTP URL: construct from effective host/port, optionally
+        # appending the API path when USE_API_PATH is enabled.
+        api_path = meta.get("api_path", "")
+        if action_config.use_api_path and api_path:
+            # Normalise: ensure leading /, strip trailing /
+            if not api_path.startswith("/"):
+                api_path = f"/{api_path}"
+            api_path = api_path.rstrip("/")
+            info["http_url"] = f"http://{ssh_host}:{http_port}{api_path}/"
+        else:
+            info["http_url"] = f"http://{ssh_host}:{http_port}/"
+
+        # Build known_hosts from captured SSH host keys
+        host_keys = meta.get("ssh_host_keys", {})
+        kh_lines: list[str] = []
+        for _key_type, key_data in sorted(host_keys.items()):
+            if key_data and ssh_host:
+                kh_lines.append(f"{ssh_host} {key_data}")
+        info["known_hosts"] = "\n".join(kh_lines)
+
+    # SSH private key from the first setup result
+    for r in setup_results:
+        if r.ssh_private_key:
+            info["ssh_private_key"] = r.ssh_private_key
+            break
+
+    return info
 
 
 # ---------------------------------------------------------------------------
@@ -253,51 +347,14 @@ def run() -> int:
                         )
                     )
 
-            # Auto-provision if mode is 'provision'
-            if g2p_config.org_setup == "provision":
-                # Gerrit container info is not yet
-                # available at this stage (containers
-                # start in Step 5).  Log a warning so
-                # users know provisioning is deferred.
-                logger.warning(
-                    "Org provisioning deferred: Gerrit "
-                    "container info not yet available. "
-                    "Audit results are still reported."
-                )
-                org_results.append(
-                    G2PCheckResult(
-                        check_name="org_provision",
-                        passed=False,
-                        message=(
-                            "Auto-provisioning deferred: "
-                            "Gerrit container info is not "
-                            "yet available at this stage"
-                        ),
-                        severity="warning",
-                    )
-                )
+            # Provisioning happens after container setup
+            # (Step 5b below) when gerrit_info is available.
 
             org_audit_json = results_to_json(org_results)
 
             logger.info("Org audit complete (mode=%s)", g2p_config.org_setup)
     else:
         logger.info("Org audit skipped (org_setup=%s)", g2p_config.org_setup)
-
-    # Write step summary unconditionally when results exist
-    if check_results or org_results:
-        seen_names: set[str] = set()
-        all_summary_results: list[G2PCheckResult] = []
-        for r in check_results + org_results:
-            if r.check_name not in seen_names:
-                seen_names.add(r.check_name)
-                all_summary_results.append(r)
-        summary_md = format_check_results_summary(
-            results=all_summary_results,
-            owner=g2p_config.github_owner,
-            mode=g2p_config.org_setup,
-            provisioned=provisioned_items or None,
-        )
-        write_summary(summary_md)
 
     # -- Step 4: Load running instances ----------------------------------
     action_config = ActionConfig.from_environment()
@@ -336,7 +393,70 @@ def run() -> int:
                 result.hooks_enabled,
             )
 
-    # -- Step 6: Emit outputs --------------------------------------------
+    # -- Step 5b: Org provisioning (after containers are configured) ------
+    if g2p_config.org_setup == "provision" and org_results:
+        with log_group("G2P org provisioning"):
+            # Build gerrit_info from instances + setup results
+            gerrit_info = _build_gerrit_info(
+                instances,
+                setup_results,
+                action_config,
+            )
+            org_token = g2p_config.resolve_org_token()
+
+            if not org_token:
+                msg = (
+                    "Cannot provision: no token available "
+                    "(set g2p_github_token or g2p_org_token_map)"
+                )
+                logger.warning(msg)
+                org_results.append(
+                    G2PCheckResult(
+                        check_name="org_provision",
+                        passed=False,
+                        message=msg,
+                        severity="error",
+                    )
+                )
+            else:
+                prov_results = provision_org_config(
+                    g2p_config,
+                    org_results,
+                    gerrit_info,
+                    org_token=org_token,
+                )
+                for pr in prov_results:
+                    if pr.passed:
+                        provisioned_items.append(pr.message)
+                        logger.info("Provisioned: %s", pr.message)
+                    else:
+                        logger.warning(
+                            "Provisioning failed: %s",
+                            pr.message,
+                        )
+                org_results.extend(prov_results)
+                org_provisioned = bool(provisioned_items)
+
+            # Recompute JSON after provisioning results
+            org_audit_json = results_to_json(org_results)
+
+    # -- Step 6: Write step summary --------------------------------------
+    if check_results or org_results:
+        seen_names: set[str] = set()
+        all_summary_results: list[G2PCheckResult] = []
+        for r in check_results + org_results:
+            if r.check_name not in seen_names:
+                seen_names.add(r.check_name)
+                all_summary_results.append(r)
+        summary_md = format_check_results_summary(
+            results=all_summary_results,
+            owner=g2p_config.github_owner,
+            mode=g2p_config.org_setup,
+            provisioned=provisioned_items or None,
+        )
+        write_summary(summary_md)
+
+    # -- Step 7: Emit outputs --------------------------------------------
     with log_group("G2P outputs"):
         _emit_g2p_outputs(
             g2p_config,

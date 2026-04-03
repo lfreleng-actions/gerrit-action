@@ -670,8 +670,9 @@ def check_org_secrets(
                 passed=False,
                 message=(
                     f"Cannot audit org secrets for '{owner}' — "
-                    "insufficient permissions (needs read:org or "
-                    "Organization Secrets read scope)"
+                    "insufficient permissions (classic PAT needs "
+                    "'admin:org' scope, or fine-grained token needs "
+                    "'Organization secrets: Read' permission)"
                 ),
                 severity="warning",
             )
@@ -791,8 +792,9 @@ def check_org_variables(
                 passed=False,
                 message=(
                     f"Cannot audit org variables for '{owner}' — "
-                    "insufficient permissions (needs read:org or "
-                    "Organization Variables read scope)"
+                    "insufficient permissions (classic PAT needs "
+                    "'admin:org' scope, or fine-grained token needs "
+                    "'Organization variables: Read' permission)"
                 ),
                 severity="warning",
             )
@@ -1558,7 +1560,7 @@ def format_check_results_summary(
     lines.append("")
 
     if mode == "provision":
-        lines.append("**Mode:** `provision` — auto-provisioning requested (deferred).")
+        lines.append("**Mode:** `provision` — auto-provisioning enabled.")
     elif mode == "verify":
         lines.append("**Mode:** `verify` — reporting only, no changes made.")
     else:

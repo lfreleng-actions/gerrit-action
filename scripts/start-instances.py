@@ -869,6 +869,9 @@ def _is_private_tunnel(tunnel_host: str) -> bool:
     except ValueError:
         return False
 
+    if not isinstance(addr, ipaddress.IPv4Address):
+        return False
+
     private_networks = (
         ipaddress.ip_network("10.0.0.0/8"),
         ipaddress.ip_network("172.16.0.0/12"),

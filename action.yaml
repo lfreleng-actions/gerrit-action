@@ -326,7 +326,7 @@ inputs:
     description: |
       Controls GitHub org verification and auto-provisioning.
       Options:
-        provision - Audit-only (auto-provisioning deferred)
+        provision - Audit and auto-create absent config
         verify   - Audit and report only (default)
         skip     - Do not audit org configuration
     required: false
@@ -720,6 +720,10 @@ runs:
         G2P_ORG_SETUP: ${{ inputs.g2p_org_setup }}
         G2P_ORG_TOKEN_MAP: ${{ inputs.g2p_org_token_map }}
         DEBUG: ${{ inputs.debug }}
+        USE_API_PATH: ${{ inputs.use_api_path }}
+        TUNNEL_HOST: ${{ inputs.tunnel_host }}
+        TUNNEL_PORTS: ${{ inputs.tunnel_ports }}
+        SSH_AUTH_USERNAME: ${{ inputs.ssh_auth_username }}
       run: |
         # Configure gerrit_to_platform inside containers (Python)
         python3 "${{ github.action_path }}/scripts/configure-g2p.py"

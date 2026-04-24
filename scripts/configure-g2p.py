@@ -55,6 +55,8 @@ from g2p_config import G2PConfig  # noqa: E402
 from g2p_github import (  # noqa: E402
     G2PCheckResult,
     check_github_config,
+    check_org_secrets,
+    check_org_variables,
     format_check_results,
     format_check_results_summary,
     provision_org_config,
@@ -219,6 +221,29 @@ def _build_gerrit_info(
 # ---------------------------------------------------------------------------
 
 
+def _emit_final_status(success: bool, reason: str = "") -> None:
+    """Print a single ✅/❌ summary line to stdout.
+
+    Bypasses the logger deliberately so this final status always
+    appears as plain stdout regardless of earlier warnings, and is
+    easy for a human to spot in the workflow console.
+    """
+    if success:
+        print("✅ Gerrit2Platform configuration succeeded")
+    else:
+        suffix = f": {reason}" if reason else ""
+        print(f"❌ Gerrit2Platform configuration failed{suffix}")
+
+
+def _pynacl_available() -> bool:
+    """Return True when PyNaCl can be imported."""
+    try:
+        import nacl.public  # noqa: F401  # pyright: ignore[reportMissingImports]
+    except ImportError:
+        return False
+    return True
+
+
 def run() -> int:
     """Configure G2P for all running Gerrit instances.
 
@@ -238,17 +263,37 @@ def run() -> int:
 
     logger.info("G2P integration enabled for '%s'", g2p_config.github_owner)
 
+    # -- Step 1b: PyNaCl precheck (provision mode only) ------------------
+    # Provisioning org-level secrets requires PyNaCl for sealed-box
+    # encryption.  Check early so we fail fast rather than after all
+    # the setup work.  Other modes (verify / skip) never touch PyNaCl
+    # so we do not import it or warn about it.
+    if g2p_config.org_setup == "provision" and not _pynacl_available():
+        logger.error(
+            "PyNaCl is required for org provisioning but is not "
+            "available; install it on the runner with "
+            "'python3 -m pip install --user PyNaCl' before "
+            "enabling g2p_org_setup=provision",
+        )
+        _emit_final_status(False, "PyNaCl missing (provision mode)")
+        return 1
+
     # -- Step 2: Validate config -----------------------------------------
     with log_group("G2P configuration validation"):
         errors = g2p_config.check()
         if errors:
             for err in errors:
+                # logger.error routes through _GitHubActionsFormatter
+                # which emits the ::error:: annotation exactly once.
                 logger.error("G2P config error: %s", err)
-                print(f"::error::G2P config: {err}", file=sys.stderr)
             raise G2PConfigError(f"G2P configuration has {len(errors)} error(s)")
         logger.info("G2P configuration valid ✅")
 
     # -- Step 3: GitHub checks -------------------------------------------
+    # These are the generic GitHub-side checks (token, org access,
+    # .github magic repo, workflow presence).  Org-level secret and
+    # variable audits are performed separately in step 3b so that
+    # provisioning (when enabled) happens *before* the final audit.
     check_json = "[]"
     check_results: list[G2PCheckResult] = []
     if g2p_config.validation_mode != "skip":
@@ -256,11 +301,13 @@ def run() -> int:
             check_results = check_github_config(g2p_config)
             check_json = results_to_json(check_results)
 
-            annotations, has_fatal = format_check_results(
+            # format_check_results logs warnings/errors through the
+            # standard logger (which emits ::warning::/::error::
+            # annotations exactly once); we do not re-print the
+            # returned annotation strings.
+            _, has_fatal = format_check_results(
                 check_results, g2p_config.validation_mode
             )
-            for annotation in annotations:
-                print(annotation, file=sys.stderr)
 
             if has_fatal:
                 raise G2PCheckError(
@@ -278,83 +325,54 @@ def run() -> int:
     else:
         logger.info("GitHub checks skipped (validation_mode=skip)")
 
-    # -- Step 3b: Org-level audit ----------------------------------------
+    # -- Step 3b: Org-level audit (initial snapshot) ---------------------
+    # This phase only *reports* the initial state. Provisioning (when
+    # requested) happens in step 5b after containers are running, and
+    # step 5c re-audits so the final ``org_audit_json`` reflects the
+    # post-provisioning state instead of flagging items we were about
+    # to create.
     org_audit_json = "[]"
     org_provisioned = False
     provisioned_items: list[str] = []
     org_results: list[G2PCheckResult] = []
 
     if g2p_config.org_setup != "skip":
-        with log_group("G2P org-level audit"):
-            # When validation ran, org checks are in check_results.
-            # Otherwise, run them standalone.
-            if check_results:
-                org_results = [
-                    r
-                    for r in check_results
-                    if r.check_name in ("org_secrets", "org_variables")
-                ]
-                # If GitHub checks ran but exited early (e.g. token
-                # or org_access failure), org-specific results won't
-                # be present.  Emit a synthetic result so the output
-                # always explains why org checks weren't executed.
-                if not org_results:
-                    org_results.append(
-                        G2PCheckResult(
-                            check_name="org_audit",
-                            passed=False,
-                            message=(
-                                "Org audit could not run because "
-                                "earlier GitHub checks failed or "
-                                "aborted before org-level checks. "
-                                "See the g2p_validation_results "
-                                "output for details."
-                            ),
-                            severity="warning",
-                        )
+        with log_group("G2P org-level audit (initial)"):
+            if g2p_config.github_token:
+                org_results.append(
+                    check_org_secrets(
+                        g2p_config.github_token,
+                        g2p_config.github_owner,
                     )
+                )
+                org_results.append(
+                    check_org_variables(
+                        g2p_config.github_token,
+                        g2p_config.github_owner,
+                    )
+                )
             else:
-                # Org audit requested but GitHub checks were
-                # skipped; run org checks directly
-                from g2p_github import (
-                    check_org_secrets,
-                    check_org_variables,
+                msg = "Org audit requires a GitHub token; skipping org checks"
+                logger.warning(msg)
+                org_results.append(
+                    G2PCheckResult(
+                        check_name="org_audit",
+                        passed=False,
+                        message=msg,
+                        severity="warning",
+                    )
                 )
 
-                org_results = []
-                if g2p_config.github_token:
-                    org_results.append(
-                        check_org_secrets(
-                            g2p_config.github_token,
-                            g2p_config.github_owner,
-                        )
-                    )
-                    org_results.append(
-                        check_org_variables(
-                            g2p_config.github_token,
-                            g2p_config.github_owner,
-                        )
-                    )
-                else:
-                    msg = "Org audit requires a GitHub token; skipping org checks"
-                    logger.warning(msg)
-                    org_results.append(
-                        G2PCheckResult(
-                            check_name="org_audit",
-                            passed=False,
-                            message=msg,
-                            severity="warning",
-                        )
-                    )
-
-            # Provisioning happens after container setup
-            # (Step 5b below) when gerrit_info is available.
-
             org_audit_json = results_to_json(org_results)
-
-            logger.info("Org audit complete (mode=%s)", g2p_config.org_setup)
+            logger.info(
+                "Initial org audit complete (mode=%s)",
+                g2p_config.org_setup,
+            )
     else:
-        logger.info("Org audit skipped (org_setup=%s)", g2p_config.org_setup)
+        logger.info(
+            "Org audit skipped (org_setup=%s)",
+            g2p_config.org_setup,
+        )
 
     # -- Step 4: Load running instances ----------------------------------
     action_config = ActionConfig.from_environment()
@@ -394,6 +412,7 @@ def run() -> int:
             )
 
     # -- Step 5b: Org provisioning (after containers are configured) ------
+    provision_had_fatal = False
     if g2p_config.org_setup == "provision" and org_results:
         with log_group("G2P org provisioning"):
             # Build gerrit_info from instances + setup results
@@ -409,7 +428,8 @@ def run() -> int:
                     "Cannot provision: no token available "
                     "(set g2p_github_token or g2p_org_token_map)"
                 )
-                logger.warning(msg)
+                logger.error(msg)
+                provision_had_fatal = True
                 org_results.append(
                     G2PCheckResult(
                         check_name="org_provision",
@@ -430,15 +450,44 @@ def run() -> int:
                         provisioned_items.append(pr.message)
                         logger.info("Provisioned: %s", pr.message)
                     else:
-                        logger.warning(
+                        logger.error(
                             "Provisioning failed: %s",
                             pr.message,
                         )
+                        provision_had_fatal = True
                 org_results.extend(prov_results)
                 org_provisioned = bool(provisioned_items)
 
-            # Recompute JSON after provisioning results
-            org_audit_json = results_to_json(org_results)
+    # -- Step 5c: Re-audit org state after provisioning -----------------
+    # Replace the initial audit entries with fresh results so the
+    # final JSON and summary reflect post-provisioning reality.
+    if (
+        g2p_config.org_setup == "provision"
+        and g2p_config.github_token
+        and org_provisioned
+    ):
+        with log_group("G2P org-level audit (post-provision)"):
+            fresh_secrets = check_org_secrets(
+                g2p_config.github_token,
+                g2p_config.github_owner,
+            )
+            fresh_variables = check_org_variables(
+                g2p_config.github_token,
+                g2p_config.github_owner,
+            )
+            # Keep any non-secret/variable entries (e.g. error
+            # breadcrumbs) and replace the original org_secrets /
+            # org_variables entries with the refreshed ones.
+            preserved = [
+                r
+                for r in org_results
+                if r.check_name not in ("org_secrets", "org_variables")
+            ]
+            org_results = [fresh_secrets, fresh_variables, *preserved]
+
+    # Recompute audit JSON after any provisioning / re-audit work
+    if g2p_config.org_setup != "skip":
+        org_audit_json = results_to_json(org_results)
 
     # -- Step 6: Write step summary --------------------------------------
     if check_results or org_results:
@@ -467,10 +516,55 @@ def run() -> int:
         )
 
         logger.info(
-            "G2P configured %d instance(s) ✅",
+            "G2P configured %d instance(s)",
             len(setup_results),
         )
 
+    # -- Step 8: Final single-line status -------------------------------
+    if provision_had_fatal:
+        _emit_final_status(False, "org provisioning failed")
+        return 1
+
+    # In provision mode, any remaining absent required secrets or
+    # variables mean the caller's downstream workflows will still be
+    # broken — surface that as a failure.
+    if g2p_config.org_setup == "provision":
+        # Only error-severity results indicate required items are
+        # still absent.  Warning-severity results (e.g. optional
+        # recommended secrets missing) are informational and must
+        # not fail the step.
+        post_failures = [
+            r
+            for r in org_results
+            if r.check_name in ("org_secrets", "org_variables")
+            and not r.passed
+            and r.severity == "error"
+        ]
+        if post_failures:
+            names = ", ".join(r.check_name for r in post_failures)
+            _emit_final_status(
+                False,
+                f"required org config still absent ({names})",
+            )
+            return 1
+
+        # Surface any non-fatal warnings for visibility without
+        # failing the overall step.
+        post_warnings = [
+            r
+            for r in org_results
+            if r.check_name in ("org_secrets", "org_variables")
+            and not r.passed
+            and r.severity == "warning"
+        ]
+        for r in post_warnings:
+            logger.warning(
+                "Post-provision audit advisory (%s): %s",
+                r.check_name,
+                r.message,
+            )
+
+    _emit_final_status(True)
     return 0
 
 

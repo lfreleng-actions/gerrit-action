@@ -334,9 +334,24 @@ inputs:
   g2p_org_token_map:
     description: |
       Base64-encoded JSON array mapping GitHub org names
-      to PATs for org-level provisioning. Required when
-      g2p_org_setup is 'provision'. Each entry needs:
-      {"github_org": "org-name", "token": "ghp_xxx"}
+      to PATs for org-level provisioning. Recommended when
+      g2p_org_setup is 'provision' so each target org can
+      use a dedicated admin:org-scoped token; otherwise
+      g2p_github_token is used as a fallback.
+
+      JSON schema (pre-encoding):
+        [
+          {"github_org": "my-org",     "token": "ghp_xxx..."},
+          {"github_org": "other-org",  "token": "ghp_yyy..."}
+        ]
+
+      Encoding (whitespace is tolerated; single line or
+      wrapped both work):
+        printf '%s' "$JSON" | base64
+
+      Store the resulting string as a repo/org secret
+      (e.g. G2P_ORG_TOKENS) and pass it via this input.
+
       See docs/GITHUB-ORG-VERIFY-CONFIG.md for details.
     required: false
     default: ''
@@ -698,6 +713,24 @@ runs:
         echo "g2p_org_audit_results=[]" >> "$GITHUB_OUTPUT"
         echo "g2p_org_provisioned=false" >> "$GITHUB_OUTPUT"
 
+    # Install PyNaCl on the runner when we will auto-provision
+    # org-level secrets.  PyNaCl is required for sealed-box
+    # encryption of GitHub Actions secrets; install only when
+    # actually needed.  A plain user-level pip install keeps
+    # this step self-contained: no setup-uv dependency and no
+    # interaction with the runner's PEP 668 system Python.
+    - name: "Install PyNaCl (provision mode)"
+      if: >-
+        inputs.g2p_enable == 'true' &&
+        inputs.g2p_org_setup == 'provision'
+      shell: bash
+      run: |
+        # Install PyNaCl for org secret provisioning
+        set -euo pipefail
+        echo "Installing PyNaCl (user site)…"
+        python3 -m pip install --user --upgrade PyNaCl
+        python3 -c "import nacl.public; print('PyNaCl OK')"
+
     # Configure G2P (gerrit_to_platform)
     - name: "Configure G2P integration"
       if: inputs.g2p_enable == 'true'
@@ -756,21 +789,48 @@ runs:
       run: |
         # Containers will continue/persist (Python)
         python3 - <<'PY'
-        import json, os, pathlib
+        import json, os, pathlib, sys
+
         summary = os.environ.get('GITHUB_STEP_SUMMARY', '')
-        if not summary:
-            exit(0)
-        lines = ['**Containers Status** 🐳', '',
-                 'Containers have detached and will continue/persist', '',
-                 'To manually cleanup later, run:', '```bash']
-        instances_path = pathlib.Path(os.environ.get('WORK_DIR', '')) / 'instances.json'
+        instances_path = (
+            pathlib.Path(os.environ.get('WORK_DIR', ''))
+            / 'instances.json'
+        )
+
+        cids: list[str] = []
         if instances_path.is_file():
             data = json.loads(instances_path.read_text())
             for slug in sorted(data):
                 cid = data[slug].get('cid', '')
                 if cid:
+                    cids.append(cid)
+
+        # Always print a human-readable status to stdout so the
+        # step is never silent in the Actions console.
+        print('🐳 Containers have detached and will continue/persist')
+        if cids:
+            print('To manually clean up later, run:')
+            for cid in cids:
+                print(f'  docker kill {cid}')
+        else:
+            print('(no container IDs were recorded)')
+        sys.stdout.flush()
+
+        if summary:
+            lines = [
+                '**Containers Status** 🐳',
+                '',
+                'Containers have detached and will continue/persist',
+                '',
+            ]
+            if cids:
+                lines.extend([
+                    'To manually cleanup later, run:',
+                    '```bash',
+                ])
+                for cid in cids:
                     lines.append(f'docker kill {cid}')
-        lines.extend(['```', ''])
-        with open(summary, 'a') as fh:
-            fh.write('\n'.join(lines) + '\n')
+                lines.extend(['```', ''])
+            with open(summary, 'a') as fh:
+                fh.write('\n'.join(lines) + '\n')
         PY

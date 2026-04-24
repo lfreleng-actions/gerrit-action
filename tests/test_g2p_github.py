@@ -880,6 +880,8 @@ class TestFormatCheckResults:
         ]
         annotations, has_fatal = format_check_results(results, "error")
         assert has_fatal is True
+        # Annotations are retained so callers can surface them in
+        # summaries; the logger also emits the ::error:: prefix.
         assert any("::error::" in a for a in annotations)
 
     def test_warn_mode_with_error_severity(self) -> None:
@@ -1388,10 +1390,18 @@ class TestFormatCheckResultsSummary:
 
 
 class TestCheckGithubConfigWithOrgAudit:
-    """Tests for check_github_config including org audit."""
+    """Tests for check_github_config org-audit integration.
+
+    Note: as of the org provisioning rework, ``check_github_config``
+    no longer runs ``check_org_secrets`` / ``check_org_variables``
+    directly — those run in ``configure-g2p.py`` as a dedicated
+    audit phase so the audit can re-run after provisioning.
+    """
 
     @patch("g2p_github.urlopen")
-    def test_org_audit_runs_in_verify_mode(self, mock_urlopen: MagicMock) -> None:
+    def test_org_checks_not_included_in_verify_mode(
+        self, mock_urlopen: MagicMock
+    ) -> None:
         mock_urlopen.side_effect = [
             # token check
             _make_urlopen_response(200, {"login": "bot"}),
@@ -1423,40 +1433,15 @@ class TestCheckGithubConfigWithOrgAudit:
                     ]
                 },
             ),
-            # org secrets check
-            _make_urlopen_response(
-                200,
-                {
-                    "total_count": 2,
-                    "secrets": [
-                        {"name": "GERRIT_SSH_PRIVKEY"},
-                        {"name": "GERRIT_SSH_PRIVKEY_G2G"},
-                    ],
-                },
-            ),
-            # org variables check
-            _make_urlopen_response(
-                200,
-                {
-                    "total_count": 4,
-                    "variables": [
-                        {"name": "GERRIT_SERVER", "value": "host:29418"},
-                        {"name": "GERRIT_SSH_USER", "value": "user"},
-                        {"name": "GERRIT_KNOWN_HOSTS", "value": "key"},
-                        {"name": "GERRIT_URL", "value": "url"},
-                    ],
-                },
-            ),
         ]
         config = _minimal_config(org_setup="verify")
         results = check_github_config(config)
         check_names = [r.check_name for r in results]
-        assert "org_secrets" in check_names
-        assert "org_variables" in check_names
-        assert all(r.passed for r in results)
+        assert "org_secrets" not in check_names
+        assert "org_variables" not in check_names
 
     @patch("g2p_github.urlopen")
-    def test_org_audit_skipped_when_skip(self, mock_urlopen: MagicMock) -> None:
+    def test_org_checks_not_included_when_skip(self, mock_urlopen: MagicMock) -> None:
         mock_urlopen.side_effect = [
             # token check
             _make_urlopen_response(200, {"login": "bot"}),

@@ -1427,13 +1427,11 @@ def check_github_config(
             )
         )
 
-    # -- Check 8: Org secrets -------------------------------------------
-    if config.org_setup != "skip":
-        results.append(check_org_secrets(config.github_token, config.github_owner))
-
-    # -- Check 9: Org variables -----------------------------------------
-    if config.org_setup != "skip":
-        results.append(check_org_variables(config.github_token, config.github_owner))
+    # Note: org-level secret and variable checks intentionally run in
+    # a later phase (see ``configure-g2p.py``) so that the audit can
+    # re-run *after* provisioning has a chance to create missing items.
+    # Running them here would emit warnings for items we are about to
+    # create, which is misleading.
 
     return results
 
@@ -1473,12 +1471,20 @@ def format_check_results(
 
         if result.severity == "error":
             if mode == "error":
+                # Strict mode: annotate once via the logger
+                # (the _GitHubActionsFormatter emits ::error::) and
+                # record the annotation string for callers that need
+                # to surface it elsewhere (e.g. test assertions or a
+                # collated summary). Marks the run fatal.
+                logger.error("%s", result.message)
                 annotations.append(f"::error::{result.message}")
                 has_fatal = True
             elif mode == "warn":
+                logger.warning("%s", result.message)
                 annotations.append(f"::warning::{result.message}")
             # mode == "skip" should never reach here
         elif result.severity == "warning":
+            logger.warning("%s", result.message)
             annotations.append(f"::warning::{result.message}")
         else:
             logger.info("%s", result)

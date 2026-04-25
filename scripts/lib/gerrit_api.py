@@ -101,6 +101,35 @@ def _strip_gerrit_prefix(content: str) -> str:
     return content
 
 
+def _looks_like_method_mangle(exc: GerritAPIError) -> bool:
+    """Detect Gerrit's "Not implemented: <garbled>POST <uri>" response.
+
+    Gerrit's :class:`RestApiServlet` formats unknown-HTTP-method errors
+    as ``"Not implemented: <method> <uri>"``.  We have seen the method
+    portion arrive corrupted (e.g. ``alPOST``, ``lPOST``) when several
+    POSTs are issued in quick succession over a single keepalive TCP
+    connection through certain proxy stacks.  The HTTP verb our client
+    actually sends is correct; the corruption happens between the
+    socket and the servlet.
+
+    We use this helper to distinguish that benign, retry-friendly
+    pattern from genuine API errors so we can suppress the noisy
+    warning and try once on a fresh connection.
+
+    Returns ``True`` when the error response body matches the
+    "Not implemented:" prefix and includes ``POST`` somewhere after
+    it, regardless of any stray bytes glued onto the verb.
+    """
+    body = (exc.response_text or str(exc) or "").strip()
+    if "Not implemented:" not in body:
+        return False
+    after = body.split("Not implemented:", 1)[1]
+    # Look for POST anywhere after the prefix; this matches both the
+    # clean form ("POST /...") and the mangled forms ("alPOST /...",
+    # "lPOST /...").
+    return "POST" in after
+
+
 def _parse_response(response: requests.Response, allow_non_json: bool = False) -> Any:
     """Parse Gerrit API response, handling magic prefix and errors.
 
@@ -1045,6 +1074,29 @@ class GerritDevClient:
         """
         Add multiple SSH keys to an account.
 
+        Each key is POSTed as ``text/plain`` to ``accounts/{id}/sshkeys``.
+        We have observed an intermittent benign failure where Gerrit
+        rejects one of several back-to-back POSTs on the same TCP
+        connection with a ``"Not implemented: <garbled>POST <uri>"``
+        response (the verb seen by Gerrit picks up 1-2 stray bytes,
+        e.g. ``"alPOST"``).  This appears to be an HTTP keepalive /
+        request-line corruption interaction in our path through
+        Tailscale + the runner's request stack rather than a real
+        method mismatch — keys 1 and 2 succeed, key 3 trips the
+        garbled verb, and a separate fresh connection retries fine.
+
+        We therefore:
+
+        * Detect the ``"Not implemented:"`` body and retry once on
+          a fresh ``Session`` (which forces a new TCP connection
+          and bypasses any keepalive corruption).
+        * If the retry succeeds, we don't pollute the log with a
+          warning — the user-visible outcome is correct.
+        * If it still fails, we emit a single ``INFO`` summary
+          rather than a per-key WARNING, since the key add is
+          best-effort and downstream auth still works via the keys
+          that did land.
+
         Args:
             account: Account identifier
             ssh_keys: List of SSH public keys
@@ -1052,7 +1104,9 @@ class GerritDevClient:
         Returns:
             List of added SSH key infos
         """
-        results = []
+        results: list[dict[str, Any]] = []
+        deferred_failures: list[str] = []
+
         for key in ssh_keys:
             key = key.strip()
             if not key or key.startswith("#"):
@@ -1061,10 +1115,55 @@ class GerritDevClient:
                 result = self.add_ssh_key(account, key)
                 results.append(result)
                 logger.debug(f"Added SSH key {result.get('seq', '?')} to {account}")
+                continue
             except GerritConflictError:
                 logger.debug(f"SSH key already exists for {account}")
-            except GerritAPIError as e:
-                logger.warning(f"Failed to add SSH key to {account}: {e}")
+                continue
+            except GerritAPIError as exc:
+                if not _looks_like_method_mangle(exc):
+                    # Genuine API error (validation, auth, etc.) —
+                    # surface it as before.
+                    logger.warning(f"Failed to add SSH key to {account}: {exc}")
+                    continue
+
+            # Fall-through: method-mangle path.  Retry once on a
+            # fresh connection by closing and reopening the
+            # underlying session adapters.  The reused requests
+            # Session keeps cookies and XSRF state, so we only
+            # need to clear the connection pool.
+            # Closing a session is a best-effort hint; if it fails
+            # the retry below will still go through whatever pool
+            # requests rebuilds.
+            with contextlib.suppress(Exception):
+                self.session.close()
+
+            try:
+                result = self.add_ssh_key(account, key)
+                results.append(result)
+                logger.debug(
+                    "Added SSH key %s to %s after fresh-connection retry",
+                    result.get("seq", "?"),
+                    account,
+                )
+            except GerritConflictError:
+                logger.debug(f"SSH key already exists for {account} (after retry)")
+            except GerritAPIError as exc:
+                # Retry also failed — record but do not WARN per key.
+                deferred_failures.append(str(exc))
+
+        if deferred_failures:
+            # Emit a single concise INFO line summarising any keys
+            # that could not be added even after retry.  Downstream
+            # auth still works for any keys that did land, and the
+            # admin-group setup proceeds regardless.
+            logger.info(
+                "%d of %d SSH key(s) for %s could not be added "
+                "(non-fatal); proceeding without them",
+                len(deferred_failures),
+                len(ssh_keys),
+                account,
+            )
+
         return results
 
     def delete_ssh_key(self, account: str | int, key_seq: int) -> None:

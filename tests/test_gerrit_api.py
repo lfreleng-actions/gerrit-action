@@ -20,6 +20,7 @@ from gerrit_api import (
     GerritConflictError,
     GerritDevClient,
     GerritNotFoundError,
+    _looks_like_method_mangle,
     _parse_response,
     _strip_gerrit_prefix,
     parse_ssh_keys,
@@ -465,6 +466,63 @@ class TestValidateSshKey:
     def test_random_text_is_invalid(self):
         """Test random text is invalid."""
         assert validate_ssh_key("not a valid ssh key") is False
+
+
+class TestLooksLikeMethodMangle:
+    """Tests for _looks_like_method_mangle helper.
+
+    The helper detects Gerrit's "Not implemented: <garbled>POST <uri>"
+    response that we have observed when several SSH-key POSTs go down
+    a single keepalive connection through certain proxy stacks.  The
+    method portion arrives with 1-2 stray bytes prepended (e.g.
+    ``alPOST``, ``lPOST``); the helper must recognise both the clean
+    and mangled forms so the calling code can retry quietly on a
+    fresh connection.
+    """
+
+    def test_recognises_mangled_alpost(self) -> None:
+        exc = GerritAPIError(
+            "API request failed: Not implemented: alPOST /r/a/accounts/1/sshkeys",
+            status_code=405,
+            response_text=("Not implemented: alPOST /r/a/accounts/1/sshkeys"),
+        )
+        assert _looks_like_method_mangle(exc) is True
+
+    def test_recognises_clean_post(self) -> None:
+        exc = GerritAPIError(
+            "API request failed: Not implemented: POST /r/a/accounts/1/sshkeys",
+            status_code=405,
+            response_text=("Not implemented: POST /r/a/accounts/1/sshkeys"),
+        )
+        assert _looks_like_method_mangle(exc) is True
+
+    def test_rejects_unrelated_error(self) -> None:
+        exc = GerritAPIError(
+            "API request failed: Bad Request",
+            status_code=400,
+            response_text="Bad Request: invalid SSH key payload",
+        )
+        assert _looks_like_method_mangle(exc) is False
+
+    def test_rejects_not_implemented_without_post(self) -> None:
+        # "Not implemented:" but for a different verb — not the
+        # keepalive-corruption pattern this helper is meant to
+        # catch, so the caller should NOT retry.
+        exc = GerritAPIError(
+            "API request failed",
+            status_code=405,
+            response_text="Not implemented: PATCH /r/a/foo",
+        )
+        assert _looks_like_method_mangle(exc) is False
+
+    def test_handles_missing_response_text(self) -> None:
+        # Falls back to str(exc) when response_text is empty.
+        exc = GerritAPIError(
+            "Not implemented: lPOST /r/a/accounts/1/sshkeys",
+            status_code=405,
+            response_text="",
+        )
+        assert _looks_like_method_mangle(exc) is True
 
 
 class TestParseSshKeys:

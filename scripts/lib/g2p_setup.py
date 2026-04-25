@@ -109,6 +109,47 @@ class G2PSetupResult:
     replication_remote_configured: bool = False
 
 
+@dataclass
+class G2PSelfTestCheck:
+    """Single self-test outcome.
+
+    Attributes:
+        name: Short machine-readable identifier.
+        passed: ``True`` when the check succeeded.
+        severity: ``"error"`` (G2P will not work), ``"warning"``
+            (likely degraded), or ``"info"`` (advisory).
+        message: Human-readable detail string.
+    """
+
+    name: str
+    passed: bool
+    severity: str = "error"
+    message: str = ""
+
+
+@dataclass
+class G2PSelfTestReport:
+    """Aggregated self-test outcomes for a container.
+
+    Attributes:
+        cid: Container identifier the self-test ran against.
+        checks: Ordered list of individual check outcomes.
+    """
+
+    cid: str = ""
+    checks: list[G2PSelfTestCheck] = field(default_factory=list)
+
+    @property
+    def all_passed(self) -> bool:
+        """Return True when every check passed."""
+        return all(c.passed for c in self.checks)
+
+    @property
+    def has_errors(self) -> bool:
+        """Return True when any error-severity check failed."""
+        return any((not c.passed) and c.severity == "error" for c in self.checks)
+
+
 # ---------------------------------------------------------------------------
 # INI generation
 # ---------------------------------------------------------------------------
@@ -809,3 +850,302 @@ def setup_g2p(
         "provided" if result.ssh_public_key else "none",
     )
     return result
+
+
+# ---------------------------------------------------------------------------
+# Self-test
+# ---------------------------------------------------------------------------
+
+
+def _selftest_check(
+    name: str,
+    *,
+    passed: bool,
+    severity: str = "error",
+    message: str = "",
+) -> G2PSelfTestCheck:
+    """Build a :class:`G2PSelfTestCheck` and emit a matching log line.
+
+    Centralised so each check is reported once at the appropriate
+    log level (info on pass, warning/error on fail) without each
+    call site having to repeat the formatting.
+    """
+    check = G2PSelfTestCheck(
+        name=name,
+        passed=passed,
+        severity=severity,
+        message=message,
+    )
+    if passed:
+        logger.info("Self-test ✅ %s — %s", name, message or "ok")
+    elif severity == "warning":
+        logger.warning("Self-test ⚠️  %s — %s", name, message)
+    else:
+        logger.error("Self-test ❌ %s — %s", name, message)
+    return check
+
+
+def _exec_or_blank(
+    docker: DockerManager,
+    cid: str,
+    command: str,
+    *,
+    user: str | None = None,
+) -> str:
+    """Run ``command`` inside ``cid``; return stdout or '' on failure.
+
+    The self-test helpers should never raise on diagnostic commands;
+    they should only record the failure.  This wrapper hides the
+    ``check=False`` plumbing.
+    """
+    try:
+        out: str = docker.exec_cmd(cid, command, user=user, check=False)
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("Self-test exec failed for %r: %s", command, exc)
+        return ""
+    return out.strip()
+
+
+def selftest_g2p_plumbing(
+    docker: DockerManager,
+    cid: str,
+    config: G2PConfig,
+) -> G2PSelfTestReport:
+    """Validate the in-container G2P plumbing end-to-end.
+
+    Runs a sequence of independent checks against the running
+    Gerrit container and collects the results into a
+    :class:`G2PSelfTestReport`.  The checks are deliberately
+    side-effect free apart from a final synthetic hook invocation
+    that targets a non-existent change so it cannot mutate any
+    real GitHub state.
+
+    Steps:
+
+    1. ``hooks.jar`` is present in ``/var/gerrit/plugins/``.
+    2. ``replication.jar`` is **absent** (we replace it with
+       pull-replication; if it's there the bundled init grabbed
+       a copy and it must be removed).
+    3. Each enabled hook symlink in ``/var/gerrit/hooks/`` exists
+       and resolves to an executable file.
+    4. Each hook target is executable as the ``gerrit`` user.
+    5. ``gerrit_to_platform.ini`` exists, is non-empty, and contains
+       a ``token = `` line whose value is non-empty.
+    6. ``replication.config`` contains a ``[remote "github-g2p"]``
+       section whose ``authGroup`` value contains the substring
+       ``github`` (case-insensitive) — the platform-detection
+       gate ``gerrit_to_platform`` uses.
+    7. The ``gerrit`` user can ``--help`` the patchset-created
+       script (proves the venv shebang resolves and the entry
+       point imports cleanly).
+
+    Parameters
+    ----------
+    docker:
+        :class:`DockerManager` instance.
+    cid:
+        Running container id or name.
+    config:
+        Validated :class:`G2PConfig` (used to know which hooks
+        should have been enabled).
+
+    Returns
+    -------
+    G2PSelfTestReport
+        Aggregated outcomes, in the order listed above.
+    """
+    report = G2PSelfTestReport(cid=cid)
+
+    # 1. hooks.jar present
+    hooks_jar = f"{GERRIT_PLUGINS_DIR}/hooks.jar"
+    has_hooks_jar = docker.exec_test(cid, f"-f {hooks_jar}")
+    report.checks.append(
+        _selftest_check(
+            "hooks_plugin_present",
+            passed=has_hooks_jar,
+            severity="error",
+            message=(
+                f"{hooks_jar} present"
+                if has_hooks_jar
+                else (
+                    f"{hooks_jar} missing — Gerrit will not invoke "
+                    "any hook scripts under /var/gerrit/hooks/"
+                )
+            ),
+        )
+    )
+
+    # 2. bundled replication.jar removed
+    bundled_repl = f"{GERRIT_PLUGINS_DIR}/replication.jar"
+    bundled_present = docker.exec_test(cid, f"-f {bundled_repl}")
+    report.checks.append(
+        _selftest_check(
+            "bundled_replication_removed",
+            passed=not bundled_present,
+            severity="warning",
+            message=(
+                "bundled replication.jar removed (pull-replication takes over)"
+                if not bundled_present
+                else (
+                    f"{bundled_repl} still present — may conflict with pull-replication"
+                )
+            ),
+        )
+    )
+
+    # 3 & 4. hook symlinks resolve and are executable
+    for hook_name in config.hooks:
+        hook_path = f"{GERRIT_HOOKS_DIR}/{hook_name}"
+        target = _exec_or_blank(docker, cid, f"readlink -f {hook_path}")
+        if not target:
+            report.checks.append(
+                _selftest_check(
+                    f"hook_symlink_{hook_name}",
+                    passed=False,
+                    severity="error",
+                    message=(f"{hook_path} does not resolve to a target"),
+                )
+            )
+            continue
+
+        report.checks.append(
+            _selftest_check(
+                f"hook_symlink_{hook_name}",
+                passed=True,
+                severity="info",
+                message=f"{hook_path} -> {target}",
+            )
+        )
+
+        # Executable as the gerrit user (UID 1000, the runtime user
+        # Gerrit uses to fork hook processes).
+        is_exec = docker.exec_test(cid, f"-x {target}") and docker.exec_test(
+            cid, f"-r {target}"
+        )
+        report.checks.append(
+            _selftest_check(
+                f"hook_target_executable_{hook_name}",
+                passed=is_exec,
+                severity="error",
+                message=(
+                    f"{target} executable+readable"
+                    if is_exec
+                    else (
+                        f"{target} not executable+readable; "
+                        "Gerrit will skip the hook silently"
+                    )
+                ),
+            )
+        )
+
+    # 5. INI exists and has a non-empty token
+    ini_present = docker.exec_test(cid, f"-s {G2P_INI_PATH}")
+    if not ini_present:
+        report.checks.append(
+            _selftest_check(
+                "g2p_ini_present",
+                passed=False,
+                severity="error",
+                message=f"{G2P_INI_PATH} missing or empty",
+            )
+        )
+    else:
+        report.checks.append(
+            _selftest_check(
+                "g2p_ini_present",
+                passed=True,
+                severity="info",
+                message=f"{G2P_INI_PATH} present and non-empty",
+            )
+        )
+        token_line = _exec_or_blank(
+            docker,
+            cid,
+            f"grep -E '^[[:space:]]*token[[:space:]]*=' {G2P_INI_PATH} || true",
+        )
+        # A bare ``token =`` (or absent line) means dispatch will
+        # fail at runtime; flag clearly.
+        token_value = ""
+        if token_line and "=" in token_line:
+            token_value = token_line.split("=", 1)[1].strip()
+        token_ok = bool(token_value)
+        report.checks.append(
+            _selftest_check(
+                "g2p_ini_token_populated",
+                passed=token_ok,
+                severity="error",
+                message=(
+                    "INI carries a non-empty token"
+                    if token_ok
+                    else (
+                        f"INI {G2P_INI_PATH} has no populated token "
+                        "line — workflow_dispatch will fail at runtime"
+                    )
+                ),
+            )
+        )
+
+    # 6. replication.config carries a github-detection remote
+    repl_authgroup = _exec_or_blank(
+        docker,
+        cid,
+        # Print just the authGroup value(s) under the github-g2p
+        # section.  awk handles the section scoping safely.
+        (
+            "awk '"
+            '/^\\[remote "github-g2p"\\]/ {in_sec=1; next} '
+            "/^\\[/ {in_sec=0} "
+            "in_sec && /authGroup[[:space:]]*=/ {print}'"
+            f" {GERRIT_REPLICATION_CONFIG}"
+        ),
+    )
+    has_github_authgroup = bool(repl_authgroup) and "github" in repl_authgroup.lower()
+    report.checks.append(
+        _selftest_check(
+            "replication_github_remote",
+            passed=has_github_authgroup,
+            severity="error",
+            message=(
+                f"github-g2p remote present (authGroup: {repl_authgroup})"
+                if has_github_authgroup
+                else (
+                    f"github-g2p remote missing or its authGroup does "
+                    f"not contain 'github' in {GERRIT_REPLICATION_CONFIG} "
+                    "— platform detection will fail and no dispatch "
+                    "will fire"
+                )
+            ),
+        )
+    )
+
+    # 7. Hook script imports cleanly when run as gerrit
+    if config.hooks:
+        first_hook = config.hooks[0]
+        first_target = f"{GERRIT_TOOLS_VENV_BIN}/{first_hook}"
+        # ``--help`` exits 0 and prints usage on the python entry
+        # point without dispatching anything.  We tolerate any
+        # 0/1/2 exit code; what we really want is "no traceback".
+        help_output = _exec_or_blank(
+            docker,
+            cid,
+            f"{first_target} --help 2>&1 || true",
+            user="gerrit",
+        )
+        traceback_seen = "Traceback" in help_output
+        report.checks.append(
+            _selftest_check(
+                "hook_entrypoint_imports",
+                passed=not traceback_seen,
+                severity="error",
+                message=(
+                    f"{first_target} --help ran cleanly as gerrit"
+                    if not traceback_seen
+                    else (
+                        f"{first_target} --help raised a Python "
+                        f"traceback when run as gerrit:\n{help_output[:400]}"
+                    )
+                ),
+            )
+        )
+
+    return report

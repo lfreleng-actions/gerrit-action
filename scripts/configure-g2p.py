@@ -62,7 +62,12 @@ from g2p_github import (  # noqa: E402
     provision_org_config,
     results_to_json,
 )
-from g2p_setup import G2PSetupResult, setup_g2p  # noqa: E402
+from g2p_setup import (  # noqa: E402
+    G2PSelfTestReport,
+    G2PSetupResult,
+    selftest_g2p_plumbing,
+    setup_g2p,
+)
 from logging_utils import log_group, setup_logging  # noqa: E402
 from outputs import write_output, write_summary  # noqa: E402
 
@@ -393,6 +398,8 @@ def run() -> int:
     # -- Step 5: Configure each container --------------------------------
     docker = DockerManager()
     setup_results: list[G2PSetupResult] = []
+    selftest_reports: list[G2PSelfTestReport] = []
+    selftest_had_errors = False
 
     for slug, meta in instances.items():
         cid = meta.get("cid", "")
@@ -410,6 +417,37 @@ def run() -> int:
                 result.config_path,
                 result.hooks_enabled,
             )
+
+        # Run plumbing self-test immediately after setup so any
+        # broken wiring (missing hooks.jar, non-executable hook
+        # target, empty token, missing github-g2p remote, import
+        # error in the entry-point script) is surfaced now rather
+        # than discovered later when a real patchset upload silently
+        # fails to dispatch a workflow.
+        with log_group(f"G2P self-test: {slug} ({cid[:12]})"):
+            report = selftest_g2p_plumbing(docker, cid, g2p_config)
+            selftest_reports.append(report)
+            if report.has_errors:
+                selftest_had_errors = True
+                failed = [
+                    c.name
+                    for c in report.checks
+                    if (not c.passed) and c.severity == "error"
+                ]
+                logger.error(
+                    "G2P self-test for instance '%s' failed: %s",
+                    slug,
+                    ", ".join(failed),
+                )
+            else:
+                passed = sum(1 for c in report.checks if c.passed)
+                total = len(report.checks)
+                logger.info(
+                    "G2P self-test for instance '%s': %d/%d checks passed",
+                    slug,
+                    passed,
+                    total,
+                )
 
     # -- Step 5b: Org provisioning (after containers are configured) ------
     # Always run provisioning when the mode requests it, regardless
@@ -530,6 +568,18 @@ def run() -> int:
     # -- Step 8: Final single-line status -------------------------------
     if provision_had_fatal:
         _emit_final_status(False, "org provisioning failed")
+        return 1
+
+    # A failed plumbing self-test means hooks won't fire or the
+    # script can't run — dispatch will silently never happen.
+    # Surface this as a failure so the deploy step itself goes red,
+    # rather than letting the user discover it later when no CI
+    # runs appear in the target org.
+    if selftest_had_errors:
+        _emit_final_status(
+            False,
+            "G2P plumbing self-test reported error(s); see preceding logs",
+        )
         return 1
 
     # In provision mode, any remaining absent required secrets or

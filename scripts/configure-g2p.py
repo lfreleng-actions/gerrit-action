@@ -412,8 +412,15 @@ def run() -> int:
             )
 
     # -- Step 5b: Org provisioning (after containers are configured) ------
+    # Always run provisioning when the mode requests it, regardless
+    # of the initial audit outcome.  Each Gerrit container build
+    # produces a fresh ephemeral SSH key and may bind to different
+    # tunnel host/ports, so we cannot rely on the audit reporting
+    # items as missing — we must overwrite required org secrets
+    # and variables on every provision run to keep them in sync
+    # with the live Gerrit instance.
     provision_had_fatal = False
-    if g2p_config.org_setup == "provision" and org_results:
+    if g2p_config.org_setup == "provision":
         with log_group("G2P org provisioning"):
             # Build gerrit_info from instances + setup results
             gerrit_info = _build_gerrit_info(

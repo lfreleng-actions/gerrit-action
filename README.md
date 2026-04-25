@@ -840,6 +840,24 @@ An optional `GERRIT_SSH_PRIVKEY_G2G` secret is reported when missing
 but never blocks the run; it is only needed by orgs that perform
 gerrit-to-gerrit replication.
 
+#### Re-run behaviour (always overwrite)
+
+In `provision` mode, every required secret and variable is
+**always overwritten** with the current run's values, even when
+the initial audit reports them as already present. This is
+deliberate: each fresh Gerrit container build produces a new
+ephemeral SSH key, and tunnel host/port assignments may change
+between runs. Without overwriting, stale `GERRIT_SSH_PRIVKEY` /
+`GERRIT_SERVER` / `GERRIT_KNOWN_HOSTS` / `GERRIT_URL` values on
+the GitHub side would silently diverge from the live Gerrit
+instance — workflows would dispatch successfully and then fail
+at SSH-push or HTTP-API time. The provisioner uses POST for
+absent items and PATCH for existing ones to keep variable
+history clean.
+
+If you do not want overwrite-on-every-run semantics, set
+`g2p_org_setup` to `verify` (audit only) or `skip`.
+
 #### Token requirements (`provision` mode)
 
 Provisioning org-level secrets requires a token with elevated scope

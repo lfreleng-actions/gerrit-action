@@ -1747,8 +1747,10 @@ class TestProvisionOrgConfig:
     """Tests for provision_org_config."""
 
     @patch("g2p_github.provision_org_secret")
-    def test_provisions_missing_secret(self, mock_prov_secret: MagicMock) -> None:
-        """Calls provision_org_secret for missing GERRIT_SSH_PRIVKEY."""
+    def test_provisions_secret_when_audit_reports_missing(
+        self, mock_prov_secret: MagicMock
+    ) -> None:
+        """Provisions GERRIT_SSH_PRIVKEY when audit flags it missing."""
         mock_prov_secret.return_value = G2PCheckResult(
             check_name="provision_secret_GERRIT_SSH_PRIVKEY",
             passed=True,
@@ -1768,17 +1770,57 @@ class TestProvisionOrgConfig:
         ]
         gerrit_info = {"ssh_private_key": "-----BEGIN OPENSSH-----"}
         results = provision_org_config(config, audit, gerrit_info)
-        assert len(results) == 1
-        assert results[0].passed is True
+        # Always-overwrite semantics: every required secret is
+        # provisioned regardless of prior audit pass/fail state.
+        secret_results = [
+            r for r in results if r.check_name.startswith("provision_secret_")
+        ]
+        assert len(secret_results) == 1
+        assert secret_results[0].passed is True
+        mock_prov_secret.assert_called_once()
+
+    @patch("g2p_github.provision_org_secret")
+    def test_overwrites_secret_even_when_already_present(
+        self, mock_prov_secret: MagicMock
+    ) -> None:
+        """Re-runs always overwrite GERRIT_SSH_PRIVKEY in provision mode.
+
+        A previous provision run leaves the secret in place, but the
+        Gerrit container's ephemeral key changes on every build, so
+        we must overwrite to keep Gerrit and the org in sync.
+        """
+        mock_prov_secret.return_value = G2PCheckResult(
+            check_name="provision_secret_GERRIT_SSH_PRIVKEY",
+            passed=True,
+            message="Created/updated org secret 'GERRIT_SSH_PRIVKEY'",
+            severity="info",
+        )
+        config = _minimal_config(org_setup="provision")
+        audit = [
+            G2PCheckResult(
+                check_name="org_secrets",
+                passed=True,
+                message="All required org secrets present",
+                details={
+                    "missing_required": [],
+                    "missing_optional": [],
+                    "found": ["GERRIT_SSH_PRIVKEY"],
+                },
+            ),
+        ]
+        gerrit_info = {"ssh_private_key": "-----BEGIN OPENSSH-----"}
+        provision_org_config(config, audit, gerrit_info)
         mock_prov_secret.assert_called_once()
 
     @patch("g2p_github.provision_org_variable")
-    def test_provisions_missing_variables(self, mock_prov_var: MagicMock) -> None:
-        """Calls provision_org_variable for each missing variable."""
+    def test_provisions_variables_when_audit_reports_missing(
+        self, mock_prov_var: MagicMock
+    ) -> None:
+        """Creates each required variable from the run's gerrit_info."""
         mock_prov_var.return_value = G2PCheckResult(
-            check_name="provision_variable_GERRIT_URL",
+            check_name="provision_variable_X",
             passed=True,
-            message="Created org variable 'GERRIT_URL'",
+            message="Created org variable",
             severity="info",
         )
         config = _minimal_config(org_setup="provision")
@@ -1787,26 +1829,82 @@ class TestProvisionOrgConfig:
                 check_name="org_variables",
                 passed=False,
                 message="Missing variables",
-                details={"missing": ["GERRIT_URL"], "empty": []},
+                details={
+                    "missing": [
+                        "GERRIT_SERVER",
+                        "GERRIT_SSH_USER",
+                        "GERRIT_KNOWN_HOSTS",
+                        "GERRIT_URL",
+                    ],
+                    "empty": [],
+                    "found": [],
+                },
             ),
         ]
-        gerrit_info = {"http_url": "https://gerrit.example.org/r/"}
+        gerrit_info = {
+            "ssh_host": "gerrit.example.org",
+            "ssh_port": "29418",
+            "ssh_user": "ci",
+            "known_hosts": "host_key_data",
+            "http_url": "https://gerrit.example.org/r/",
+        }
         results = provision_org_config(config, audit, gerrit_info)
-        assert len(results) == 1
-        assert results[0].passed is True
-        mock_prov_var.assert_called_once_with(
-            "ghp_testtoken123",
-            "test-org",
-            "GERRIT_URL",
-            "https://gerrit.example.org/r/",
-            exists=False,
+        var_results = [
+            r for r in results if r.check_name.startswith("provision_variable_")
+        ]
+        # Every required variable is provisioned on every run.
+        assert len(var_results) == len(REQUIRED_ORG_VARIABLES)
+        # All four use POST (exists=False) because audit shows none found.
+        assert all(
+            call.kwargs.get("exists") is False for call in mock_prov_var.call_args_list
         )
 
     @patch("g2p_github.provision_org_variable")
-    def test_empty_var_uses_patch(self, mock_prov_var: MagicMock) -> None:
-        """Variables in the empty list use exists=True (PATCH)."""
+    def test_overwrites_existing_variables_with_patch(
+        self, mock_prov_var: MagicMock
+    ) -> None:
+        """Existing variables get PATCHed with current values on re-run.
+
+        Tunnel host/port and known_hosts can change between provision
+        runs, so stale values must be overwritten rather than left.
+        """
         mock_prov_var.return_value = G2PCheckResult(
-            check_name="provision_variable_GERRIT_URL",
+            check_name="provision_variable_X",
+            passed=True,
+            message="Updated",
+            severity="info",
+        )
+        config = _minimal_config(org_setup="provision")
+        audit = [
+            G2PCheckResult(
+                check_name="org_variables",
+                passed=True,
+                message="All present",
+                details={
+                    "missing": [],
+                    "empty": [],
+                    "found": list(REQUIRED_ORG_VARIABLES),
+                },
+            ),
+        ]
+        gerrit_info = {
+            "ssh_host": "gerrit.example.org",
+            "ssh_port": "29418",
+            "ssh_user": "ci",
+            "known_hosts": "host_key_data",
+            "http_url": "https://gerrit.example.org/r/",
+        }
+        provision_org_config(config, audit, gerrit_info)
+        # All four variables were already present → exists=True (PATCH)
+        assert mock_prov_var.call_count == len(REQUIRED_ORG_VARIABLES)
+        for call in mock_prov_var.call_args_list:
+            assert call.kwargs.get("exists") is True
+
+    @patch("g2p_github.provision_org_variable")
+    def test_empty_var_uses_patch(self, mock_prov_var: MagicMock) -> None:
+        """Variables present-but-empty use exists=True (PATCH)."""
+        mock_prov_var.return_value = G2PCheckResult(
+            check_name="provision_variable_X",
             passed=True,
             message="Updated",
             severity="info",
@@ -1820,78 +1918,151 @@ class TestProvisionOrgConfig:
                 details={
                     "missing": [],
                     "empty": ["GERRIT_URL"],
+                    "found": ["GERRIT_URL"],
                 },
             ),
         ]
-        gerrit_info = {"http_url": "https://gerrit.example.org/r/"}
-        results = provision_org_config(config, audit, gerrit_info)
-        assert len(results) == 1
-        mock_prov_var.assert_called_once_with(
-            "ghp_testtoken123",
-            "test-org",
-            "GERRIT_URL",
-            "https://gerrit.example.org/r/",
-            exists=True,
-        )
+        gerrit_info = {
+            "ssh_host": "gerrit.example.org",
+            "ssh_port": "29418",
+            "ssh_user": "ci",
+            "known_hosts": "host_key_data",
+            "http_url": "https://gerrit.example.org/r/",
+        }
+        provision_org_config(config, audit, gerrit_info)
+        # Locate the GERRIT_URL call and confirm PATCH (exists=True).
+        url_calls = [
+            c for c in mock_prov_var.call_args_list if c.args[2] == "GERRIT_URL"
+        ]
+        assert len(url_calls) == 1
+        assert url_calls[0].kwargs.get("exists") is True
+        assert url_calls[0].args[3] == "https://gerrit.example.org/r/"
 
-    def test_no_audit_results_returns_empty(self) -> None:
-        """No audit results means nothing to provision."""
+    def test_no_audit_results_skips_variable_existence_inference(self) -> None:
+        """No audit results: variables default to POST (exists=False).
+
+        With always-overwrite semantics, secrets and variables are
+        still attempted using the run's gerrit_info; only the
+        existence hint (POST vs PATCH) is unavailable.
+        """
         config = _minimal_config(org_setup="provision")
-        results = provision_org_config(config, [], {})
-        assert results == []
+        gerrit_info = {
+            "ssh_private_key": "key_data",
+            "ssh_host": "gerrit.example.org",
+            "ssh_port": "29418",
+            "ssh_user": "ci",
+            "known_hosts": "host_key_data",
+            "http_url": "https://gerrit.example.org/r/",
+        }
+        with (
+            patch("g2p_github.provision_org_secret") as mock_secret,
+            patch("g2p_github.provision_org_variable") as mock_var,
+        ):
+            mock_secret.return_value = G2PCheckResult(
+                check_name="provision_secret_GERRIT_SSH_PRIVKEY",
+                passed=True,
+                message="ok",
+                severity="info",
+            )
+            mock_var.return_value = G2PCheckResult(
+                check_name="provision_variable_X",
+                passed=True,
+                message="ok",
+                severity="info",
+            )
+            provision_org_config(config, [], gerrit_info)
+            # All required items still get provisioned.
+            assert mock_secret.call_count == 1
+            assert mock_var.call_count == len(REQUIRED_ORG_VARIABLES)
+            # No audit data → exists=False everywhere.
+            for call in mock_var.call_args_list:
+                assert call.kwargs.get("exists") is False
 
-    def test_all_passed_returns_empty(self) -> None:
-        """Passed audit results skip provisioning."""
+    def test_all_passed_audit_still_overwrites(self) -> None:
+        """Passing audit results do NOT skip provisioning.
+
+        This is the critical re-run safety property: a prior run
+        leaving everything in place must not stop the current run
+        from overwriting with its own (potentially different)
+        values.
+        """
         config = _minimal_config(org_setup="provision")
         audit = [
             G2PCheckResult(
                 check_name="org_secrets",
                 passed=True,
                 message="All present",
+                details={"found": ["GERRIT_SSH_PRIVKEY"]},
             ),
             G2PCheckResult(
                 check_name="org_variables",
                 passed=True,
                 message="All present",
-            ),
-        ]
-        results = provision_org_config(config, audit, {})
-        assert results == []
-
-    def test_missing_secret_value_logs_warning(self) -> None:
-        """Secret name present but gerrit_info lacks the value."""
-        config = _minimal_config(org_setup="provision")
-        audit = [
-            G2PCheckResult(
-                check_name="org_secrets",
-                passed=False,
-                message="Missing",
                 details={
-                    "missing_required": ["GERRIT_SSH_PRIVKEY"],
-                },
-            ),
-        ]
-        # Empty gerrit_info — no ssh_private_key
-        results = provision_org_config(config, audit, {})
-        assert results == []
-
-    def test_missing_variable_value_skipped(self) -> None:
-        """Variable in missing list but no value in gerrit_info."""
-        config = _minimal_config(org_setup="provision")
-        audit = [
-            G2PCheckResult(
-                check_name="org_variables",
-                passed=False,
-                message="Missing",
-                details={
-                    "missing": ["GERRIT_SERVER"],
+                    "missing": [],
                     "empty": [],
+                    "found": list(REQUIRED_ORG_VARIABLES),
                 },
             ),
         ]
-        # No ssh_host in gerrit_info → GERRIT_SERVER maps to ""
-        results = provision_org_config(config, audit, {})
-        assert results == []
+        gerrit_info = {
+            "ssh_private_key": "key_data",
+            "ssh_host": "gerrit.example.org",
+            "ssh_port": "29418",
+            "ssh_user": "ci",
+            "known_hosts": "host_key_data",
+            "http_url": "https://gerrit.example.org/r/",
+        }
+        with (
+            patch("g2p_github.provision_org_secret") as mock_secret,
+            patch("g2p_github.provision_org_variable") as mock_var,
+        ):
+            mock_secret.return_value = G2PCheckResult(
+                check_name="x", passed=True, message="ok"
+            )
+            mock_var.return_value = G2PCheckResult(
+                check_name="x", passed=True, message="ok"
+            )
+            provision_org_config(config, audit, gerrit_info)
+            assert mock_secret.call_count == 1
+            assert mock_var.call_count == len(REQUIRED_ORG_VARIABLES)
+
+    def test_missing_secret_value_records_failure(self) -> None:
+        """Provision attempt records a failure when no SSH key is available."""
+        config = _minimal_config(org_setup="provision")
+        # Empty gerrit_info — no ssh_private_key
+        results = provision_org_config(config, [], {})
+        secret_failures = [
+            r
+            for r in results
+            if r.check_name == "provision_secret_GERRIT_SSH_PRIVKEY" and not r.passed
+        ]
+        assert len(secret_failures) == 1
+        assert secret_failures[0].severity == "error"
+
+    def test_missing_variable_value_records_failure(self) -> None:
+        """Variable with no run-time value emits an explicit failure."""
+        config = _minimal_config(org_setup="provision")
+        # Provide some values but omit GERRIT_SERVER prerequisites
+        gerrit_info = {
+            "ssh_private_key": "key_data",
+            "ssh_user": "ci",
+            "known_hosts": "host_key_data",
+            "http_url": "https://gerrit.example.org/r/",
+            # ssh_host / ssh_port intentionally absent
+        }
+        with patch("g2p_github.provision_org_variable") as mock_var:
+            mock_var.return_value = G2PCheckResult(
+                check_name="x", passed=True, message="ok"
+            )
+            results = provision_org_config(config, [], gerrit_info)
+        server_failures = [
+            r
+            for r in results
+            if r.check_name == "provision_variable_GERRIT_SERVER" and not r.passed
+        ]
+        assert len(server_failures) == 1
+        assert server_failures[0].severity == "error"
 
     def test_uses_org_token_when_provided(self) -> None:
         """Prefers org_token over config.github_token."""
@@ -1904,22 +2075,29 @@ class TestProvisionOrgConfig:
                 details={
                     "missing": ["GERRIT_URL"],
                     "empty": [],
+                    "found": [],
                 },
             ),
         ]
-        gerrit_info = {"http_url": "https://gerrit.example.org/r/"}
+        gerrit_info = {
+            "ssh_host": "gerrit.example.org",
+            "ssh_port": "29418",
+            "ssh_user": "ci",
+            "known_hosts": "host_key_data",
+            "http_url": "https://gerrit.example.org/r/",
+        }
         with patch("g2p_github.provision_org_variable") as mock_prov:
             mock_prov.return_value = G2PCheckResult(
                 check_name="x", passed=True, message="ok"
             )
             provision_org_config(config, audit, gerrit_info, org_token="elevated_tok")
-            mock_prov.assert_called_once_with(
-                "elevated_tok",
-                "test-org",
-                "GERRIT_URL",
-                "https://gerrit.example.org/r/",
-                exists=False,
-            )
+            # All required variables are provisioned every run with
+            # the elevated token, regardless of which were flagged
+            # missing in the audit.
+            assert mock_prov.call_count == len(REQUIRED_ORG_VARIABLES)
+            for call in mock_prov.call_args_list:
+                assert call.args[0] == "elevated_tok"
+                assert call.args[1] == "test-org"
 
     def test_gerrit_server_built_from_host_port(self) -> None:
         """GERRIT_SERVER value constructed from ssh_host:ssh_port."""
@@ -1932,29 +2110,37 @@ class TestProvisionOrgConfig:
                 details={
                     "missing": ["GERRIT_SERVER"],
                     "empty": [],
+                    "found": [],
                 },
             ),
         ]
         gerrit_info = {
             "ssh_host": "gerrit.example.org",
             "ssh_port": "29418",
+            "ssh_user": "ci",
+            "known_hosts": "host_key_data",
+            "http_url": "https://gerrit.example.org/r/",
         }
         with patch("g2p_github.provision_org_variable") as mock_prov:
             mock_prov.return_value = G2PCheckResult(
                 check_name="x", passed=True, message="ok"
             )
             provision_org_config(config, audit, gerrit_info)
-            mock_prov.assert_called_once_with(
-                "ghp_testtoken123",
-                "test-org",
-                "GERRIT_SERVER",
-                "gerrit.example.org:29418",
-                exists=False,
-            )
+            server_calls = [
+                c for c in mock_prov.call_args_list if c.args[2] == "GERRIT_SERVER"
+            ]
+            assert len(server_calls) == 1
+            assert server_calls[0].args[0] == "ghp_testtoken123"
+            assert server_calls[0].args[1] == "test-org"
+            assert server_calls[0].args[3] == "gerrit.example.org:29418"
+            assert server_calls[0].kwargs.get("exists") is False
 
-    def test_unknown_secret_name_skipped(self) -> None:
-        """Secret name not matching GERRIT_SSH_PRIVKEY is skipped."""
+    def test_only_known_secret_names_provisioned(self) -> None:
+        """Provisioning is limited to REQUIRED_ORG_SECRETS regardless of audit."""
         config = _minimal_config(org_setup="provision")
+        # Audit invents an unrelated 'missing_required' entry; the
+        # provisioner ignores it because it iterates the canonical
+        # REQUIRED_ORG_SECRETS tuple, not the audit's ad-hoc list.
         audit = [
             G2PCheckResult(
                 check_name="org_secrets",
@@ -1966,5 +2152,14 @@ class TestProvisionOrgConfig:
             ),
         ]
         gerrit_info = {"ssh_private_key": "key_data"}
-        results = provision_org_config(config, audit, gerrit_info)
-        assert results == []
+        with patch("g2p_github.provision_org_secret") as mock_secret:
+            mock_secret.return_value = G2PCheckResult(
+                check_name="provision_secret_GERRIT_SSH_PRIVKEY",
+                passed=True,
+                message="ok",
+                severity="info",
+            )
+            provision_org_config(config, audit, gerrit_info)
+            # Only the canonical required secret is touched.
+            assert mock_secret.call_count == 1
+            assert mock_secret.call_args.args[2] == "GERRIT_SSH_PRIVKEY"

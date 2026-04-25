@@ -1265,30 +1265,56 @@ def provision_org_config(
     owner = config.github_owner
     results: list[G2PCheckResult] = []
 
-    # Find the failed audit checks
-    secrets_check = next(
-        (r for r in audit_results if r.check_name == "org_secrets"),
-        None,
-    )
+    # Look up the variables audit entry so we can pick the correct
+    # HTTP verb (POST vs PATCH) per variable.  Secrets do not need
+    # this lookup because the GitHub Actions secrets API uses a
+    # single PUT verb for both create and update.
     variables_check = next(
         (r for r in audit_results if r.check_name == "org_variables"),
         None,
     )
 
-    # Provision missing secrets
-    if secrets_check and not secrets_check.passed:
-        missing = secrets_check.details.get("missing_required", [])
-        for secret_name in missing:
-            value = gerrit_info.get("ssh_private_key", "")
-            if secret_name == "GERRIT_SSH_PRIVKEY" and value:
-                results.append(provision_org_secret(token, owner, secret_name, value))
-            else:
-                logger.warning(
-                    "No value available for secret '%s'",
-                    secret_name,
+    # Provision required secrets.
+    #
+    # In ``provision`` mode we ALWAYS overwrite required secrets with
+    # the current run's values, regardless of whether they were
+    # already present.  Each Gerrit container build produces a fresh
+    # ephemeral SSH key, so a "GERRIT_SSH_PRIVKEY exists already"
+    # state from a previous run would silently leave the GitHub org
+    # holding a stale key that does not match the live Gerrit
+    # instance — workflows would dispatch successfully but fail at
+    # push time.  Always overwriting keeps Gerrit and the org in
+    # lock-step for every provision run.
+    ssh_private_key = gerrit_info.get("ssh_private_key", "")
+    if ssh_private_key:
+        for secret_name in REQUIRED_ORG_SECRETS:
+            if secret_name == "GERRIT_SSH_PRIVKEY":
+                results.append(
+                    provision_org_secret(token, owner, secret_name, ssh_private_key)
                 )
+    else:
+        logger.warning(
+            "No SSH private key available; skipping required secret provisioning"
+        )
+        # Surface this as an explicit failed result so the
+        # post-provision audit can flag it.
+        results.append(
+            G2PCheckResult(
+                check_name="provision_secret_GERRIT_SSH_PRIVKEY",
+                passed=False,
+                message=(
+                    "No SSH private key available to provision GERRIT_SSH_PRIVKEY"
+                ),
+                severity="error",
+            )
+        )
 
-    # Provision missing variables
+    # Provision required variables.
+    #
+    # As with secrets, every required variable is overwritten on each
+    # provision run.  Tunnel host/port assignments and known_hosts
+    # values can change between runs, and stale variables would
+    # cause downstream workflows to talk to the wrong endpoint.
     ssh_host = gerrit_info.get("ssh_host")
     ssh_port = gerrit_info.get("ssh_port")
     gerrit_server = f"{ssh_host}:{ssh_port}" if ssh_host and ssh_port else ""
@@ -1300,28 +1326,43 @@ def provision_org_config(
         "GERRIT_URL": gerrit_info.get("http_url", ""),
     }
 
-    if variables_check and not variables_check.passed:
-        missing_vars = variables_check.details.get("missing", [])
-        empty_vars = variables_check.details.get("empty", [])
-        vars_to_provision = missing_vars + empty_vars
+    # Determine which variables already exist so we can pick the
+    # correct HTTP verb (POST for create, PATCH for update).  Use
+    # the audit details when available; fall back to assuming the
+    # variable does not exist.
+    existing_vars: set[str] = set()
+    if variables_check is not None:
+        details = variables_check.details
+        # ``found`` lists variables that exist (any value), while
+        # ``empty`` lists those that exist but have an empty value.
+        existing_vars.update(details.get("found", []))
+        existing_vars.update(details.get("empty", []))
 
-        for var_name in vars_to_provision:
-            value = variable_map.get(var_name, "")
-            if not value:
-                logger.warning(
-                    "No value available for variable '%s'",
-                    var_name,
-                )
-                continue
+    for var_name in REQUIRED_ORG_VARIABLES:
+        value = variable_map.get(var_name, "")
+        if not value:
+            logger.warning(
+                "No value available for variable '%s'; skipping",
+                var_name,
+            )
             results.append(
-                provision_org_variable(
-                    token,
-                    owner,
-                    var_name,
-                    value,
-                    exists=var_name in empty_vars,
+                G2PCheckResult(
+                    check_name=f"provision_variable_{var_name}",
+                    passed=False,
+                    message=(f"No value available to provision variable '{var_name}'"),
+                    severity="error",
                 )
             )
+            continue
+        results.append(
+            provision_org_variable(
+                token,
+                owner,
+                var_name,
+                value,
+                exists=var_name in existing_vars,
+            )
+        )
 
     return results
 

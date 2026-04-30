@@ -40,6 +40,9 @@ VALID_NAME_STYLES: tuple[str, ...] = ("dash", "underscore", "slash")
 VALID_VALIDATION_MODES: tuple[str, ...] = ("error", "warn", "skip")
 """Allowed values for ``validation_mode``."""
 
+VALID_ORG_SETUP_MODES: tuple[str, ...] = ("provision", "verify", "skip")
+"""Allowed values for ``org_setup``."""
+
 VALID_HOOKS: tuple[str, ...] = (
     "patchset-created",
     "comment-added",
@@ -70,6 +73,76 @@ def _str_to_bool(value: str) -> bool:
 def _parse_csv(value: str) -> list[str]:
     """Split a comma-separated string into a trimmed, non-empty list."""
     return [item.strip() for item in value.split(",") if item.strip()]
+
+
+def decode_org_tokens(
+    b64_value: str,
+) -> dict[str, str]:
+    """Decode a Base64-encoded JSON array of org-token mappings.
+
+    The expected inner JSON schema is::
+
+        [{"github_org": "org-name", "token": "ghp_xxx"}, ...]
+
+    Parameters
+    ----------
+    b64_value:
+        Base64-encoded string.
+
+    Returns
+    -------
+    dict[str, str]
+        Mapping of ``github_org`` to ``token``.
+
+    Raises
+    ------
+    ConfigError
+        If the value cannot be decoded or parsed.
+    """
+    import base64
+
+    if not b64_value.strip():
+        return {}
+
+    # Normalize input: remove all whitespace so wrapped base64
+    # (e.g. line-wrapped by macOS/Linux or GitHub secrets) still
+    # decodes correctly with validate=True.
+    normalized = "".join(b64_value.split())
+
+    try:
+        decoded = base64.b64decode(normalized, validate=True).decode("utf-8")
+    except Exception as exc:
+        raise ConfigError(
+            f"Failed to decode g2p_org_token_map — bad base64: {exc}"
+        ) from exc
+
+    try:
+        entries = json.loads(decoded)
+    except json.JSONDecodeError as exc:
+        raise ConfigError(
+            f"Failed to parse g2p_org_token_map — bad JSON: {exc}"
+        ) from exc
+
+    if not isinstance(entries, list):
+        raise ConfigError(
+            f"g2p_org_token_map must be a JSON array, got {type(entries).__name__}"
+        )
+
+    result: dict[str, str] = {}
+    for entry in entries:
+        if not isinstance(entry, dict):
+            raise ConfigError(
+                f"g2p_org_token_map entries must be objects, got {type(entry).__name__}"
+            )
+        org = entry.get("github_org", "")
+        token = entry.get("token", "")
+        if not org or not token:
+            raise ConfigError(
+                "g2p_org_token_map entries must have 'github_org' and 'token' fields"
+            )
+        result[org] = token
+
+    return result
 
 
 def _parse_comment_mappings(raw: str) -> dict[str, str]:
@@ -156,6 +229,10 @@ class G2PConfig:
     ssh_private_key: str = ""
     github_known_hosts: str = ""
 
+    # -- Org verification/provisioning -----------------------------------
+    org_setup: str = "verify"
+    org_token_map: str = ""
+
     # ------------------------------------------------------------------
     # Factory
     # ------------------------------------------------------------------
@@ -215,6 +292,8 @@ class G2PConfig:
             validate_repos=validate_repos,
             ssh_private_key=env("G2P_SSH_PRIVATE_KEY", ""),
             github_known_hosts=env("G2P_GITHUB_KNOWN_HOSTS", ""),
+            org_setup=env("G2P_ORG_SETUP", "verify").strip().lower(),
+            org_token_map=env("G2P_ORG_TOKEN_MAP", ""),
         )
 
     # ------------------------------------------------------------------
@@ -260,6 +339,12 @@ class G2PConfig:
                 f"{VALID_VALIDATION_MODES!r}, got {self.validation_mode!r}"
             )
 
+        if self.org_setup not in VALID_ORG_SETUP_MODES:
+            errors.append(
+                f"g2p_org_setup must be one of "
+                f"{VALID_ORG_SETUP_MODES!r}, got {self.org_setup!r}"
+            )
+
         # -- Hook names --------------------------------------------------
         invalid_hooks = [h for h in self.hooks if h not in VALID_HOOKS]
         if invalid_hooks:
@@ -299,6 +384,13 @@ class G2PConfig:
                 self.remote_auth_group,
             )
 
+        if self.org_setup == "provision" and not self.org_token_map:
+            logger.warning(
+                "g2p_org_setup is 'provision' but no "
+                "g2p_org_token_map provided; will fall "
+                "back to g2p_github_token for org operations"
+            )
+
         return errors
 
     # ------------------------------------------------------------------
@@ -328,3 +420,33 @@ class G2PConfig:
     def token_provided(self) -> bool:
         """Whether a GitHub token was supplied."""
         return bool(self.github_token)
+
+    def resolve_org_token(self) -> str:
+        """Resolve the token for org-level operations.
+
+        Priority:
+        1. ``org_token_map`` entry for this ``github_owner``
+        2. ``github_token`` (fallback)
+
+        Returns
+        -------
+        str
+            The resolved token string.
+        """
+        if self.org_token_map:
+            try:
+                tokens = decode_org_tokens(self.org_token_map)
+            except ConfigError:
+                logger.warning(
+                    "Failed to decode org_token_map; falling back to github_token"
+                )
+                return self.github_token
+            token = tokens.get(self.github_owner)
+            if token:
+                return token
+            logger.warning(
+                "No entry for '%s' in g2p_org_token_map; "
+                "falling back to g2p_github_token",
+                self.github_owner,
+            )
+        return self.github_token

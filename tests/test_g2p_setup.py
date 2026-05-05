@@ -746,8 +746,11 @@ class TestSetupG2pHooks:
 
     def test_partial_availability(self) -> None:
         docker = _make_docker_mock()
-        # First call: patchset-created exists, second: comment-added missing
-        docker.exec_test.side_effect = [True, False]
+        # exec_test call sequence:
+        #   1. hooks.jar present?         -> True
+        #   2. patchset-created binary?    -> True
+        #   3. comment-added binary?       -> False
+        docker.exec_test.side_effect = [True, True, False]
         config = G2PConfig(
             enabled=True,
             github_owner="test",
@@ -812,9 +815,10 @@ class TestSetupG2pSsh:
                 stdout="ssh-ed25519 AAAApubkey gerrit-action-g2p",
                 stderr="",
             )
-            public_key = setup_g2p_ssh(docker, CID, config)
+            public_key, private_key = setup_g2p_ssh(docker, CID, config)
 
         assert public_key.startswith("ssh-ed25519")
+        assert "BEGIN OPENSSH PRIVATE KEY" in private_key
         docker.cp.assert_called()
 
     def test_auto_generates_keypair(self) -> None:
@@ -830,9 +834,10 @@ class TestSetupG2pSsh:
                 "-----BEGIN KEY-----\nprivate\n-----END KEY-----",
                 "ssh-ed25519 AAAAgenerated gerrit-action-g2p",
             )
-            public_key = setup_g2p_ssh(docker, CID, config)
+            public_key, private_key = setup_g2p_ssh(docker, CID, config)
 
         assert "AAAAgenerated" in public_key
+        assert "private" in private_key
         mock_keygen.assert_called_once()
 
     def test_keygen_failure_is_warning_not_error(self) -> None:
@@ -846,9 +851,10 @@ class TestSetupG2pSsh:
         with patch("g2p_setup.generate_ssh_keypair") as mock_keygen:
             mock_keygen.side_effect = G2PSetupError("keygen failed")
             # Should not raise
-            public_key = setup_g2p_ssh(docker, CID, config)
+            public_key, private_key = setup_g2p_ssh(docker, CID, config)
 
         assert public_key == ""
+        assert private_key == ""
 
     def test_creates_ssh_directory(self) -> None:
         docker = _make_docker_mock(exec_cmd_return="0")
@@ -996,7 +1002,7 @@ class TestSetupG2p:
         mock_ini.return_value = G2P_INI_PATH
         mock_repl_remote.return_value = True
         mock_hooks.return_value = ["patchset-created", "comment-added"]
-        mock_ssh.return_value = "ssh-ed25519 AAAAkey"
+        mock_ssh.return_value = ("ssh-ed25519 AAAAkey", "-----BEGIN KEY-----")
 
         docker = _make_docker_mock()
         config = G2PConfig(
@@ -1039,7 +1045,7 @@ class TestSetupG2p:
         mock_ini.return_value = G2P_INI_PATH
         mock_repl_remote.return_value = False
         mock_hooks.return_value = []
-        mock_ssh.return_value = ""
+        mock_ssh.return_value = ("", "")
 
         docker = _make_docker_mock()
         config = G2PConfig(enabled=True, github_owner="test")

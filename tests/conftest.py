@@ -85,6 +85,8 @@ def clean_env(monkeypatch: pytest.MonkeyPatch) -> pytest.MonkeyPatch:
         "G2P_VALIDATE_REPOS",
         "G2P_SSH_PRIVATE_KEY",
         "G2P_GITHUB_KNOWN_HOSTS",
+        "G2P_ORG_SETUP",
+        "G2P_ORG_TOKEN_MAP",
     ]
     for var in env_vars:
         monkeypatch.delenv(var, raising=False)

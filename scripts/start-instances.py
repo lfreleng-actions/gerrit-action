@@ -33,6 +33,7 @@ Usage::
 
 from __future__ import annotations
 
+import ipaddress
 import json
 import logging
 import shutil
@@ -566,12 +567,19 @@ def init_gerrit_site(
     slug: str,
     canonical_url: str,
     image: str,
+    extra_init_args: str = "",
 ) -> None:
     """Initialise a Gerrit site directory using ``gerrit init``.
 
     Runs the Gerrit image with ``init`` as the command, mounting only
     the individual sub-directories (not the whole ``/var/gerrit``
     directory) so that ``/var/gerrit/bin`` from the image is preserved.
+
+    Parameters
+    ----------
+    extra_init_args:
+        Optional comma-separated list of additional arguments to pass
+        to ``gerrit init`` (from the ``gerrit_init_args`` action input).
     """
     logger.info("Initializing Gerrit site for %s…", slug)
 
@@ -586,11 +594,28 @@ def init_gerrit_site(
     volumes = {str(instance_dir / sub): f"/var/gerrit/{sub}" for sub in _GERRIT_SUBDIRS}
 
     try:
+        # Pass --batch so init never prompts, and
+        # --install-all-plugins so the bundled plugins from the
+        # image (hooks, download-commands, delete-project,
+        # webhooks, singleusergroup, reviewnotes, etc.) get copied
+        # into the mounted plugins/ directory.  Without this the
+        # mount shadows the image's bundled plugins and Gerrit
+        # starts without the hooks plugin — which silently breaks
+        # G2P because Gerrit never invokes the symlinks in
+        # /var/gerrit/hooks/.
+        command = ["init", "--batch", "--install-all-plugins"]
+        if extra_init_args.strip():
+            # Honour any user-supplied extras (comma-separated).
+            for extra in extra_init_args.split(","):
+                extra = extra.strip()
+                if extra:
+                    command.append(extra)
+
         docker.run_ephemeral(
             image,
             volumes=volumes,
             env={"CANONICAL_WEB_URL": canonical_url},
-            command=["init"],
+            command=command,
             timeout=180,
         )
     except DockerError as exc:
@@ -614,6 +639,7 @@ def configure_gerrit(
     api_path: str,
     advertised_ssh_addr: str,
     use_tunnel: bool,
+    tunnel_host: str = "",
 ) -> None:
     """Write ``gerrit.config`` settings via ``git config``.
 
@@ -668,11 +694,18 @@ def configure_gerrit(
     # Remote plugin admin
     if use_tunnel:
         _gc("plugins.allowRemoteAdmin", "false")
-        logger.warning(
-            "⚠️  Tunnel mode active with DEVELOPMENT_BECOME_ANY_ACCOUNT auth."
-        )
-        logger.warning("   Anyone with network access can authenticate as any user.")
-        logger.warning("   Remote plugin admin has been disabled to limit exposure.")
+        if _is_private_tunnel(tunnel_host):
+            logger.info("Tunnel mode active (private network — remote admin disabled).")
+        else:
+            logger.warning(
+                "⚠️  Tunnel mode active with DEVELOPMENT_BECOME_ANY_ACCOUNT auth."
+            )
+            logger.warning(
+                "   Anyone with network access can authenticate as any user."
+            )
+            logger.warning(
+                "   Remote plugin admin has been disabled to limit exposure."
+            )
     else:
         _gc("plugins.allowRemoteAdmin", "true")
 
@@ -842,6 +875,36 @@ def capture_ssh_host_keys(
 # =====================================================================
 
 
+def _is_private_tunnel(tunnel_host: str) -> bool:
+    """Check whether the tunnel host is a private or VPN address.
+
+    Returns ``True`` when *tunnel_host* is an IPv4 address inside one of
+    the RFC 1918 private ranges (``10.0.0.0/8``, ``172.16.0.0/12``,
+    ``192.168.0.0/16``) or the CGNAT range (``100.64.0.0/10``, which
+    includes Tailscale addresses).  Hostnames that cannot be parsed as
+    an IP address (e.g. ``bore.pub``) are treated as public and return
+    ``False``.
+    """
+    if not tunnel_host:
+        return False
+
+    try:
+        addr = ipaddress.ip_address(tunnel_host)
+    except ValueError:
+        return False
+
+    if not isinstance(addr, ipaddress.IPv4Address):
+        return False
+
+    private_networks = (
+        ipaddress.ip_network("10.0.0.0/8"),
+        ipaddress.ip_network("172.16.0.0/12"),
+        ipaddress.ip_network("192.168.0.0/16"),
+        ipaddress.ip_network("100.64.0.0/10"),
+    )
+    return any(addr in net for net in private_networks)
+
+
 def _resolve_tunnel(
     slug: str,
     config: ActionConfig,
@@ -950,7 +1013,14 @@ def start_instance(
     instance_dir = config.work_path / "instances" / slug
 
     # Step 1: Init site
-    init_gerrit_site(docker, instance_dir, slug, canonical_url, image)
+    init_gerrit_site(
+        docker,
+        instance_dir,
+        slug,
+        canonical_url,
+        image,
+        extra_init_args=config.gerrit_init_args,
+    )
 
     # Step 2: Configure
     configure_gerrit(
@@ -961,6 +1031,7 @@ def start_instance(
         api_path,
         advertised_ssh_addr,
         use_tunnel,
+        tunnel_host=config.tunnel_host,
     )
 
     # Step 3: Plugins

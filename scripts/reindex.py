@@ -78,7 +78,7 @@ LIB_DIR = SCRIPT_DIR / "lib"
 sys.path.insert(0, str(LIB_DIR))
 
 from config import ActionConfig, InstanceStore  # noqa: E402
-from errors import ConfigError, GerritActionError  # noqa: E402
+from errors import GerritActionError  # noqa: E402
 from logging_utils import setup_logging  # noqa: E402
 
 from gerrit_api import GerritAPIError, GerritDevClient  # noqa: E402
@@ -130,12 +130,13 @@ def _flush_caches(client: GerritDevClient, slug: str) -> int:
         endpoint = f"config/server/caches/{cache_name}/flush"
         try:
             # The flush endpoint takes no body.  Pass ``data=None``
-            # (not ``data=""``) so the client sends a true zero-byte
-            # request: an empty string with ``Content-Type:
-            # application/json`` makes Gerrit attempt to parse it as
-            # a JSON document and reject the request with
-            # ``HTTP 400: Expected JSON object``.
-            client.post(endpoint, data=None)
+            # so the client sends a true zero-byte request, and
+            # ``content_type=""`` to suppress the default
+            # ``Content-Type: application/json`` header — otherwise
+            # Gerrit sees ``Content-Type: application/json`` with an
+            # empty body, tries to parse ``""`` as JSON, and rejects
+            # the call with ``HTTP 400: Expected JSON object``.
+            client.post(endpoint, data=None, content_type="")
             flushed += 1
             logger.debug("[%s]   flushed cache: %s", slug, cache_name)
         except GerritAPIError as exc:
@@ -164,9 +165,10 @@ def _list_projects(client: GerritDevClient, slug: str) -> list[str]:
     """
     try:
         # ``?type=ALL`` includes the magic projects; we filter them
-        # out below.  We don't constrain by description so the call
-        # is cheap to parse.
-        result = client.get("projects/?type=ALL&d")
+        # out below.  We only need the project names (the response
+        # keys), so we don't request descriptions (``&d``) — keeping
+        # the response small and cheap to parse.
+        result = client.get("projects/?type=ALL")
     except GerritAPIError as exc:
         logger.error("[%s] failed to list projects: %s", slug, exc)
         return []
@@ -192,13 +194,15 @@ def _reindex_project(client: GerritDevClient, slug: str, project: str) -> bool:
     endpoint = f"projects/{encoded}/index.changes"
     try:
         # The index.changes endpoint takes no body.  Pass
-        # ``data=None`` so the client sends a zero-byte request;
-        # ``data=""`` would set the body to an empty string which,
-        # combined with ``Content-Type: application/json``, makes
-        # Gerrit reject the call with ``HTTP 400: Expected JSON
-        # object`` (observed on every project of the previous
-        # dispatch).
-        client.post(endpoint, data=None)
+        # ``data=None`` so the client sends a zero-byte request,
+        # and ``content_type=""`` so the default
+        # ``Content-Type: application/json`` header is suppressed:
+        # if it is sent alongside an empty body Gerrit tries to
+        # parse ``""`` as JSON and rejects with
+        # ``HTTP 400: Expected JSON object`` (observed against
+        # every project of the previous two dispatches even with
+        # ``data=None`` alone).
+        client.post(endpoint, data=None, content_type="")
     except GerritAPIError as exc:
         # Projects with no changes return 204 No Content which the
         # client treats as success; an actual error here is genuinely
@@ -317,14 +321,19 @@ def run() -> int:
         return 0
 
     instance_store = InstanceStore(config.instances_json_path)
-    try:
-        instance_store.load()
-    except ConfigError:
+    if not config.instances_json_path.exists():
+        # Only the *missing-file* case is a benign no-op (no
+        # deployment ran).  If the file exists but contains invalid
+        # JSON, ``load()`` raises ``ConfigError`` and we let it
+        # propagate so corrupt metadata fails the step instead of
+        # silently skipping the reindex.
         logger.warning(
             "No instances.json at %s; nothing to reindex",
             config.instances_json_path,
         )
         return 0
+
+    instance_store.load()
 
     if len(instance_store) == 0:
         logger.warning("instances.json is empty; nothing to reindex")

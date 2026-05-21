@@ -402,6 +402,31 @@ def generate_replication_config(
     # Duplicates are tolerated by Gerrit but suppressed here so the
     # generated file stays tidy when an operator already lists the
     # ref pattern explicitly in ``sync_refs``.
+    #
+    # Note: the per-project remote DOES mirror each project's own
+    # ``refs/meta/config`` (via the ``refs/meta/*`` wildcard).  This
+    # is intentional and is a different trade-off from the magic-repo
+    # remote's handling:
+    #
+    # * Per-project ``refs/meta/config`` defines that project's
+    #   *project-local* ACL (per-ref read / push / submit
+    #   permissions, plus the project's owner-group reference).
+    # * The bootstrap container does not have a meaningful local
+    #   ACL for replicated user projects (they were just pre-
+    #   created as empty bare repos by ``fetch_and_precreate_
+    #   projects``), so mirroring the source's ACL is a strict
+    #   improvement: it lets the deployed Gerrit reflect the
+    #   source server's per-project access rules.
+    # * The bootstrap admin account 1000000 retains the global
+    #   ``administrateServer`` capability (because the magic-repo
+    #   remote excludes ``All-Projects:refs/meta/config`` — see the
+    #   block comment further down), and that capability bypasses
+    #   project-level ACLs, so the admin still sees every replicated
+    #   project regardless of what its per-project ACL says.
+    # * Non-admin / anonymous viewers may be blocked by per-project
+    #   ACLs that reference source-server group UUIDs that do not
+    #   exist locally, but that is the expected behaviour for a
+    #   "mirror the source server" deployment shape.
     if config.replicate_meta_refs:
         for extra in (
             "+refs/meta/*:refs/meta/*",
@@ -483,14 +508,83 @@ def generate_replication_config(
     # narrowly scoped to user projects.  ``createMissingRepositories``
     # is set to ``false`` here because Gerrit always creates these
     # special repos itself during ``gerrit init``.
+    #
+    # CRITICAL: refs/meta/config is INTENTIONALLY EXCLUDED.
+    # ====================================================
+    # An earlier version of this code used a blanket
+    # ``+refs/meta/*:refs/meta/*`` refspec for both magic projects.
+    # That pulled the source server's
+    # ``All-Projects:refs/meta/config`` over the top of the deployed
+    # container's locally-bootstrapped global ACL.  The fallout was
+    # silent but severe:
+    #
+    # * ``refs/meta/config`` on ``All-Projects`` is the
+    #   server-wide ACL definition.  It names the UUID of the
+    #   ``Administrators`` group, plus every per-ref permission
+    #   block (read / push / submit / forge-author / etc.).
+    # * The bootstrap container creates account 1000000 and adds
+    #   it to the *local* Administrators group (with a locally
+    #   generated UUID).  Setup-gerrit-user.py then provisions the
+    #   operator's SSH keys against that account.
+    # * After pull-replication writes the source server's
+    #   ``refs/meta/config`` into the local All-Projects, the
+    #   Administrators group reference resolves to the source
+    #   server's UUID, whose membership is the source server's
+    #   admins — NOT the local account 1000000.  Account 1000000
+    #   still exists in ``refs/users/00/1000000`` (untouched
+    #   because the ``refs/users/*`` fetch typically fails on
+    #   ACL-restricted source servers), but it is no longer in
+    #   any group with ``administrateServer`` capability.
+    # * Every REST endpoint that requires ``administrate-server``
+    #   or ``maintain-server`` then returns 403 against the
+    #   would-be admin.  ``POST /projects/<name>/index.changes``
+    #   needs ``administrate-server``; ``POST /config/server/
+    #   caches/<name>/flush`` needs ``maintain-server``.  Both
+    #   of those calls fired 403 across the board in the
+    #   2026-05-21 14:35 / 14:51 / 15:02 dispatches with the
+    #   blanket-refspec config.
+    # * Operators see the symptom in the deployed Gerrit UI too:
+    #   their account exists (DEVELOPMENT_BECOME_ANY_ACCOUNT
+    #   still works) but the admin UI is locked because the
+    #   Administrators group no longer points at them.
+    #
+    # Fix: enumerate the meta refs we actually need by exact name
+    # so the wildcard never grabs ``refs/meta/config``.  The
+    # specific refs we want are NoteDb-related (the things that
+    # actually let the deployed Gerrit render the source server's
+    # accounts / groups / changes correctly):
+    #
+    # * ``refs/meta/external-ids`` (All-Users) — login → account_id
+    #   map; without this, replicated changes show ``Anonymous
+    #   Coward`` instead of real author names.
+    # * ``refs/meta/group-names`` (All-Users) — group UUID → name
+    #   map; without this, replicated group references render as
+    #   raw UUIDs.
+    # * ``refs/meta/version`` (both) — NoteDb schema version pin;
+    #   harmless to mirror and required for some consistency
+    #   checks the secondary index runs.
+    #
+    # We do NOT enumerate ``refs/meta/config`` for either project
+    # because:
+    #   - All-Projects:refs/meta/config = source's global ACL
+    #     (the hijack risk above).
+    #   - All-Users:refs/meta/config = source's All-Users-specific
+    #     ACL; replicating it has the same hijack effect against
+    #     account-edit / draft-comment permissions on the local
+    #     deployment.
     if config.replicate_meta_refs:
         lines.extend(
             [
                 "",
                 "# Magic-repo remote: All-Users / All-Projects NoteDb refs.",
-                "# Required for accounts, external IDs, groups, the",
-                "# change-number sequence and global ACLs to resolve on",
-                "# the deployed CI Gerrit.",
+                "# Required for accounts, external IDs, groups and the",
+                "# change-number sequence to resolve on the deployed",
+                "# CI Gerrit.  refs/meta/config is INTENTIONALLY",
+                "# EXCLUDED — see the source comment in",
+                "# generate_replication_config for the full rationale",
+                "# (TL;DR: replicating it overwrites the local",
+                "# Administrators-group ACL and breaks reindex /",
+                "# cache-flush / admin UI on the bootstrap account).",
                 f'[remote "{slug}-meta"]',
                 f"  url = {git_url}",
             ]
@@ -506,25 +600,47 @@ def generate_replication_config(
                 f"  threads = {config.replication_threads}",
                 "  createMissingRepositories = false",
                 "  replicateHiddenProjects = true",
-                # All-Users + All-Projects share these refspecs.
-                # ``refs/users/*`` and ``refs/groups/*`` only exist in
-                # All-Users; ``refs/sequences/*`` and ``refs/meta/*``
-                # span both.  The other refs (``draft-comments``,
-                # ``starred-changes``, ``edit``) are All-Users only but
-                # are harmless no-ops on All-Projects.
-                "  fetch = +refs/meta/*:refs/meta/*",
-                "  fetch = +refs/sequences/*:refs/sequences/*",
+                # Refspecs are enumerated rather than wildcarded so
+                # the source server's ``refs/meta/config`` (on either
+                # All-Projects or All-Users) is never pulled.  See the
+                # block comment above for the rationale.  Each refspec
+                # is documented inline so future maintainers can see
+                # which magic project the ref normally lives on and
+                # why we are mirroring it.
+                #
+                # NoteDb identity / membership refs (All-Users):
                 "  fetch = +refs/users/*:refs/users/*",
                 "  fetch = +refs/groups/*:refs/groups/*",
+                "  fetch = +refs/meta/external-ids:refs/meta/external-ids",
+                "  fetch = +refs/meta/group-names:refs/meta/group-names",
+                # Per-user state refs (All-Users); harmless no-ops
+                # against All-Projects because they don't exist there.
                 "  fetch = +refs/draft-comments/*:refs/draft-comments/*",
                 "  fetch = +refs/starred-changes/*:refs/starred-changes/*",
+                # Change-number sequence (All-Projects); also a no-op
+                # against All-Users.  Without this the local container
+                # would start handing out change numbers from 1, which
+                # would collide with the replicated refs/changes/*
+                # numbers on the very first locally-uploaded change.
+                # The test Gerrit is read-only by policy, so this is
+                # belt-and-braces, but cheap to mirror.
+                "  fetch = +refs/sequences/*:refs/sequences/*",
+                # NoteDb schema-version pin (both projects).  Cheap to
+                # mirror and helps some consistency-check paths in the
+                # secondary index.
+                "  fetch = +refs/meta/version:refs/meta/version",
+                # Magic-project filter.  Both names are listed even
+                # though some refspecs only apply to one of them —
+                # the pull-replication plugin silently skips refs
+                # that don't exist for a given project.
                 "  projects = All-Users",
                 "  projects = All-Projects",
             ]
         )
         logger.info(
             "  Meta-ref replication enabled: "
-            "All-Users / All-Projects NoteDb refs will be mirrored"
+            "All-Users / All-Projects NoteDb refs will be mirrored "
+            "(refs/meta/config excluded to preserve local ACL)"
         )
 
     config_file.parent.mkdir(parents=True, exist_ok=True)

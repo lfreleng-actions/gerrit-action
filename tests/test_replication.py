@@ -718,6 +718,112 @@ class TestCheckReplicationErrors:
         assert report.has_advisory_errors is True
         assert report.has_authoritative_errors is False
 
+    def test_magic_repo_match_classified_as_magic(self, mock_docker):
+        """All-Users / All-Projects URLs in matches set ``is_magic_repo``.
+
+        Replication failures against Gerrit's special repositories
+        (``All-Users``, ``All-Projects``, ``All-External-IDs``,
+        ``Sequences``) are commonly driven by stricter source-side
+        ACLs and should be surfaced separately from real user-project
+        failures.  ``check_replication_errors`` tags each match
+        accordingly so ``has_user_project_errors`` /
+        ``has_magic_repo_errors`` can be queried independently.
+        """
+        from replication import check_replication_errors
+
+        docker, mock_run = mock_docker
+        mock_run.side_effect = [
+            # exec_test: log file exists
+            make_completed_process(returncode=0),
+            # grep: both an All-Users failure and a user-project failure.
+            make_completed_process(
+                stdout=(
+                    "[ts] [aaa] Cannot replicate from "
+                    "https://gerrit.onap.org/r/a/All-Users.git\n"
+                    "[ts] [bbb] Cannot replicate from "
+                    "https://gerrit.onap.org/r/a/aai/resources.git\n"
+                )
+            ),
+            # container_logs: clean
+            make_completed_process(stdout="INFO: ready"),
+        ]
+
+        report = check_replication_errors(docker, "abc123")
+        assert report.has_authoritative_errors is True
+        # User-project gate should fire (one of the two lines is a
+        # user project) but the magic-repo gate should also be set.
+        assert report.has_user_project_errors is True
+        assert report.has_magic_repo_errors is True
+        # Per-match flag must agree with the URL it contains.
+        by_magic = {m.is_magic_repo: m for m in report.log_file_matches}
+        assert True in by_magic and False in by_magic
+        assert "All-Users.git" in by_magic[True].line
+        assert "aai/resources.git" in by_magic[False].line
+
+    def test_only_magic_repo_errors_do_not_set_user_project_flag(self, mock_docker):
+        """All-Users-only failures must not trip the user-project gate.
+
+        This is the exact failure mode the previous deployment hit:
+        the workflow's service-account credentials are not admin on
+        the source Gerrit, so ``All-Users`` fetches return 401/403
+        while every user project replicates fine.  The verification
+        callers must classify that as a magic-repo (advisory)
+        failure so the deployment still succeeds.
+        """
+        from replication import check_replication_errors
+
+        docker, mock_run = mock_docker
+        mock_run.side_effect = [
+            make_completed_process(returncode=0),
+            make_completed_process(
+                stdout=(
+                    "[ts] [aaa] Cannot replicate from "
+                    "https://gerrit.onap.org/r/a/All-Users.git\n"
+                    "org.eclipse.jgit.errors.TransportException: "
+                    "https://gerrit.onap.org/r/a/All-Users.git: "
+                    "not authorized\n"
+                )
+            ),
+            make_completed_process(stdout="INFO: ready"),
+        ]
+
+        report = check_replication_errors(docker, "abc123")
+        assert report.has_authoritative_errors is True
+        assert report.has_magic_repo_errors is True
+        # Crucially: no user-project failures — the workflow should
+        # not abort on this combination.
+        assert report.has_user_project_errors is False
+        # Both matched lines must be tagged as magic-repo.
+        assert all(m.is_magic_repo for m in report.log_file_matches)
+
+    def test_all_four_magic_repo_names_detected(self, mock_docker):
+        """All-Users / All-Projects / All-External-IDs / Sequences classify."""
+        from replication import check_replication_errors
+
+        docker, mock_run = mock_docker
+        mock_run.side_effect = [
+            make_completed_process(returncode=0),
+            make_completed_process(
+                stdout=(
+                    "[ts] Cannot replicate from "
+                    "https://g.example.org/All-Users.git\n"
+                    "[ts] Cannot replicate from "
+                    "https://g.example.org/All-Projects.git\n"
+                    "[ts] Cannot replicate from "
+                    "https://g.example.org/All-External-IDs.git\n"
+                    "[ts] Cannot replicate from "
+                    "https://g.example.org/Sequences.git\n"
+                )
+            ),
+            make_completed_process(stdout="INFO: ready"),
+        ]
+
+        report = check_replication_errors(docker, "abc123")
+        assert report.has_magic_repo_errors is True
+        assert report.has_user_project_errors is False
+        assert len(report.log_file_matches) == 4
+        assert all(m.is_magic_repo for m in report.log_file_matches)
+
 
 # =========================================================================
 # get_completed_repo_count
@@ -1962,6 +2068,76 @@ class TestVerifySingleInstance:
         # Advisory-only matches must not abort verification — the
         # later steps (wait_for_replication / disk usage) decide
         # success.
+        assert result.success is True
+        assert result.error == ""
+
+    @patch("replication.get_git_disk_usage_mb", return_value=500)
+    @patch("replication.get_git_disk_usage_human", return_value="500M")
+    @patch("replication.get_completed_repo_count", return_value=10)
+    @patch("replication.count_repositories", return_value=10)
+    @patch("replication.wait_for_replication", return_value=True)
+    @patch("replication.check_secure_config", return_value=True)
+    @patch("replication.show_replication_config", return_value="[remote]")
+    @patch("replication.check_replication_config", return_value=True)
+    @patch("replication.verify_plugin_loaded", return_value=True)
+    @patch(
+        "replication.check_replication_errors",
+        return_value=ReplicationErrorReport(
+            log_file_matches=[
+                ErrorMatch(
+                    source="pull_replication_log",
+                    pattern="Cannot replicate",
+                    line=(
+                        "[ts] [aaa] Cannot replicate from "
+                        "https://gerrit.onap.org/r/a/All-Users.git"
+                    ),
+                    is_magic_repo=True,
+                )
+            ]
+        ),
+    )
+    def test_magic_repo_only_errors_do_not_fail_verification(
+        self,
+        mock_errors,
+        mock_plugin,
+        mock_config,
+        mock_show_config,
+        mock_secure,
+        mock_wait,
+        mock_count,
+        mock_completed,
+        mock_disk_human,
+        mock_disk_mb,
+    ):
+        """All-Users-only authoritative errors must warn but not fail.
+
+        This is the exact failure mode the previous deployment hit:
+        the source Gerrit's ACL on All-Users requires admin scope,
+        but the workflow's HTTP service-account credentials are not
+        admin.  Every user-project fetch succeeds; only All-Users
+        returns 401/403.  ``verify_single_instance`` must classify
+        that as a magic-repo (advisory) failure so the deployment
+        completes — the operator just loses NoteDb account / group
+        rendering for replicated changes, which is the documented
+        degraded mode for this combination.
+        """
+        from replication import verify_single_instance
+
+        docker = MagicMock()
+        docker.container_exists.return_value = True
+        docker.container_state.return_value = "running"
+        docker.exec_test.return_value = True
+
+        instance = {
+            "cid": "abc123def456",
+            "gerrit_host": "gerrit.example.org",
+            "project": "",
+            "expected_project_count": 10,
+        }
+
+        result = verify_single_instance(docker, "onap", instance)
+        # Magic-repo-only matches must not abort verification —
+        # user-project replication is unaffected.
         assert result.success is True
         assert result.error == ""
 

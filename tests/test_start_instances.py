@@ -783,14 +783,20 @@ class TestGenerateReplicationConfig:
 
         content = config_file.read_text()
         assert '[remote "onap-meta"]' in content
-        # All required magic-repo refspecs present
+        # The enumerated NoteDb refspecs are present.  The magic-repo
+        # remote intentionally uses explicit ref names (rather than a
+        # ``refs/meta/*`` wildcard) so the source server's
+        # ``refs/meta/config`` is never pulled — see the rationale
+        # in ``generate_replication_config`` for why that matters.
         for refspec in (
-            "fetch = +refs/meta/*:refs/meta/*",
-            "fetch = +refs/sequences/*:refs/sequences/*",
             "fetch = +refs/users/*:refs/users/*",
             "fetch = +refs/groups/*:refs/groups/*",
+            "fetch = +refs/meta/external-ids:refs/meta/external-ids",
+            "fetch = +refs/meta/group-names:refs/meta/group-names",
             "fetch = +refs/draft-comments/*:refs/draft-comments/*",
             "fetch = +refs/starred-changes/*:refs/starred-changes/*",
+            "fetch = +refs/sequences/*:refs/sequences/*",
+            "fetch = +refs/meta/version:refs/meta/version",
         ):
             assert refspec in content, f"missing: {refspec}"
         # Both magic projects listed explicitly
@@ -801,6 +807,60 @@ class TestGenerateReplicationConfig:
         # All-Users is reachable.
         assert "createMissingRepositories = false" in content
         assert "replicateHiddenProjects = true" in content
+
+    def test_meta_refs_excludes_refs_meta_config(self, tmp_path: Path) -> None:
+        """refs/meta/config must NEVER appear in the magic-repo remote.
+
+        Replicating ``All-Projects:refs/meta/config`` from the source
+        server overwrites the deployed container's locally-bootstrapped
+        global ACL.  The fallout is severe and silent: the
+        ``Administrators`` group reference resolves to the source
+        server's UUID, the bootstrap admin account (1000000) is no
+        longer in any admin group, and every REST call gated on
+        ``administrate-server`` / ``maintain-server`` (notably the
+        reindex and cache-flush endpoints used by
+        ``scripts/reindex.py``) returns HTTP 403.  This regression
+        was observed in three consecutive dispatches before the
+        wildcard was replaced with the enumerated refspec list.
+
+        Pinning the exclusion explicitly here ensures a future
+        "helpful" patch that re-introduces ``+refs/meta/*`` fails
+        loudly.
+        """
+        config_file = tmp_path / "replication.config"
+        config = _make_config(replicate_meta_refs=True)
+
+        start_instances.generate_replication_config(
+            config_file,
+            "onap",
+            "gerrit.example.org",
+            "",
+            "gerrit",
+            29418,
+            "",
+            config,
+        )
+
+        content = config_file.read_text()
+        # The literal refspec ``refs/meta/config`` must not appear as
+        # a fetch line, and the wildcard form must not appear inside
+        # the magic-repo remote either.
+        magic_remote_section = content.split('[remote "onap-meta"]', 1)[1]
+        # End the magic-remote section at the next top-level header
+        # (or end-of-file) so we don't accidentally see fetch lines
+        # from a different remote.
+        magic_remote_section = magic_remote_section.split("\n[", 1)[0]
+        assert "refs/meta/config" not in magic_remote_section, (
+            f"refs/meta/config must be excluded from the magic-repo "
+            f"remote (ACL hijack risk); found in section:\n"
+            f"{magic_remote_section}"
+        )
+        assert "+refs/meta/*:refs/meta/*" not in magic_remote_section, (
+            "The blanket refs/meta/* wildcard was re-introduced in "
+            "the magic-repo remote; this pulls refs/meta/config and "
+            "hijacks the local global ACL.  See the comment in "
+            "generate_replication_config for the rationale."
+        )
 
     def test_meta_refs_no_duplicate_when_user_specified(self, tmp_path: Path) -> None:
         """Operator-specified ``refs/meta/*`` is not duplicated."""

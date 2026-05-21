@@ -240,6 +240,37 @@ class _StabilityTracker:
         return self._prev_snapshot.timestamp - self._last_change_time
 
 
+# Gerrit special projects.  When ``replicate_meta_refs`` is enabled
+# the action emits a second ``[remote "<slug>-meta"]`` section that
+# targets these repositories with a broader refspec set.  Errors
+# against them in the authoritative log are classified separately
+# from user-project errors: the source server's ACL on All-Users
+# typically requires admin scope (because it holds per-user PII),
+# and a non-admin replication credential can fail there even when
+# it has full read on every user project.  We never want a magic-
+# repo permission denial alone to fail the workflow, because the
+# core feature — per-project replication — still works in that
+# case; the operator just loses NoteDb account/group rendering in
+# the deployed Gerrit's UI.
+_MAGIC_REPO_NAMES: tuple[str, ...] = (
+    "All-Users",
+    "All-Projects",
+    "All-External-IDs",
+    "Sequences",
+)
+
+# Pattern matched against an authoritative-log line to determine
+# whether the offending fetch targeted a magic repository.  The
+# pull-replication plugin writes both ``Cannot replicate from
+# https://.../All-Users.git`` headlines and follow-on stack-trace
+# lines such as ``TransportException: https://.../All-Users.git:
+# not authorized``; either form is enough to attribute the match.
+_MAGIC_REPO_RE = re.compile(
+    r"/(" + "|".join(re.escape(name) for name in _MAGIC_REPO_NAMES) + r")\.git",
+    re.IGNORECASE,
+)
+
+
 @dataclass
 class ErrorMatch:
     """A single line that matched a replication-error pattern.
@@ -260,11 +291,24 @@ class ErrorMatch:
         which rule fired.
     line:
         The matching line itself, with the trailing newline stripped.
+    is_magic_repo:
+        True when the matched line references one of Gerrit's special
+        repositories (see ``_MAGIC_REPO_NAMES``).  These come from the
+        opt-in ``<slug>-meta`` magic-repo remote that ``replicate_
+        meta_refs`` enables.  Callers should treat these matches as
+        a degraded-feature warning rather than a fatal replication
+        failure — the source server's ACL on ``All-Users`` etc. is
+        commonly stricter than its ACL on ordinary projects, and a
+        permission denial there does not affect user-project
+        replication.  See :class:`ReplicationErrorReport`'s
+        ``has_user_project_errors`` / ``has_magic_repo_errors``
+        properties for the structured accessors.
     """
 
     source: str
     pattern: str
     line: str
+    is_magic_repo: bool = False
 
 
 @dataclass
@@ -300,6 +344,36 @@ class ReplicationErrorReport:
         actual replication failure.
         """
         return bool(self.log_file_matches)
+
+    @property
+    def has_user_project_errors(self) -> bool:
+        """True when the per-event log has matches against user projects.
+
+        Excludes matches whose URL references one of Gerrit's magic
+        repositories (``All-Users``, ``All-Projects``,
+        ``All-External-IDs``, ``Sequences``).  This is the gate the
+        verification callers use to decide whether to fail the
+        workflow: user-project replication failures are real
+        problems, while magic-repo failures usually reflect an ACL
+        restriction on the source server that the action cannot
+        work around (see ``has_magic_repo_errors``).
+        """
+        return any(not m.is_magic_repo for m in self.log_file_matches)
+
+    @property
+    def has_magic_repo_errors(self) -> bool:
+        """True when the per-event log has matches against magic repos.
+
+        These come from the ``<slug>-meta`` remote that
+        ``replicate_meta_refs`` enables.  A typical cause is the
+        source server's stricter ACL on ``All-Users`` (which holds
+        per-user PII) requiring admin-level read access that the
+        replication service account does not have.  User-project
+        replication is unaffected when only this property is true;
+        the deployed Gerrit's UI just loses NoteDb account / group
+        rendering for replicated changes.
+        """
+        return any(m.is_magic_repo for m in self.log_file_matches)
 
     @property
     def has_advisory_errors(self) -> bool:
@@ -485,6 +559,7 @@ def check_replication_errors(
                         source="pull_replication_log",
                         pattern=matched_pattern,
                         line=line,
+                        is_magic_repo=bool(_MAGIC_REPO_RE.search(line)),
                     )
                 )
         except DockerError:
@@ -1083,13 +1158,22 @@ def wait_for_replication(
 
         # ---- 1. Error check (require 2 consecutive hits) ----
         #
-        # Authoritative matches (per-event pull_replication_log) gate
-        # the consecutive-hit counter that can ultimately fail the
-        # workflow.  Advisory matches (container ``docker logs``) are
-        # surfaced as warnings but do NOT count toward the failure
-        # threshold — their patterns are heuristic and the source
-        # stream is too broad (everything Gerrit writes to
-        # stdout/stderr) to fail a deployment on its own.
+        # Failure gating distinguishes three sources, in order of
+        # confidence:
+        #
+        # * ``has_user_project_errors`` (authoritative per-event log,
+        #   user projects) — gates the consecutive-hit counter that
+        #   can ultimately fail the workflow.
+        # * ``has_magic_repo_errors`` (authoritative per-event log,
+        #   All-Users / All-Projects / ...) — surfaced as warnings
+        #   but never fatal: the source server's ACL on these repos
+        #   is commonly stricter than its ACL on user projects, and
+        #   a non-admin replication credential can fail there while
+        #   user-project replication completes fine.  See
+        #   ``ReplicationErrorReport.has_magic_repo_errors`` for the
+        #   rationale.
+        # * ``has_advisory_errors`` (container ``docker logs``) —
+        #   also informational only.
         error_report = check_replication_errors(docker, cid)
         # Always surface what matched so subsequent debug runs know
         # which source / regex fired — the 50-line tail dumped on
@@ -1098,7 +1182,14 @@ def wait_for_replication(
             logger.debug("  Advisory replication signals (informational):")
             for diag in error_report.format_matches():
                 logger.debug(diag)
-        if error_report.has_authoritative_errors:
+        if error_report.has_magic_repo_errors:
+            logger.warning(
+                "  Magic-repo replication errors (degraded NoteDb "
+                "rendering; user-project replication unaffected):"
+            )
+            for diag in error_report.format_matches():
+                logger.warning(diag)
+        if error_report.has_user_project_errors:
             logger.warning("  Authoritative replication-log errors:")
             for diag in error_report.format_matches():
                 logger.warning(diag)
@@ -1399,13 +1490,12 @@ def verify_single_instance(
 
     # Step 3: Error check
     #
-    # Only authoritative matches (per-event pull_replication_log)
-    # fail the verification.  Advisory matches (container
-    # ``docker logs``) are emitted as warnings so operators can
-    # see them in the workflow output without having the action
-    # bail on startup chatter that happened to match a heuristic
-    # pattern.  This mirrors ``wait_for_replication``'s treatment
-    # of the two sources.
+    # Failure gating is identical to ``wait_for_replication``'s step 1:
+    # only authoritative user-project errors can fail verification.
+    # Magic-repo failures (``All-Users`` etc.) and container-log
+    # advisory signals surface as warnings so the operator sees them
+    # without the action bailing on environmental ACL restrictions
+    # or startup chatter.
     logger.info("")
     logger.info("Step 3: Checking for replication errors…")
     error_report = check_replication_errors(docker, cid)
@@ -1416,7 +1506,15 @@ def verify_single_instance(
         )
         for diag in error_report.format_matches():
             logger.warning(diag)
-    if error_report.has_authoritative_errors:
+    if error_report.has_magic_repo_errors:
+        logger.warning(
+            "  Magic-repo replication errors (degraded NoteDb "
+            "rendering; user-project replication unaffected, "
+            "will not fail verification):"
+        )
+        for diag in error_report.format_matches():
+            logger.warning(diag)
+    if error_report.has_user_project_errors:
         logger.error("Replication errors detected in pull_replication_log! ❌")
         for diag in error_report.format_matches():
             logger.error(diag)

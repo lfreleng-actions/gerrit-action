@@ -758,6 +758,22 @@ runs:
         # Verify replication success (Python)
         python3 "${{ github.action_path }}/scripts/verify-replication.py"
 
+    # Reindex changes and flush stale caches after replication.
+    # Required when replicate_meta_refs is enabled so the Gerrit UI
+    # actually shows the replicated open changes; harmless no-op when
+    # the flag is left at its default.
+    - name: "Reindex changes and flush caches"
+      if: inputs.sync_on_startup == 'true' && inputs.reindex_after_sync == 'true'
+      shell: bash
+      env:
+        REINDEX_AFTER_SYNC: ${{ inputs.reindex_after_sync }}
+        SYNC_ON_STARTUP: ${{ inputs.sync_on_startup }}
+        USE_API_PATH: ${{ inputs.use_api_path }}
+        DEBUG: ${{ inputs.debug }}
+      run: |
+        # Reindex Gerrit changes and flush caches (Python)
+        python3 "${{ github.action_path }}/scripts/reindex.py"
+
     # Set default G2P outputs when disabled
     - name: "Set G2P defaults (disabled)"
       if: inputs.g2p_enable != 'true'

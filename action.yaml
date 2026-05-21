@@ -137,6 +137,51 @@ inputs:
       repository.
     required: false
     default: 'true'
+  replicate_meta_refs:
+    description: |
+      Mirror Gerrit NoteDb meta refs in addition to the normal heads /
+      tags / changes refs.  Required for the deployed CI Gerrit to
+      render *open changes* (votes, comments, status), per-account
+      identities and group memberships from the source server.
+
+      Concretely, when ``'true'`` the generated ``replication.config``
+      gains:
+
+        * ``+refs/meta/*:refs/meta/*`` and
+          ``+refs/cache-automerge/*:refs/cache-automerge/*`` on every
+          per-project remote (project ACLs + merge-preview cache).
+        * A second ``[remote "<slug>-meta"]`` section targeted at
+          ``All-Users`` and ``All-Projects`` that pulls
+          ``refs/users/*``, ``refs/groups/*``, ``refs/meta/*``,
+          ``refs/sequences/*``, ``refs/draft-comments/*`` and
+          ``refs/starred-changes/*`` — the refs that store account
+          identities, the ``external-ids`` map, group membership, the
+          change-number sequence and global ACLs.
+
+      Off by default because it materially increases initial sync
+      size on instances with large review histories.  Combine with
+      ``reindex_after_sync: 'true'`` so the Gerrit Lucene index
+      reflects the replicated NoteDb state in the UI.
+    required: false
+    default: 'false'
+  reindex_after_sync:
+    description: |
+      After the initial pull-replication sync completes, run an
+      online reindex (and cache flush) inside each Gerrit container.
+      Required for replicated changes to actually show up in the UI
+      and search results, because Gerrit's dashboard queries hit the
+      Lucene secondary index, not NoteDb directly.
+
+      The reindex iterates over every replicated project and issues
+      ``POST /a/projects/<name>/index.changes``, then flushes the
+      ``accounts``, ``groups`` and ``external_ids_map`` caches via
+      ``POST /a/config/server/caches/`` so newly replicated account /
+      group refs become visible without a container restart.
+
+      Has no effect when ``sync_on_startup`` is ``'false'``.  Off by
+      default; typically enabled together with ``replicate_meta_refs``.
+    required: false
+    default: 'false'
   require_replication_success:
     description: |
       If true and sync_on_startup is true, the workflow will fail
@@ -675,6 +720,8 @@ runs:
         TUNNEL_PORTS: ${{ inputs.tunnel_ports }}
         MAX_PROJECTS: ${{ inputs.max_projects }}
         SKIP_ARCHIVED_PROJECTS: ${{ inputs.skip_archived_projects }}
+        REPLICATE_META_REFS: ${{ inputs.replicate_meta_refs }}
+        REINDEX_AFTER_SYNC: ${{ inputs.reindex_after_sync }}
       run: |
         # Start Gerrit instances (Python)
         python3 "${{ github.action_path }}/scripts/start-instances.py"

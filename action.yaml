@@ -386,9 +386,19 @@ inputs:
     description: |
       Controls GitHub org verification and auto-provisioning.
       Options:
-        provision - Audit and auto-create absent config
-        verify   - Audit and report only (default)
-        skip     - Do not audit org configuration
+        provision - Audit AND always-overwrite required org
+                    secrets and variables on every run, even
+                    when they already exist.  Overwrite is
+                    deliberate because each container build
+                    produces a fresh ephemeral SSH key and may
+                    bind to different tunnel host / ports
+                    between runs; leaving stale values on the
+                    GitHub side would silently break downstream
+                    workflows.  Use `g2p_org_token_map` to
+                    supply an elevated token per org.
+        verify   - Audit and report only (default).  No writes
+                    to the GitHub org.
+        skip     - Do not audit org configuration.
     required: false
     default: 'verify'
   g2p_org_token_map:

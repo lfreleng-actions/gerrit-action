@@ -389,6 +389,22 @@ def generate_replication_config(
     # Parse sync refs
     sync_refs = [r.strip() for r in config.sync_refs.split(",") if r.strip()]
 
+    # When meta-ref replication is enabled, append the per-project
+    # refspecs that carry NoteDb change metadata (``refs/changes/*``
+    # already covers ``refs/changes/NN/CCCCCC/meta`` by hierarchy),
+    # project ACLs (``refs/meta/config``, ``refs/meta/dashboards``,
+    # ``refs/meta/external-ids`` etc.) and the merge-preview cache.
+    # Duplicates are tolerated by Gerrit but suppressed here so the
+    # generated file stays tidy when an operator already lists the
+    # ref pattern explicitly in ``sync_refs``.
+    if config.replicate_meta_refs:
+        for extra in (
+            "+refs/meta/*:refs/meta/*",
+            "+refs/cache-automerge/*:refs/cache-automerge/*",
+        ):
+            if extra not in sync_refs:
+                sync_refs.append(extra)
+
     fetch_every_enabled = config.fetch_every_enabled
     fetch_interval = config.fetch_every
 
@@ -446,6 +462,65 @@ def generate_replication_config(
     # Project filter
     if project:
         lines.append(f"  projects = {project}")
+
+    # When meta-ref replication is enabled, emit a second remote that
+    # targets Gerrit's ``All-Users`` and ``All-Projects`` repositories
+    # with the broader set of refspecs they need.  These are the
+    # "magic" projects that hold per-account identities, external IDs,
+    # group membership, the change-number sequence and global ACLs.
+    # Without them, replicated changes display authors as
+    # "Gerrit Code Review", group ACLs do not resolve, and any new
+    # change uploaded against the CI Gerrit risks colliding with the
+    # source's change-number sequence.
+    #
+    # We use a distinct ``[remote "<slug>-meta"]`` section so the
+    # primary remote's project filter and per-project refspecs stay
+    # narrowly scoped to user projects.  ``createMissingRepositories``
+    # is set to ``false`` here because Gerrit always creates these
+    # special repos itself during ``gerrit init``.
+    if config.replicate_meta_refs:
+        lines.extend(
+            [
+                "",
+                "# Magic-repo remote: All-Users / All-Projects NoteDb refs.",
+                "# Required for accounts, external IDs, groups, the",
+                "# change-number sequence and global ACLs to resolve on",
+                "# the deployed CI Gerrit.",
+                f'[remote "{slug}-meta"]',
+                f"  url = {git_url}",
+            ]
+        )
+        if fetch_every_enabled:
+            lines.append(f"  fetchEvery = {fetch_interval}")
+        lines.extend(
+            [
+                f"  timeout = {config.replication_timeout}",
+                f"  connectionTimeout = {connection_timeout_ms}",
+                "  replicationDelay = 0",
+                "  replicationRetry = 60",
+                f"  threads = {config.replication_threads}",
+                "  createMissingRepositories = false",
+                "  replicateHiddenProjects = true",
+                # All-Users + All-Projects share these refspecs.
+                # ``refs/users/*`` and ``refs/groups/*`` only exist in
+                # All-Users; ``refs/sequences/*`` and ``refs/meta/*``
+                # span both.  The other refs (``draft-comments``,
+                # ``starred-changes``, ``edit``) are All-Users only but
+                # are harmless no-ops on All-Projects.
+                "  fetch = +refs/meta/*:refs/meta/*",
+                "  fetch = +refs/sequences/*:refs/sequences/*",
+                "  fetch = +refs/users/*:refs/users/*",
+                "  fetch = +refs/groups/*:refs/groups/*",
+                "  fetch = +refs/draft-comments/*:refs/draft-comments/*",
+                "  fetch = +refs/starred-changes/*:refs/starred-changes/*",
+                "  projects = All-Users",
+                "  projects = All-Projects",
+            ]
+        )
+        logger.info(
+            "  Meta-ref replication enabled: "
+            "All-Users / All-Projects NoteDb refs will be mirrored"
+        )
 
     config_file.parent.mkdir(parents=True, exist_ok=True)
     config_file.write_text("\n".join(lines) + "\n", encoding="utf-8")

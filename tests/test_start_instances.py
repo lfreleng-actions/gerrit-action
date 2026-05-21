@@ -98,6 +98,8 @@ def _make_config(**overrides: Any) -> ActionConfig:
         "fetch_every": "60s",
         "require_replication_success": False,
         "replication_wait_timeout": 180,
+        "replicate_meta_refs": False,
+        "reindex_after_sync": False,
         "check_service": True,
         "exit": False,
         "enable_cache": False,
@@ -717,6 +719,117 @@ class TestGenerateReplicationConfig:
 
         content = config_file.read_text()
         assert '[remote "my-slug"]' in content
+
+    def test_meta_refs_disabled_by_default(self, tmp_path: Path) -> None:
+        """Default config omits NoteDb meta refs and the magic-repo remote."""
+        config_file = tmp_path / "replication.config"
+        config = _make_config()
+        assert config.replicate_meta_refs is False
+
+        start_instances.generate_replication_config(
+            config_file,
+            "test",
+            "gerrit.example.org",
+            "",
+            "gerrit",
+            29418,
+            "",
+            config,
+        )
+
+        content = config_file.read_text()
+        assert '[remote "test-meta"]' not in content
+        assert "refs/meta/*:refs/meta/*" not in content
+        assert "refs/users/*:refs/users/*" not in content
+        assert "projects = All-Users" not in content
+
+    def test_meta_refs_emits_extra_per_project_refspecs(self, tmp_path: Path) -> None:
+        """Per-project remote gains meta + cache-automerge refspecs."""
+        config_file = tmp_path / "replication.config"
+        config = _make_config(replicate_meta_refs=True)
+
+        start_instances.generate_replication_config(
+            config_file,
+            "test",
+            "gerrit.example.org",
+            "",
+            "gerrit",
+            29418,
+            "",
+            config,
+        )
+
+        content = config_file.read_text()
+        assert "fetch = +refs/meta/*:refs/meta/*" in content
+        assert "fetch = +refs/cache-automerge/*:refs/cache-automerge/*" in content
+        # Sanity: pre-existing default refspecs still present.
+        assert "fetch = +refs/heads/*:refs/heads/*" in content
+
+    def test_meta_refs_emits_magic_repo_remote(self, tmp_path: Path) -> None:
+        """A second ``<slug>-meta`` remote targets All-Users / All-Projects."""
+        config_file = tmp_path / "replication.config"
+        config = _make_config(replicate_meta_refs=True)
+
+        start_instances.generate_replication_config(
+            config_file,
+            "onap",
+            "gerrit.example.org",
+            "",
+            "gerrit",
+            29418,
+            "",
+            config,
+        )
+
+        content = config_file.read_text()
+        assert '[remote "onap-meta"]' in content
+        # All required magic-repo refspecs present
+        for refspec in (
+            "fetch = +refs/meta/*:refs/meta/*",
+            "fetch = +refs/sequences/*:refs/sequences/*",
+            "fetch = +refs/users/*:refs/users/*",
+            "fetch = +refs/groups/*:refs/groups/*",
+            "fetch = +refs/draft-comments/*:refs/draft-comments/*",
+            "fetch = +refs/starred-changes/*:refs/starred-changes/*",
+        ):
+            assert refspec in content, f"missing: {refspec}"
+        # Both magic projects listed explicitly
+        assert "projects = All-Users" in content
+        assert "projects = All-Projects" in content
+        # Magic-repo remote must NOT create missing repos (Gerrit
+        # owns them already) and must allow hidden replication so
+        # All-Users is reachable.
+        assert "createMissingRepositories = false" in content
+        assert "replicateHiddenProjects = true" in content
+
+    def test_meta_refs_no_duplicate_when_user_specified(self, tmp_path: Path) -> None:
+        """Operator-specified ``refs/meta/*`` is not duplicated."""
+        config_file = tmp_path / "replication.config"
+        config = _make_config(
+            sync_refs="+refs/heads/*:refs/heads/*,+refs/meta/*:refs/meta/*",
+            replicate_meta_refs=True,
+        )
+
+        start_instances.generate_replication_config(
+            config_file,
+            "test",
+            "gerrit.example.org",
+            "",
+            "gerrit",
+            29418,
+            "",
+            config,
+        )
+
+        content = config_file.read_text()
+        # Only the per-project remote section's ``fetch =`` lines
+        # should be considered for the de-dup check; the magic-repo
+        # remote section legitimately repeats ``refs/meta/*``.
+        per_project = content.split('[remote "test-meta"]')[0]
+        meta_count = per_project.count("fetch = +refs/meta/*:refs/meta/*")
+        assert meta_count == 1, (
+            f"expected per-project remote to list refs/meta/* once, got {meta_count}"
+        )
 
     def test_replication_timeout_and_connection_timeout(self, tmp_path: Path) -> None:
         config_file = tmp_path / "replication.config"

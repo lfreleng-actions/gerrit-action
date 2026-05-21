@@ -219,7 +219,7 @@ comment-added, change merges).
 | ssh_host_keys          | JSON object mapping slug to SSH host keys    | `{"onap": {"ssh_host_ed25519_key": "..."}}`      |
 | g2p_enabled            | Whether G2P integration ran                  | `true` / `false`                                 |
 | g2p_config_path        | Path to generated INI inside container       | `/var/gerrit/.config/.../gerrit_to_platform.ini` |
-| g2p_hooks_enabled      | JSON array of hooks that got symlinks        | `["patchset-created","comment-added"]`           |
+| g2p_hooks_enabled      | JSON array of hooks that got wrapper scripts | `["patchset-created","comment-added"]`           |
 | g2p_github_owner       | Configured GitHub owner                      | `modeseven-gerrit-onap`                          |
 | g2p_remote_name_style  | Configured repository name style             | `dash`                                           |
 | g2p_validation_results | JSON array of GitHub check results           | `[{"check_name":"token_valid","passed":true}]`   |
@@ -732,10 +732,14 @@ with:
 If a Gerrit change is uploaded, reviewed, and merged but no
 GitHub Actions workflows run in the target organisation, the
 container is most likely missing the Gerrit `hooks` plugin.
-G2P relies on Gerrit invoking the symlinks under
-`/var/gerrit/hooks/` (`patchset-created`, `comment-added`,
-`change-merged`); without `hooks.jar` loaded as a plugin those
-symlinks are inert.
+G2P relies on Gerrit invoking the POSIX-shell wrapper scripts
+this action installs under `/var/gerrit/hooks/`
+(`patchset-created`, `comment-added`, `change-merged`); each
+wrapper exec()s the matching `gerrit_to_platform` console
+script and tees its stdout / stderr to
+`/var/gerrit/logs/g2p-hooks.log`.  Without `hooks.jar` loaded
+as a plugin Gerrit never invokes the wrappers and those
+log entries never appear.
 
 Check whether the plugin is present in the running container:
 
@@ -744,25 +748,41 @@ docker exec <container_id> ls -la /var/gerrit/plugins/hooks.jar
 ```
 
 If the file is missing, the site was initialised without
-`gerrit init --install-all-plugins`. Recent versions of this
-action pass `--batch --install-all-plugins` automatically, so
-the most likely cause is an older cached image or a manual
-override via `gerrit_init_args`. Re-run the deploy workflow
-with the cache disabled (or supply `gerrit_init_args` that does
-not suppress the default flags) to repopulate the bundled
-plugins.
+`gerrit init --install-all-plugins`.  This action always passes
+`--batch --install-all-plugins` to `gerrit init` and the
+`gerrit_init_args` input only *appends* to that argv — those
+two flags cannot be suppressed by user input.  The most likely
+remaining cause is an older cached image that pre-dates the
+`--install-all-plugins` change; re-run the deploy workflow
+with caching disabled (`enable_cache: false`) to force a fresh
+build and repopulate the bundled plugins.
 
-You can also confirm hooks fire correctly by tailing the
-container logs while uploading a patchset:
+The most direct signal for whether hooks are firing in real
+time is the dedicated G2P hook log written by the wrappers
+this action installs.  Tail it while uploading a patchset:
+
+```bash
+docker exec <container_id> tail -F /var/gerrit/logs/g2p-hooks.log
+```
+
+Each invocation produces a structured `[g2p-hook][<hook>][pid=…]`
+header followed by `[out]` / `[err]` prefixed lines from the
+underlying `gerrit_to_platform` console script and a final
+`end pid=… rc=…` summary.  No entries for the hook you expected
+means the Gerrit `hooks` plugin did not invoke the wrapper at
+all — typically because the plugin was not loaded (see the
+`hooks.jar` check above) or the event type is not enabled in
+`g2p_hooks`.  Entries present but ending with non-zero `rc=`
+means the wrapper fired and the underlying console script
+failed; the `[err]` lines for the same `pid=` carry the cause.
+
+For lower-level diagnostics (plugin loader output, JGit errors,
+SSH session activity) the standard Gerrit logs are still useful:
 
 ```bash
 docker exec <container_id> tail -f /var/gerrit/logs/error_log \
   /var/gerrit/logs/sshd_log
 ```
-
-A successful G2P dispatch logs an entry such as
-`patchset-created hook executed` followed by an HTTP request to
-`api.github.com`.
 
 ### Authentication Issues
 
@@ -784,15 +804,18 @@ The [gerrit\_to\_platform](https://gerrit.linuxfoundation.org/infra/admin/repos/
 package enables a Gerrit instance to dispatch GitHub Actions workflows
 in response to Gerrit events. When `g2p_enable` is set to `true`, this
 action configures the deployed Gerrit container(s) with the files and
-symlinks that `gerrit_to_platform` needs:
+wrapper scripts that `gerrit_to_platform` needs:
 
 - **`gerrit_to_platform.ini`** — application config with the GitHub
   token and comment-keyword-to-workflow-filter mappings
 - **`replication.config` remote** — a detection-only remote that tells
   `gerrit_to_platform` which platform, organisation, and repository
   naming convention to use
-- **Gerrit hook symlinks** — `patchset-created`, `comment-added`, and
-  `change-merged` linked to the g2p console scripts
+- **Gerrit hook wrapper scripts** — `patchset-created`, `comment-added`,
+  and `change-merged` installed as POSIX-shell wrappers in
+  `/var/gerrit/hooks/` that exec() the matching g2p console scripts
+  and tee every invocation (with stdout / stderr) to
+  `/var/gerrit/logs/g2p-hooks.log`
 - **SSH configuration** — keypair and `known_hosts` for github.com
 
 ### G2P Token Scopes

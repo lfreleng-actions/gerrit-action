@@ -76,6 +76,47 @@ _REPLICATION_ERROR_PATTERNS = [
     "Connection refused",
 ]
 
+# Patterns that match the pull-replication plugin's known *soft*
+# failure modes.  When a line that already matched one of
+# ``_REPLICATION_ERROR_PATTERNS`` ALSO matches one of these patterns,
+# the resulting ``ErrorMatch`` is flagged ``is_soft_failure=True`` and
+# excluded from the ``has_user_project_errors`` /
+# ``has_magic_repo_errors`` failure gates.  Soft failures surface as a
+# clearly-labelled warning block so the operator can see them in the
+# workflow output without the action treating them as a fatal stop.
+#
+# Current entries:
+#
+# * ``InexistentRefTransportException`` — raised by the pull-
+#   replication plugin when an explicitly-named refspec resolves to
+#   no advertised ref on the remote.  This is expected in two
+#   legitimate situations:
+#
+#   - The magic-repo remote's refspecs are heterogeneous across the
+#     two magic projects ``All-Users`` and ``All-Projects``.  E.g.
+#     ``refs/meta/external-ids`` only exists on All-Users; asking
+#     for it on All-Projects raises this exception.  The blanket
+#     ``+refs/meta/*:refs/meta/*`` wildcard used to mask this by
+#     letting the plugin walk the remote's ref advertisement and
+#     skip what isn't there, but the explicit refspec list we
+#     adopted to keep ``refs/meta/config`` out of the wildcard
+#     surface inevitably names refs that are absent from one or
+#     other of the magic projects.  The exception is informational,
+#     not a fault.
+#
+#   - The source server's ACL hides certain refs (notably
+#     ``All-Users:refs/meta/external-ids``, which holds per-user
+#     PII) from non-admin replication credentials.  From the plugin's
+#     perspective the ref "does not exist" because the smart-http
+#     refs advertisement does not list it; the underlying cause is
+#     a missing read grant on the source.  Either way the right
+#     action is the same: log it, do not fail the workflow, and let
+#     the operator know the deployed Gerrit will run in a degraded-
+#     NoteDb-rendering mode for that ref.
+_SOFT_FAILURE_PATTERNS = [
+    "InexistentRefTransportException",
+]
+
 # Patterns for detecting replication errors in the **container** logs.
 #
 # These must be much more selective than the pull_replication_log patterns
@@ -303,12 +344,22 @@ class ErrorMatch:
         replication.  See :class:`ReplicationErrorReport`'s
         ``has_user_project_errors`` / ``has_magic_repo_errors``
         properties for the structured accessors.
+    is_soft_failure:
+        True when the matched line also matches one of
+        ``_SOFT_FAILURE_PATTERNS`` — known benign exception classes
+        emitted by the pull-replication plugin (e.g.
+        ``InexistentRefTransportException``).  Soft failures are
+        excluded from every fatal-error gate; they only surface as
+        warnings under their own heading so the operator can see
+        them without the action stopping.  See
+        :class:`ReplicationErrorReport.has_soft_failures`.
     """
 
     source: str
     pattern: str
     line: str
     is_magic_repo: bool = False
+    is_soft_failure: bool = False
 
 
 @dataclass
@@ -351,14 +402,16 @@ class ReplicationErrorReport:
 
         Excludes matches whose URL references one of Gerrit's magic
         repositories (``All-Users``, ``All-Projects``,
-        ``All-External-IDs``, ``Sequences``).  This is the gate the
-        verification callers use to decide whether to fail the
-        workflow: user-project replication failures are real
-        problems, while magic-repo failures usually reflect an ACL
-        restriction on the source server that the action cannot
-        work around (see ``has_magic_repo_errors``).
+        ``All-External-IDs``, ``Sequences``) AND excludes matches
+        flagged as soft failures (see ``has_soft_failures``).  This
+        is the gate the verification callers use to decide whether
+        to fail the workflow: user-project replication failures
+        that are not known-benign soft failures are real problems
+        and warrant aborting the deployment.
         """
-        return any(not m.is_magic_repo for m in self.log_file_matches)
+        return any(
+            not m.is_magic_repo and not m.is_soft_failure for m in self.log_file_matches
+        )
 
     @property
     def has_magic_repo_errors(self) -> bool:
@@ -372,8 +425,41 @@ class ReplicationErrorReport:
         replication is unaffected when only this property is true;
         the deployed Gerrit's UI just loses NoteDb account / group
         rendering for replicated changes.
+
+        Soft failures (see ``has_soft_failures``) are excluded so
+        they surface under their own heading and never inflate
+        the magic-repo signal.
         """
-        return any(m.is_magic_repo for m in self.log_file_matches)
+        return any(
+            m.is_magic_repo and not m.is_soft_failure for m in self.log_file_matches
+        )
+
+    @property
+    def has_soft_failures(self) -> bool:
+        """True when the per-event log has known-benign soft failures.
+
+        Soft failures are pull-replication plugin exceptions whose
+        meaning is informational rather than fatal.  Currently this
+        is dominated by ``InexistentRefTransportException``, which
+        the plugin raises when an explicitly-named refspec resolves
+        to no advertised ref on the remote.  That happens routinely
+        with the magic-repo remote's enumerated refspecs because:
+
+        * The two magic projects (``All-Users`` and
+          ``All-Projects``) have different ref sets; e.g.
+          ``refs/meta/external-ids`` only lives on All-Users, so
+          asking for it on All-Projects always raises this.
+        * Source-server ACLs commonly hide certain refs (e.g.
+          ``All-Users:refs/meta/external-ids``) from non-admin
+          replication credentials; the smart-http advertisement
+          simply omits them and the plugin treats the absence as a
+          permanent failure.
+
+        Neither case is something the action can fix — the right
+        action is to surface the soft failures in the log and let
+        replication continue.
+        """
+        return any(m.is_soft_failure for m in self.log_file_matches)
 
     @property
     def has_advisory_errors(self) -> bool:
@@ -404,6 +490,7 @@ class ReplicationErrorReport:
         max_per_source: int = 20,
         sources: tuple[str, ...] | None = None,
         magic_repo: bool | None = None,
+        soft_failure: bool | None = None,
     ) -> list[str]:
         """Return human-readable lines describing matches.
 
@@ -429,12 +516,17 @@ class ReplicationErrorReport:
             ``is_magic_repo`` is True), ``False`` keeps only
             non-magic (user-project) matches, and ``None`` (the
             default) keeps both.
+        soft_failure:
+            Restrict the output by soft-failure classification:
+            ``True`` keeps only soft failures (e.g.
+            ``InexistentRefTransportException``), ``False`` keeps
+            only non-soft (real) failures, and ``None`` (the
+            default) keeps both.
 
-        Callers print warnings under three separate headings
-        (advisory / magic-repo / user-project).  Use the filters
-        to scope each call site to the matches that belong under
-        its heading so the same line does not appear under more
-        than one heading.
+        Callers print warnings under four separate headings
+        (advisory / soft-failure / magic-repo / user-project) and
+        rely on these filters to keep the same line from appearing
+        under more than one heading.
         """
         # Map source label → list of ``ErrorMatch`` objects, in the
         # order the caller normally prints them.  Filtering keeps
@@ -460,7 +552,8 @@ class ReplicationErrorReport:
             filtered = [
                 m
                 for m in matches
-                if magic_repo is None or m.is_magic_repo is magic_repo
+                if (magic_repo is None or m.is_magic_repo is magic_repo)
+                and (soft_failure is None or m.is_soft_failure is soft_failure)
             ]
             if not filtered:
                 continue
@@ -611,6 +704,10 @@ def check_replication_errors(
                         pattern=matched_pattern,
                         line=line,
                         is_magic_repo=bool(_MAGIC_REPO_RE.search(line)),
+                        is_soft_failure=any(
+                            re.search(p, line, re.IGNORECASE)
+                            for p in _SOFT_FAILURE_PATTERNS
+                        ),
                     )
                 )
         except DockerError:
@@ -1193,6 +1290,7 @@ def wait_for_replication(
     # on every interval (≈12x per minute), drowning the legitimate
     # progress lines and the final summary.
     seen_advisory: set[str] = set()
+    seen_soft_failure: set[str] = set()
     seen_magic_repo: set[str] = set()
     seen_user_project: set[str] = set()
 
@@ -1256,11 +1354,37 @@ def wait_for_replication(
                 for diag in error_report.format_matches(sources=("container_logs",)):
                     logger.debug(diag)
                 seen_advisory.update(new_lines)
+        if error_report.has_soft_failures:
+            # Soft failures (e.g. InexistentRefTransportException)
+            # are surfaced under their own heading so the operator
+            # knows the plugin tried to fetch a ref that didn't exist
+            # or wasn't visible on the remote.  These never count
+            # toward the failure threshold — they are an expected
+            # consequence of the magic-repo remote's enumerated
+            # refspec list spanning two heterogeneous magic projects
+            # and tightly-ACL'd source servers.
+            new_lines = [
+                m.line
+                for m in error_report.log_file_matches
+                if m.is_soft_failure and m.line not in seen_soft_failure
+            ]
+            if new_lines:
+                logger.warning(
+                    "  Soft replication failures (refs missing on remote "
+                    "or hidden by source ACL; will not fail verification):"
+                )
+                for diag in error_report.format_matches(
+                    sources=("pull_replication_log",), soft_failure=True
+                ):
+                    logger.warning(diag)
+                seen_soft_failure.update(new_lines)
         if error_report.has_magic_repo_errors:
             new_lines = [
                 m.line
                 for m in error_report.log_file_matches
-                if m.is_magic_repo and m.line not in seen_magic_repo
+                if m.is_magic_repo
+                and not m.is_soft_failure
+                and m.line not in seen_magic_repo
             ]
             if new_lines:
                 logger.warning(
@@ -1268,7 +1392,9 @@ def wait_for_replication(
                     "rendering; user-project replication unaffected):"
                 )
                 for diag in error_report.format_matches(
-                    sources=("pull_replication_log",), magic_repo=True
+                    sources=("pull_replication_log",),
+                    magic_repo=True,
+                    soft_failure=False,
                 ):
                     logger.warning(diag)
                 seen_magic_repo.update(new_lines)
@@ -1276,12 +1402,16 @@ def wait_for_replication(
             new_lines = [
                 m.line
                 for m in error_report.log_file_matches
-                if not m.is_magic_repo and m.line not in seen_user_project
+                if not m.is_magic_repo
+                and not m.is_soft_failure
+                and m.line not in seen_user_project
             ]
             if new_lines:
                 logger.warning("  Authoritative replication-log errors:")
                 for diag in error_report.format_matches(
-                    sources=("pull_replication_log",), magic_repo=False
+                    sources=("pull_replication_log",),
+                    magic_repo=False,
+                    soft_failure=False,
                 ):
                     logger.warning(diag)
                 seen_user_project.update(new_lines)
@@ -1598,6 +1728,15 @@ def verify_single_instance(
         )
         for diag in error_report.format_matches(sources=("container_logs",)):
             logger.warning(diag)
+    if error_report.has_soft_failures:
+        logger.warning(
+            "  Soft replication failures (refs missing on remote "
+            "or hidden by source ACL; will not fail verification):"
+        )
+        for diag in error_report.format_matches(
+            sources=("pull_replication_log",), soft_failure=True
+        ):
+            logger.warning(diag)
     if error_report.has_magic_repo_errors:
         logger.warning(
             "  Magic-repo replication errors (degraded NoteDb "
@@ -1605,13 +1744,17 @@ def verify_single_instance(
             "will not fail verification):"
         )
         for diag in error_report.format_matches(
-            sources=("pull_replication_log",), magic_repo=True
+            sources=("pull_replication_log",),
+            magic_repo=True,
+            soft_failure=False,
         ):
             logger.warning(diag)
     if error_report.has_user_project_errors:
         logger.error("Replication errors detected in pull_replication_log! ❌")
         for diag in error_report.format_matches(
-            sources=("pull_replication_log",), magic_repo=False
+            sources=("pull_replication_log",),
+            magic_repo=False,
+            soft_failure=False,
         ):
             logger.error(diag)
         result.error = "Replication errors detected"

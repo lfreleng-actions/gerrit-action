@@ -914,6 +914,156 @@ class TestCheckReplicationErrors:
         assert len(report.log_file_matches) == 4
         assert all(m.is_magic_repo for m in report.log_file_matches)
 
+    def test_inexistent_ref_classified_as_soft_failure(self, mock_docker):
+        """InexistentRefTransportException is a soft failure.
+
+        The pull-replication plugin raises this exception when an
+        explicitly-named refspec resolves to no advertised ref on
+        the remote.  That happens routinely with the magic-repo
+        remote's enumerated refspecs because the two magic projects
+        have different ref sets, and because source-server ACLs
+        hide certain refs (notably All-Users:refs/meta/external-ids,
+        which holds per-user PII) from non-admin replication
+        credentials.  Neither situation is something the action can
+        fix; the right behaviour is to log and continue.
+
+        The match must be tagged ``is_soft_failure=True`` so the
+        verification callers can route it to its own warning heading
+        instead of failing the workflow on it.
+        """
+        from replication import check_replication_errors
+
+        docker, mock_run = mock_docker
+        mock_run.side_effect = [
+            make_completed_process(returncode=0),
+            make_completed_process(
+                stdout=(
+                    "com.gerritforge.gerrit.plugins.replication.pull.fetch."
+                    "InexistentRefTransportException: Ref "
+                    "refs/meta/external-ids does not exist on remote\n"
+                )
+            ),
+            make_completed_process(stdout="INFO: ready"),
+        ]
+
+        report = check_replication_errors(docker, "abc123")
+        assert len(report.log_file_matches) == 1
+        match = report.log_file_matches[0]
+        assert match.is_soft_failure is True
+        # Soft failures are excluded from the failure gates.
+        assert report.has_soft_failures is True
+        assert report.has_user_project_errors is False
+        # Even when the URL would normally classify as magic-repo,
+        # the soft-failure flag wins: the magic-repo gate is also
+        # False.  (In this synthetic case the line has no URL so
+        # is_magic_repo is also False, but the principle applies
+        # to both flags.)
+        assert report.has_magic_repo_errors is False
+
+    def test_soft_failure_excluded_from_user_project_gate(self):
+        """A soft-failure user-project match must not trip the fail gate.
+
+        Even a non-magic-repo line that happens to be a soft
+        failure should NOT cause ``has_user_project_errors`` to
+        fire, because the underlying cause (missing ref on remote)
+        is not actionable from the action's side.
+        """
+        from replication import ErrorMatch, ReplicationErrorReport
+
+        report = ReplicationErrorReport(
+            log_file_matches=[
+                ErrorMatch(
+                    source="pull_replication_log",
+                    pattern="TransportException",
+                    line=(
+                        "InexistentRefTransportException: Ref "
+                        "refs/meta/version does not exist on remote"
+                    ),
+                    is_magic_repo=False,
+                    is_soft_failure=True,
+                )
+            ]
+        )
+        assert report.has_soft_failures is True
+        assert report.has_user_project_errors is False
+        assert report.has_magic_repo_errors is False
+
+    def test_real_user_project_error_still_fails_alongside_soft(self):
+        """A real user-project error coexists with soft-failure lines.
+
+        The soft-failure classification must not mask a genuine
+        user-project failure that arrives in the same scan window.
+        ``has_user_project_errors`` should still fire on the real
+        match, while the soft-failure flag scopes the
+        InexistentRefTransportException line to the soft heading.
+        """
+        from replication import ErrorMatch, ReplicationErrorReport
+
+        report = ReplicationErrorReport(
+            log_file_matches=[
+                # Soft failure (expected, informational only).
+                ErrorMatch(
+                    source="pull_replication_log",
+                    pattern="TransportException",
+                    line=(
+                        "InexistentRefTransportException: Ref "
+                        "refs/meta/external-ids does not exist on remote"
+                    ),
+                    is_magic_repo=True,
+                    is_soft_failure=True,
+                ),
+                # Genuine user-project failure (should fail the run).
+                ErrorMatch(
+                    source="pull_replication_log",
+                    pattern="Cannot replicate",
+                    line=(
+                        "Cannot replicate from "
+                        "https://gerrit.onap.org/r/a/aai/resources.git"
+                    ),
+                    is_magic_repo=False,
+                    is_soft_failure=False,
+                ),
+            ]
+        )
+        assert report.has_soft_failures is True
+        assert report.has_user_project_errors is True
+        assert report.has_magic_repo_errors is False
+
+    def test_format_matches_filters_by_soft_failure(self):
+        """``soft_failure=True/False`` restricts output accordingly.
+
+        The wait_for_replication / verify_single_instance callers
+        rely on this filter to keep the three heading blocks
+        (soft / magic-repo / user-project) disjoint when the same
+        scan contains lines from multiple classes.
+        """
+        from replication import ErrorMatch, ReplicationErrorReport
+
+        report = ReplicationErrorReport(
+            log_file_matches=[
+                ErrorMatch(
+                    source="pull_replication_log",
+                    pattern="TransportException",
+                    line="InexistentRefTransportException: refs/meta/version",
+                    is_soft_failure=True,
+                ),
+                ErrorMatch(
+                    source="pull_replication_log",
+                    pattern="Cannot replicate",
+                    line="Cannot replicate from /aai/resources.git",
+                    is_soft_failure=False,
+                ),
+            ]
+        )
+
+        soft_only = "\n".join(report.format_matches(soft_failure=True))
+        assert "InexistentRefTransportException" in soft_only
+        assert "aai/resources.git" not in soft_only
+
+        real_only = "\n".join(report.format_matches(soft_failure=False))
+        assert "aai/resources.git" in real_only
+        assert "InexistentRefTransportException" not in real_only
+
 
 # =========================================================================
 # get_completed_repo_count

@@ -188,6 +188,9 @@ class TestActionConfig:
             "TUNNEL_HOST",
             "TUNNEL_PORTS",
             "MAX_PROJECTS",
+            "SKIP_ARCHIVED_PROJECTS",
+            "REPLICATE_META_REFS",
+            "REINDEX_AFTER_SYNC",
             "ENABLE_CACHE",
             "CACHE_KEY_SUFFIX",
             "CHECK_SERVICE",
@@ -209,6 +212,9 @@ class TestActionConfig:
         assert config.base_http_port == 18080
         assert config.base_ssh_port == 29418
         assert config.debug is False
+        assert config.skip_archived_projects is True
+        assert config.replicate_meta_refs is False
+        assert config.reindex_after_sync is False
         assert config.instances == []
 
     def test_from_environment_with_instances(

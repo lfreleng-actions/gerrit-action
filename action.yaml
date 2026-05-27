@@ -284,6 +284,33 @@ inputs:
         ssh_auth_username: 'myusername'
     required: false
     default: ''
+  ssh_auth_keys_secondary:
+    description: |
+      Additional SSH public keys to register on a *second* Gerrit
+      account, distinct from the one configured via
+      ssh_auth_username / ssh_auth_keys.
+
+      Intended for deployments that want to keep an automated bot
+      identity (primary) separate from one or more human identities
+      (secondary) on the same ephemeral Gerrit. The primary user
+      typically owns the keypair whose private half is consumed by
+      downstream GitHub Actions workflows (e.g.
+      lfreleng-actions/gerrit-review-action), while the secondary
+      user holds long-lived human keys (e.g. Secure Enclave-backed
+      keys) for interactive SSH / UI access.
+
+      When set, ssh_auth_username_secondary must also be set. Both
+      fields use the same format as the primary pair.
+    required: false
+    default: ''
+  ssh_auth_username_secondary:
+    description: |
+      Gerrit username to create for the *second* SSH account.
+      Required when ssh_auth_keys_secondary is set; ignored
+      otherwise. See ssh_auth_keys_secondary for the intended
+      bot/human split.
+    required: false
+    default: ''
   tunnel_host:
     description: |
       External tunnel hostname for public access.
@@ -751,6 +778,25 @@ runs:
         DEBUG: ${{ inputs.debug }}
       run: |
         # Add SSH authentication keys for user access (Python)
+        python3 "${{ github.action_path }}/scripts/setup-gerrit-user.py" \
+          --instances-file "$WORK_DIR/instances.json" \
+          --loop-instances
+
+    # Optional second account: keep bot/human identities separate.
+    # Reuses the same setup-gerrit-user.py entry point; the script
+    # is idempotent and safe to invoke per-instance a second time.
+    - name: "Add SSH authentication keys (secondary user)"
+      if: >-
+        inputs.ssh_auth_keys_secondary != '' &&
+        inputs.ssh_auth_username_secondary != ''
+      shell: bash
+      env:
+        SSH_AUTH_KEYS: ${{ inputs.ssh_auth_keys_secondary }}
+        SSH_AUTH_USERNAME: ${{ inputs.ssh_auth_username_secondary }}
+        USE_API_PATH: ${{ inputs.use_api_path }}
+        DEBUG: ${{ inputs.debug }}
+      run: |
+        # Add SSH auth keys for the secondary Gerrit account (Python)
         python3 "${{ github.action_path }}/scripts/setup-gerrit-user.py" \
           --instances-file "$WORK_DIR/instances.json" \
           --loop-instances

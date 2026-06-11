@@ -4,12 +4,14 @@
 """G2P setup: generate config files and configure containers.
 
 This module provides functions that translate a :class:`G2PConfig` into
-the files and symlinks required inside a running Gerrit container for
+the files and wrappers required inside a running Gerrit container for
 ``gerrit_to_platform`` to operate:
 
 - ``gerrit_to_platform.ini`` — app config with token and mappings
 - ``replication.config`` symlink — platform detection data
-- Gerrit hook symlinks — connect events to g2p console scripts
+- Gerrit hook wrapper scripts — connect events to g2p console scripts
+  and tee every invocation to ``/var/gerrit/logs/g2p-hooks.log`` for
+  operator observability
 - SSH configuration — keypair and ``known_hosts`` for github.com
 
 Usage::
@@ -52,6 +54,9 @@ GERRIT_USER_HOME = "/var/gerrit"
 GERRIT_HOOKS_DIR = f"{GERRIT_HOME}/hooks"
 """Directory where Gerrit looks for hook scripts."""
 
+GERRIT_PLUGINS_DIR = f"{GERRIT_HOME}/plugins"
+"""Directory where Gerrit loads plugin JARs from at startup."""
+
 GERRIT_ETC_DIR = f"{GERRIT_HOME}/etc"
 """Gerrit configuration directory."""
 
@@ -69,6 +74,20 @@ G2P_REPLICATION_SYMLINK = f"{G2P_CONFIG_DIR}/replication.config"
 
 GERRIT_TOOLS_VENV_BIN = "/opt/gerrit-tools/bin"
 """Path to the g2p console-script binaries inside the container."""
+
+GERRIT_LOGS_DIR = f"{GERRIT_HOME}/logs"
+"""Gerrit logs directory inside the container."""
+
+G2P_HOOK_LOG = f"{GERRIT_LOGS_DIR}/g2p-hooks.log"
+"""Single log file capturing every G2P hook invocation made by Gerrit.
+
+Written to by the wrapper script ``setup_g2p_hooks`` installs in
+``/var/gerrit/hooks/`` so operators can reconstruct exactly which
+hook fired, with what arguments, and what the underlying
+``gerrit_to_platform`` console script printed and returned.  This
+is the single source of truth for diagnosing whether a Gerrit
+event reached the dispatcher.
+"""
 
 SSH_DIR = f"{GERRIT_USER_HOME}/.ssh"
 """SSH directory inside the container."""
@@ -91,8 +110,33 @@ class G2PSetupResult:
 
     Attributes:
         config_path: Path to the generated INI inside the container.
-        hooks_enabled: Hook names that received symlinks.
+        hooks_enabled: Hook names whose wrapper scripts the action
+            installed (one POSIX-shell wrapper per hook under
+            ``/var/gerrit/hooks/``; each invokes the matching
+            console script and tees output to
+            ``/var/gerrit/logs/g2p-hooks.log``).
         ssh_public_key: Public key (for downstream deploy-key setup).
+        ssh_private_key:
+            The Ed25519 SSH private key generated for the Gerrit
+            container's *outbound* connection to ``github.com``
+            (i.e. ``~/.ssh/g2p_github_key`` inside the container).
+            This is the key the Gerrit-side push-replication
+            plugin authenticates with when talking to GitHub.
+
+            **It is NOT the credential that GitHub Actions
+            workflows use to SSH back into Gerrit for review
+            voting** — that credential is the
+            ``GERRIT_SSH_PRIVKEY`` org secret, which is generated
+            and authorised against the Gerrit user account in a
+            separate step (see ``setup_g2p_ssh``'s
+            documentation).  The current org-provisioning code
+            reuses this same field for ``GERRIT_SSH_PRIVKEY``
+            because the two keypairs happen to be derived from
+            the same Ed25519 generator and both ends of the loop
+            run inside this action; that mapping is documented in
+            ``provision_org_config`` and will be tightened in a
+            follow-up that splits Gerrit-auth and GitHub-auth
+            keypairs into distinct fields.
         replication_remote_configured: Whether the g2p detection
             remote is present in ``replication.config`` (either
             already existing or newly appended).
@@ -101,7 +145,49 @@ class G2PSetupResult:
     config_path: str = ""
     hooks_enabled: list[str] = field(default_factory=list)
     ssh_public_key: str = ""
+    ssh_private_key: str = ""
     replication_remote_configured: bool = False
+
+
+@dataclass
+class G2PSelfTestCheck:
+    """Single self-test outcome.
+
+    Attributes:
+        name: Short machine-readable identifier.
+        passed: ``True`` when the check succeeded.
+        severity: ``"error"`` (G2P will not work), ``"warning"``
+            (likely degraded), or ``"info"`` (advisory).
+        message: Human-readable detail string.
+    """
+
+    name: str
+    passed: bool
+    severity: str = "error"
+    message: str = ""
+
+
+@dataclass
+class G2PSelfTestReport:
+    """Aggregated self-test outcomes for a container.
+
+    Attributes:
+        cid: Container identifier the self-test ran against.
+        checks: Ordered list of individual check outcomes.
+    """
+
+    cid: str = ""
+    checks: list[G2PSelfTestCheck] = field(default_factory=list)
+
+    @property
+    def all_passed(self) -> bool:
+        """Return True when every check passed."""
+        return all(c.passed for c in self.checks)
+
+    @property
+    def has_errors(self) -> bool:
+        """Return True when any error-severity check failed."""
+        return any((not c.passed) and c.severity == "error" for c in self.checks)
 
 
 # ---------------------------------------------------------------------------
@@ -503,12 +589,159 @@ def setup_g2p_replication_remote(
     return True
 
 
+def _build_hook_wrapper(hook_name: str, target_bin: str) -> str:
+    """Build the POSIX-shell wrapper installed in /var/gerrit/hooks/.
+
+    The wrapper is intentionally tiny and dependency-free so it works
+    in any minimal container environment.  For each Gerrit hook
+    invocation it:
+
+    * Records a structured header line carrying timestamp, hook
+      name, PID, and the full argv so the wider operational log
+      can be sliced per-event.
+    * Forwards stdout and stderr from the underlying console script
+      back to Gerrit's hooks plugin (the plugin captures these for
+      its own logging) **and** appends a copy to ``G2P_HOOK_LOG``
+      so a single ``tail -F`` shows every dispatch attempt.
+    * Captures the exit code, prints a footer line, and re-exits
+      with the same code so Gerrit's hook accounting is unchanged.
+
+    Parameters
+    ----------
+    hook_name:
+        The Gerrit hook name (e.g. ``patchset-created``).
+    target_bin:
+        Absolute path to the underlying ``gerrit_to_platform``
+        console script that the wrapper should invoke.
+
+    Returns
+    -------
+    str
+        The wrapper script contents (UTF-8 text).  The caller is
+        responsible for writing it to the container with mode 0755.
+    """
+    # NOTE: keep this script /bin/sh-compatible (no bashisms).  The
+    # base Gerrit image ships a minimal shell environment for the
+    # gerrit user.  Use single-quoted heredoc so Python f-string
+    # interpolation is restricted to {hook_name}/{target_bin}/{log}
+    # and shell variables like $$ are passed through verbatim.
+    log = G2P_HOOK_LOG
+    return f"""#!/bin/sh
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: 2025 The Linux Foundation
+#
+# Auto-generated by gerrit-action: G2P hook wrapper for {hook_name}.
+# Do not edit by hand — it will be overwritten on the next deploy.
+#
+# Logs every invocation to {log} so operators can confirm whether
+# Gerrit's 'hooks' plugin fires this hook for real events and what
+# the underlying gerrit_to_platform console script returned.
+set -u
+
+HOOK_NAME='{hook_name}'
+TARGET='{target_bin}'
+LOG='{log}'
+
+# ISO-8601 UTC timestamp; falls back to a POSIX-portable form if
+# the runtime busybox/coreutils variant lacks --iso-8601=seconds.
+_ts() {{
+    date -u '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || date -u
+}}
+
+start_ts=$(_ts)
+pid=$$
+
+# Header: timestamp, hook, pid, full argv.  Each argv element is
+# wrapped in single quotes with any embedded single quotes
+# replaced by the standard POSIX-shell quoting sequence
+# ``'\''`` (close, escaped quote, reopen) via two sed substitutions.
+# This is functionally equivalent to printf %q without depending
+# on bash, so embedded spaces and special characters survive the
+# round-trip into the log file in a form a human reader can
+# unambiguously re-tokenise.
+{{
+    printf '%s [g2p-hook][%s] start pid=%s argv:' "$start_ts" "$HOOK_NAME" "$pid"
+    for a in "$@"; do
+        printf ' %s' "$(printf '%s' "$a" | sed -e "s/'/'\\\\''/g" -e "s/^/'/; s/$/'/")"
+    done
+    printf '\n'
+}} >> "$LOG" 2>/dev/null || true
+
+# Run the underlying console script.  The wrapper preserves the
+# Gerrit hook contract by re-emitting stdout on stdout and stderr
+# on stderr (a previous version merged the two via 2>&1, which
+# would confuse anything downstream that distinguishes the two
+# streams).  We capture each stream to its own temp file, replay
+# them on the matching fd, then append both to the persistent
+# log with a per-line prefix so the log stays greppable per-hook.
+#
+# Require ``mktemp``: a predictable fallback (e.g. /tmp/g2p-hook-$$)
+# is a symlink/clobber risk on multi-tenant hosts.  If mktemp is
+# unavailable we exit with rc=70 (EX_SOFTWARE) and a clear message
+# rather than silently using a guessable path.
+out_tmp=$(mktemp 2>/dev/null) || {{
+    printf '%s [g2p-hook][%s][pid=%s] mktemp unavailable; ' \
+        "$(_ts)" "$HOOK_NAME" "$pid" >&2
+    printf 'cannot safely capture hook output, aborting\n' >&2
+    printf '%s [g2p-hook][%s] end pid=%s rc=70 (mktemp missing)\n' \
+        "$(_ts)" "$HOOK_NAME" "$pid" >> "$LOG" 2>/dev/null || true
+    exit 70
+}}
+err_tmp=$(mktemp 2>/dev/null) || {{
+    rm -f "$out_tmp"
+    printf '%s [g2p-hook][%s][pid=%s] mktemp unavailable; ' \
+        "$(_ts)" "$HOOK_NAME" "$pid" >&2
+    printf 'cannot safely capture hook output, aborting\n' >&2
+    printf '%s [g2p-hook][%s] end pid=%s rc=70 (mktemp missing)\n' \
+        "$(_ts)" "$HOOK_NAME" "$pid" >> "$LOG" 2>/dev/null || true
+    exit 70
+}}
+"$TARGET" "$@" >"$out_tmp" 2>"$err_tmp"
+rc=$?
+
+# Replay each captured stream on the matching fd back to Gerrit's
+# hook plugin.  The plugin gets the same per-stream bytes it would
+# have received if our wrapper were not in the path at all.
+cat "$out_tmp"
+cat "$err_tmp" >&2
+
+# Append both streams to the persistent log with a per-line tag
+# that records which stream the line came from, so post-mortem
+# readers can still tell stdout from stderr.
+if [ -s "$out_tmp" ]; then
+    sed -e "s|^|$(_ts) [g2p-hook][$HOOK_NAME][pid=$pid][out] |" "$out_tmp" \
+        >> "$LOG" 2>/dev/null || true
+fi
+if [ -s "$err_tmp" ]; then
+    sed -e "s|^|$(_ts) [g2p-hook][$HOOK_NAME][pid=$pid][err] |" "$err_tmp" \
+        >> "$LOG" 2>/dev/null || true
+fi
+rm -f "$out_tmp" "$err_tmp"
+
+end_ts=$(_ts)
+printf '%s [g2p-hook][%s] end pid=%s rc=%s\n' "$end_ts" "$HOOK_NAME" "$pid" "$rc" \
+    >> "$LOG" 2>/dev/null || true
+
+exit "$rc"
+"""
+
+
 def setup_g2p_hooks(
     docker: DockerManager,
     cid: str,
     config: G2PConfig,
 ) -> list[str]:
-    """Create Gerrit hook symlinks for each enabled g2p hook.
+    """Install Gerrit hook wrappers for each enabled g2p hook.
+
+    For each hook in ``config.hooks`` the function writes a small
+    POSIX-shell wrapper script into ``/var/gerrit/hooks/`` (see
+    :func:`_build_hook_wrapper`).  The wrapper preserves the Gerrit
+    hook contract — same argv passed through to the underlying
+    ``gerrit_to_platform`` console script, same stdout/stderr
+    forwarded back to the hooks plugin, same exit code — while teeing
+    every invocation to ``/var/gerrit/logs/g2p-hooks.log`` so an
+    operator can confirm whether the hook fired and what the
+    underlying script returned.
 
     Parameters
     ----------
@@ -522,12 +755,26 @@ def setup_g2p_hooks(
     Returns
     -------
     list[str]
-        Hook names that were successfully symlinked.
+        Hook names whose wrapper scripts were successfully
+        installed.
     """
     enabled: list[str] = []
 
     # Ensure the hooks directory exists
     docker.exec_cmd(cid, f"mkdir -p {GERRIT_HOOKS_DIR}", user="0")
+
+    # Verify the Gerrit ``hooks`` plugin is installed.  Without it
+    # Gerrit never invokes the scripts in /var/gerrit/hooks/, which
+    # would silently break G2P.  ``gerrit init --install-all-plugins``
+    # is responsible for placing hooks.jar; if it is missing here,
+    # the hook wrappers we install below will be inert.
+    if not docker.exec_test(cid, f"-f {GERRIT_PLUGINS_DIR}/hooks.jar"):
+        logger.warning(
+            "Gerrit 'hooks' plugin (hooks.jar) is missing from %s — "
+            "G2P hook scripts will not run.  Ensure the site is "
+            "initialised with 'gerrit init --install-all-plugins'.",
+            GERRIT_PLUGINS_DIR,
+        )
 
     for hook_name in config.hooks:
         target_bin = f"{GERRIT_TOOLS_VENV_BIN}/{hook_name}"
@@ -542,18 +789,44 @@ def setup_g2p_hooks(
             )
             continue
 
-        docker.exec_cmd(
+        # Install a small POSIX-shell wrapper script.  The wrapper
+        # preserves Gerrit's hook contract (same argv passed to the
+        # underlying console script, same stdout/stderr forwarded
+        # back to the hooks plugin, same exit code) while teeing
+        # every invocation to a known log file under
+        # /var/gerrit/logs/g2p-hooks.log.  Without this we have zero
+        # in-container observability of whether gerrit_to_platform
+        # actually fires for a given event — see also the G2P
+        # plumbing self-test that exercises the script with --help
+        # to prove imports work.
+        wrapper = _build_hook_wrapper(hook_name, target_bin)
+        _write_file_in_container(
+            docker,
             cid,
-            f"ln -sf {target_bin} {hook_path}",
-            user="0",
-        )
-        docker.exec_cmd(
-            cid,
-            f"chown -h gerrit:gerrit {hook_path}",
-            user="0",
+            hook_path,
+            wrapper,
+            mode="0755",
+            owner="gerrit:gerrit",
         )
         enabled.append(hook_name)
-        logger.info("Hook symlink: %s -> %s", hook_path, target_bin)
+        logger.info(
+            "Hook wrapper: %s -> %s (log: %s)",
+            hook_path,
+            target_bin,
+            G2P_HOOK_LOG,
+        )
+
+    # Make sure the destination log file exists and is writable
+    # by the gerrit user before the first hook fires — the wrapper
+    # appends to it, so a missing file is fine, but pre-creating
+    # avoids a race during the very first invocation and lets
+    # operators ``tail -F`` it from container start.
+    docker.exec_cmd(
+        cid,
+        f"touch {G2P_HOOK_LOG} && chown gerrit:gerrit {G2P_HOOK_LOG} "
+        f"&& chmod 0644 {G2P_HOOK_LOG}",
+        user="0",
+    )
 
     return enabled
 
@@ -562,7 +835,7 @@ def setup_g2p_ssh(
     docker: DockerManager,
     cid: str,
     config: G2PConfig,
-) -> str:
+) -> tuple[str, str]:
     """Configure SSH for github.com inside the container.
 
     Handles:
@@ -585,11 +858,14 @@ def setup_g2p_ssh(
 
     Returns
     -------
-    str
-        The SSH public key (useful for deploy-key setup in downstream
-        steps).  Empty string if no key was configured.
+    tuple[str, str]
+        ``(public_key, private_key)`` — the SSH public key (for
+        deploy-key setup) and private key (for org-level secret
+        provisioning).  Either may be an empty string if no key
+        was configured.
     """
     public_key = ""
+    private_key = ""
     key_deployed = False
 
     # Ensure .ssh directory exists with correct permissions
@@ -700,7 +976,7 @@ def setup_g2p_ssh(
     else:
         logger.info("No SSH key deployed; skipping SSH client config")
 
-    return public_key
+    return public_key, private_key
 
 
 # ---------------------------------------------------------------------------
@@ -724,7 +1000,7 @@ def setup_g2p(
     2. Generate and deploy ``gerrit_to_platform.ini``
     3. Append the g2p detection remote to ``replication.config``
     4. Symlink ``replication.config`` into the g2p config dir
-    5. Create Gerrit hook symlinks
+    5. Install Gerrit hook wrapper scripts
     6. Configure SSH for github.com
 
     Parameters
@@ -765,11 +1041,15 @@ def setup_g2p(
         # Step 4: Replication config symlink
         setup_g2p_replication_symlink(docker, cid)
 
-        # Step 5: Hook symlinks
+        # Step 5: Hook wrapper scripts
         result.hooks_enabled = setup_g2p_hooks(docker, cid, config)
 
         # Step 6: SSH
-        result.ssh_public_key = setup_g2p_ssh(docker, cid, config)
+        result.ssh_public_key, result.ssh_private_key = setup_g2p_ssh(
+            docker,
+            cid,
+            config,
+        )
 
     except G2PSetupError:
         raise
@@ -784,3 +1064,339 @@ def setup_g2p(
         "provided" if result.ssh_public_key else "none",
     )
     return result
+
+
+# ---------------------------------------------------------------------------
+# Self-test
+# ---------------------------------------------------------------------------
+
+
+def _selftest_check(
+    name: str,
+    *,
+    passed: bool,
+    severity: str = "error",
+    message: str = "",
+) -> G2PSelfTestCheck:
+    """Build a :class:`G2PSelfTestCheck` and emit a matching log line.
+
+    Centralised so each check is reported once at the appropriate
+    log level (info on pass, warning/error on fail) without each
+    call site having to repeat the formatting.
+    """
+    check = G2PSelfTestCheck(
+        name=name,
+        passed=passed,
+        severity=severity,
+        message=message,
+    )
+    if passed:
+        logger.info("Self-test ✅ %s — %s", name, message or "ok")
+    elif severity == "warning":
+        logger.warning("Self-test ⚠️  %s — %s", name, message)
+    else:
+        logger.error("Self-test ❌ %s — %s", name, message)
+    return check
+
+
+def _exec_or_blank(
+    docker: DockerManager,
+    cid: str,
+    command: str,
+    *,
+    user: str | None = None,
+) -> str:
+    """Run ``command`` inside ``cid``; return stdout or '' on failure.
+
+    The self-test helpers should never raise on diagnostic commands;
+    they should only record the failure.  This wrapper hides the
+    ``check=False`` plumbing.
+    """
+    try:
+        out: str = docker.exec_cmd(cid, command, user=user, check=False)
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("Self-test exec failed for %r: %s", command, exc)
+        return ""
+    return out.strip()
+
+
+def selftest_g2p_plumbing(
+    docker: DockerManager,
+    cid: str,
+    config: G2PConfig,
+) -> G2PSelfTestReport:
+    """Validate the in-container G2P plumbing end-to-end.
+
+    Runs a sequence of independent checks against the running
+    Gerrit container and collects the results into a
+    :class:`G2PSelfTestReport`.  The checks are deliberately
+    side-effect free apart from a final synthetic hook invocation
+    that targets a non-existent change so it cannot mutate any
+    real GitHub state.
+
+    Steps:
+
+    1. ``hooks.jar`` is present in ``/var/gerrit/plugins/``.
+    2. ``replication.jar`` is **absent** (we replace it with
+       pull-replication; if it's there the bundled init grabbed
+       a copy and it must be removed).
+    3. Each enabled hook wrapper in ``/var/gerrit/hooks/`` exists
+       and points at an executable console-script target.
+    4. Each hook target is executable as the ``gerrit`` user.
+    5. ``gerrit_to_platform.ini`` exists, is non-empty, and contains
+       a ``token = `` line whose value is non-empty.
+    6. ``replication.config`` contains a ``[remote "github-g2p"]``
+       section whose ``authGroup`` value contains the substring
+       ``github`` (case-insensitive) — the platform-detection
+       gate ``gerrit_to_platform`` uses.
+    7. The ``gerrit`` user can ``--help`` the patchset-created
+       script (proves the venv shebang resolves and the entry
+       point imports cleanly).
+
+    Parameters
+    ----------
+    docker:
+        :class:`DockerManager` instance.
+    cid:
+        Running container id or name.
+    config:
+        Validated :class:`G2PConfig` (used to know which hooks
+        should have been enabled).
+
+    Returns
+    -------
+    G2PSelfTestReport
+        Aggregated outcomes, in the order listed above.
+    """
+    report = G2PSelfTestReport(cid=cid)
+
+    # 1. hooks.jar present
+    hooks_jar = f"{GERRIT_PLUGINS_DIR}/hooks.jar"
+    has_hooks_jar = docker.exec_test(cid, f"-f {hooks_jar}")
+    report.checks.append(
+        _selftest_check(
+            "hooks_plugin_present",
+            passed=has_hooks_jar,
+            severity="error",
+            message=(
+                f"{hooks_jar} present"
+                if has_hooks_jar
+                else (
+                    f"{hooks_jar} missing — Gerrit will not invoke "
+                    "any hook scripts under /var/gerrit/hooks/"
+                )
+            ),
+        )
+    )
+
+    # 2. bundled replication.jar removed
+    bundled_repl = f"{GERRIT_PLUGINS_DIR}/replication.jar"
+    bundled_present = docker.exec_test(cid, f"-f {bundled_repl}")
+    report.checks.append(
+        _selftest_check(
+            "bundled_replication_removed",
+            passed=not bundled_present,
+            severity="warning",
+            message=(
+                "bundled replication.jar removed (pull-replication takes over)"
+                if not bundled_present
+                else (
+                    f"{bundled_repl} still present — may conflict with pull-replication"
+                )
+            ),
+        )
+    )
+
+    # 3 & 4. Hook wrappers exist and their underlying TARGET
+    # console script (the line ``TARGET='/opt/gerrit-tools/bin/<hook>'``
+    # inside the wrapper) is executable.  The check name
+    # (``hook_symlink_*``) is kept stable for any downstream
+    # consumers that filter on it, even though the install layer
+    # has moved from a bare ``ln -sf`` symlink to a POSIX-shell
+    # wrapper.  We deliberately do NOT use ``readlink -f`` here:
+    # on a regular wrapper file ``readlink -f`` resolves to the
+    # wrapper itself, which would validate nothing about the
+    # underlying console script the wrapper exec()s.  Instead we
+    # parse the wrapper's ``TARGET=`` line so the check actually
+    # asserts what it claims to.
+    for hook_name in config.hooks:
+        hook_path = f"{GERRIT_HOOKS_DIR}/{hook_name}"
+
+        # The wrapper itself must exist and be executable.
+        if not docker.exec_test(cid, f"-f {hook_path}"):
+            report.checks.append(
+                _selftest_check(
+                    f"hook_symlink_{hook_name}",
+                    passed=False,
+                    severity="error",
+                    message=f"{hook_path} missing",
+                )
+            )
+            continue
+
+        # Extract the TARGET shell variable from the wrapper body.
+        # The wrapper installs a single ``TARGET='...'`` line; we
+        # grep + sed it out rather than executing the wrapper.
+        target = _exec_or_blank(
+            docker,
+            cid,
+            (
+                f'grep -m1 "^TARGET=" {hook_path} | '
+                'sed -E "s/^TARGET=[\'\\"]?//; s/[\'\\"]?$//"'
+            ),
+        )
+        if not target:
+            report.checks.append(
+                _selftest_check(
+                    f"hook_symlink_{hook_name}",
+                    passed=False,
+                    severity="error",
+                    message=(
+                        f"{hook_path} has no TARGET= line; wrapper looks malformed"
+                    ),
+                )
+            )
+            continue
+
+        report.checks.append(
+            _selftest_check(
+                f"hook_symlink_{hook_name}",
+                passed=True,
+                severity="info",
+                message=f"{hook_path} -> {target}",
+            )
+        )
+
+        # The underlying console script must be present and runnable
+        # as the gerrit user (UID 1000, the runtime user Gerrit uses
+        # to fork hook processes).
+        is_exec = docker.exec_test(cid, f"-x {target}") and docker.exec_test(
+            cid, f"-r {target}"
+        )
+        report.checks.append(
+            _selftest_check(
+                f"hook_target_executable_{hook_name}",
+                passed=is_exec,
+                severity="error",
+                message=(
+                    f"{target} executable+readable"
+                    if is_exec
+                    else (
+                        f"{target} not executable+readable; "
+                        "Gerrit will skip the hook silently"
+                    )
+                ),
+            )
+        )
+
+    # 5. INI exists and has a non-empty token
+    ini_present = docker.exec_test(cid, f"-s {G2P_INI_PATH}")
+    if not ini_present:
+        report.checks.append(
+            _selftest_check(
+                "g2p_ini_present",
+                passed=False,
+                severity="error",
+                message=f"{G2P_INI_PATH} missing or empty",
+            )
+        )
+    else:
+        report.checks.append(
+            _selftest_check(
+                "g2p_ini_present",
+                passed=True,
+                severity="info",
+                message=f"{G2P_INI_PATH} present and non-empty",
+            )
+        )
+        token_line = _exec_or_blank(
+            docker,
+            cid,
+            f"grep -E '^[[:space:]]*token[[:space:]]*=' {G2P_INI_PATH} || true",
+        )
+        # A bare ``token =`` (or absent line) means dispatch will
+        # fail at runtime; flag clearly.
+        token_value = ""
+        if token_line and "=" in token_line:
+            token_value = token_line.split("=", 1)[1].strip()
+        token_ok = bool(token_value)
+        report.checks.append(
+            _selftest_check(
+                "g2p_ini_token_populated",
+                passed=token_ok,
+                severity="error",
+                message=(
+                    "INI carries a non-empty token"
+                    if token_ok
+                    else (
+                        f"INI {G2P_INI_PATH} has no populated token "
+                        "line — workflow_dispatch will fail at runtime"
+                    )
+                ),
+            )
+        )
+
+    # 6. replication.config carries a github-detection remote
+    repl_authgroup = _exec_or_blank(
+        docker,
+        cid,
+        # Print just the authGroup value(s) under the github-g2p
+        # section.  awk handles the section scoping safely.
+        (
+            "awk '"
+            '/^\\[remote "github-g2p"\\]/ {in_sec=1; next} '
+            "/^\\[/ {in_sec=0} "
+            "in_sec && /authGroup[[:space:]]*=/ {print}'"
+            f" {GERRIT_REPLICATION_CONFIG}"
+        ),
+    )
+    has_github_authgroup = bool(repl_authgroup) and "github" in repl_authgroup.lower()
+    report.checks.append(
+        _selftest_check(
+            "replication_github_remote",
+            passed=has_github_authgroup,
+            severity="error",
+            message=(
+                f"github-g2p remote present (authGroup: {repl_authgroup})"
+                if has_github_authgroup
+                else (
+                    f"github-g2p remote missing or its authGroup does "
+                    f"not contain 'github' in {GERRIT_REPLICATION_CONFIG} "
+                    "— platform detection will fail and no dispatch "
+                    "will fire"
+                )
+            ),
+        )
+    )
+
+    # 7. Hook script imports cleanly when run as gerrit
+    if config.hooks:
+        first_hook = config.hooks[0]
+        first_target = f"{GERRIT_TOOLS_VENV_BIN}/{first_hook}"
+        # ``--help`` exits 0 and prints usage on the python entry
+        # point without dispatching anything.  We tolerate any
+        # 0/1/2 exit code; what we really want is "no traceback".
+        help_output = _exec_or_blank(
+            docker,
+            cid,
+            f"{first_target} --help 2>&1 || true",
+            user="gerrit",
+        )
+        traceback_seen = "Traceback" in help_output
+        report.checks.append(
+            _selftest_check(
+                "hook_entrypoint_imports",
+                passed=not traceback_seen,
+                severity="error",
+                message=(
+                    f"{first_target} --help ran cleanly as gerrit"
+                    if not traceback_seen
+                    else (
+                        f"{first_target} --help raised a Python "
+                        f"traceback when run as gerrit:\n{help_output[:400]}"
+                    )
+                ),
+            )
+        )
+
+    return report

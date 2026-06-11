@@ -185,21 +185,23 @@ comment-added, change merges).
 
 <!-- markdownlint-disable MD013 -->
 
-| Name                   | Required | Default                                                      | Description                                                                  |
-| ---------------------- | -------- | ------------------------------------------------------------ | ---------------------------------------------------------------------------- |
-| g2p_enable             | False    | `false`                                                      | Enable G2P integration                                                       |
-| g2p_github_token       | False    |                                                              | GitHub PAT for workflow dispatch (see [G2P Token Scopes](#g2p-token-scopes)) |
-| g2p_github_owner       | False    |                                                              | Target GitHub organisation or user (required when `g2p_enable` is true)      |
-| g2p_remote_name_style  | False    | `dash`                                                       | How Gerrit project names map to GitHub repos: `dash`, `underscore`, `slash`  |
-| g2p_remote_url         | False    |                                                              | Override remote URL pattern (auto-generated from `g2p_github_owner`)         |
-| g2p_remote_auth_group  | False    | `GitHub Replication`                                         | Gerrit authGroup for the replication remote (must contain "github")          |
-| g2p_comment_mappings   | False    | `{"recheck":"verify","reverify":"verify","remerge":"merge"}` | JSON mapping of comment keywords to workflow filters                         |
-| g2p_hooks              | False    | `patchset-created,comment-added,change-merged`               | Comma-separated Gerrit hooks to enable                                       |
-| g2p_validation_mode    | False    | `warn`                                                       | Behaviour when GitHub checks fail: `error`, `warn`, or `skip`                |
-| g2p_validate_workflows | False    | `true`                                                       | Check that the target org has matching Gerrit workflows                      |
-| g2p_validate_repos     | False    |                                                              | Comma-separated repos to verify exist in the target org                      |
-| g2p_ssh_private_key    | False    |                                                              | SSH private key for GitHub push-based replication                            |
-| g2p_github_known_hosts | False    |                                                              | SSH known\_hosts entries for github.com (auto-fetched if omitted)            |
+| Name                   | Required | Default                                                      | Description                                                                                                                |
+| ---------------------- | -------- | ------------------------------------------------------------ | -------------------------------------------------------------------------------------------------------------------------- |
+| g2p_enable             | False    | `false`                                                      | Enable G2P integration                                                                                                     |
+| g2p_github_token       | False    |                                                              | GitHub PAT for workflow dispatch (see [G2P Token Scopes](#g2p-token-scopes))                                               |
+| g2p_github_owner       | False    |                                                              | Target GitHub organisation or user (required when `g2p_enable` is true)                                                    |
+| g2p_remote_name_style  | False    | `dash`                                                       | How Gerrit project names map to GitHub repos: `dash`, `underscore`, `slash`                                                |
+| g2p_remote_url         | False    |                                                              | Override remote URL pattern (auto-generated from `g2p_github_owner`)                                                       |
+| g2p_remote_auth_group  | False    | `GitHub Replication`                                         | Gerrit authGroup for the replication remote (must contain "github")                                                        |
+| g2p_comment_mappings   | False    | `{"recheck":"verify","reverify":"verify","remerge":"merge"}` | JSON mapping of comment keywords to workflow filters                                                                       |
+| g2p_hooks              | False    | `patchset-created,comment-added,change-merged`               | Comma-separated Gerrit hooks to enable                                                                                     |
+| g2p_validation_mode    | False    | `warn`                                                       | Behaviour when GitHub checks fail: `error`, `warn`, or `skip`                                                              |
+| g2p_validate_workflows | False    | `true`                                                       | Check that the target org has matching Gerrit workflows                                                                    |
+| g2p_validate_repos     | False    |                                                              | Comma-separated repos to verify exist in the target org                                                                    |
+| g2p_ssh_private_key    | False    |                                                              | SSH private key for GitHub push-based replication                                                                          |
+| g2p_github_known_hosts | False    |                                                              | SSH known\_hosts entries for github.com (auto-fetched if omitted)                                                          |
+| g2p_org_setup          | False    | `verify`                                                     | Org-level audit/provisioning mode: `provision`, `verify`, or `skip` (see [G2P Org Setup](#g2p-org-setup-and-provisioning)) |
+| g2p_org_token_map      | False    |                                                              | Base64-encoded JSON mapping orgs to admin PATs (see [G2P Org Setup](#g2p-org-setup-and-provisioning))                      |
 
 <!-- markdownlint-enable MD013 -->
 
@@ -217,12 +219,14 @@ comment-added, change merges).
 | ssh_host_keys          | JSON object mapping slug to SSH host keys    | `{"onap": {"ssh_host_ed25519_key": "..."}}`      |
 | g2p_enabled            | Whether G2P integration ran                  | `true` / `false`                                 |
 | g2p_config_path        | Path to generated INI inside container       | `/var/gerrit/.config/.../gerrit_to_platform.ini` |
-| g2p_hooks_enabled      | JSON array of hooks that got symlinks        | `["patchset-created","comment-added"]`           |
+| g2p_hooks_enabled      | JSON array of hooks that got wrapper scripts | `["patchset-created","comment-added"]`           |
 | g2p_github_owner       | Configured GitHub owner                      | `modeseven-gerrit-onap`                          |
 | g2p_remote_name_style  | Configured repository name style             | `dash`                                           |
 | g2p_validation_results | JSON array of GitHub check results           | `[{"check_name":"token_valid","passed":true}]`   |
 | g2p_token_provided     | Whether a GitHub token was supplied          | `true` / `false`                                 |
 | g2p_ssh_public_key     | Public key for downstream deploy-key setup   | `ssh-ed25519 AAAA...`                            |
+| g2p_org_audit_results  | JSON array of org-level audit check results  | `[{"check_name":"org_secrets","passed":true}]`   |
+| g2p_org_provisioned    | Whether any org items got auto-provisioned   | `true` / `false`                                 |
 
 <!-- markdownlint-enable MD013 -->
 
@@ -723,6 +727,63 @@ with:
   check_service: false
 ```
 
+### G2P Hooks Not Firing
+
+If a Gerrit change is uploaded, reviewed, and merged but no
+GitHub Actions workflows run in the target organisation, the
+container is most likely missing the Gerrit `hooks` plugin.
+G2P relies on Gerrit invoking the POSIX-shell wrapper scripts
+this action installs under `/var/gerrit/hooks/`
+(`patchset-created`, `comment-added`, `change-merged`); each
+wrapper exec()s the matching `gerrit_to_platform` console
+script and tees its stdout / stderr to
+`/var/gerrit/logs/g2p-hooks.log`.  Without `hooks.jar` loaded
+as a plugin Gerrit never invokes the wrappers and those
+log entries never appear.
+
+Check whether the plugin is present in the running container:
+
+```bash
+docker exec <container_id> ls -la /var/gerrit/plugins/hooks.jar
+```
+
+If the file is missing, the site was initialised without
+`gerrit init --install-all-plugins`.  This action always passes
+`--batch --install-all-plugins` to `gerrit init` and the
+`gerrit_init_args` input only *appends* to that argv — those
+two flags cannot be suppressed by user input.  The most likely
+remaining cause is an older cached image that pre-dates the
+`--install-all-plugins` change; re-run the deploy workflow
+with caching disabled (`enable_cache: false`) to force a fresh
+build and repopulate the bundled plugins.
+
+The most direct signal for whether hooks are firing in real
+time is the dedicated G2P hook log written by the wrappers
+this action installs.  Tail it while uploading a patchset:
+
+```bash
+docker exec <container_id> tail -F /var/gerrit/logs/g2p-hooks.log
+```
+
+Each invocation produces a structured `[g2p-hook][<hook>][pid=…]`
+header followed by `[out]` / `[err]` prefixed lines from the
+underlying `gerrit_to_platform` console script and a final
+`end pid=… rc=…` summary.  No entries for the hook you expected
+means the Gerrit `hooks` plugin did not invoke the wrapper at
+all — typically because the plugin was not loaded (see the
+`hooks.jar` check above) or the event type is not enabled in
+`g2p_hooks`.  Entries present but ending with non-zero `rc=`
+means the wrapper fired and the underlying console script
+failed; the `[err]` lines for the same `pid=` carry the cause.
+
+For lower-level diagnostics (plugin loader output, JGit errors,
+SSH session activity) the standard Gerrit logs are still useful:
+
+```bash
+docker exec <container_id> tail -f /var/gerrit/logs/error_log \
+  /var/gerrit/logs/sshd_log
+```
+
 ### Authentication Issues
 
 Verify SSH key format:
@@ -743,15 +804,18 @@ The [gerrit\_to\_platform](https://gerrit.linuxfoundation.org/infra/admin/repos/
 package enables a Gerrit instance to dispatch GitHub Actions workflows
 in response to Gerrit events. When `g2p_enable` is set to `true`, this
 action configures the deployed Gerrit container(s) with the files and
-symlinks that `gerrit_to_platform` needs:
+wrapper scripts that `gerrit_to_platform` needs:
 
 - **`gerrit_to_platform.ini`** — application config with the GitHub
   token and comment-keyword-to-workflow-filter mappings
 - **`replication.config` remote** — a detection-only remote that tells
   `gerrit_to_platform` which platform, organisation, and repository
   naming convention to use
-- **Gerrit hook symlinks** — `patchset-created`, `comment-added`, and
-  `change-merged` linked to the g2p console scripts
+- **Gerrit hook wrapper scripts** — `patchset-created`, `comment-added`,
+  and `change-merged` installed as POSIX-shell wrappers in
+  `/var/gerrit/hooks/` that exec() the matching g2p console scripts
+  and tee every invocation (with stdout / stderr) to
+  `/var/gerrit/logs/g2p-hooks.log`
 - **SSH configuration** — keypair and `known_hosts` for github.com
 
 ### G2P Token Scopes
@@ -809,6 +873,128 @@ organisation and grant these permissions:
     g2p_remote_name_style: dash
     g2p_validation_mode: warn
 ```
+
+### G2P Org Setup and Provisioning
+
+The `g2p_org_setup` input controls whether the action audits — and
+optionally creates — the org-level GitHub Actions secrets and
+variables that downstream Gerrit-dispatched workflows need to run:
+
+<!-- markdownlint-disable MD013 -->
+
+| Mode        | Behaviour                                                          |
+| ----------- | ------------------------------------------------------------------ |
+| `provision` | Audit the target org and auto-create absent required secrets/vars  |
+| `verify`    | Audit and report only (default); make no changes                   |
+| `skip`      | Skip org-level audits entirely                                     |
+
+<!-- markdownlint-enable MD013 -->
+
+Required org-level items checked (and provisioned in `provision` mode):
+
+- **Secret**: `GERRIT_SSH_PRIVKEY`
+- **Variables**: `GERRIT_SERVER`, `GERRIT_SSH_USER`, `GERRIT_KNOWN_HOSTS`,
+  `GERRIT_URL`
+
+An optional `GERRIT_SSH_PRIVKEY_G2G` secret is recorded for
+visibility but never blocks the run and never appears as a
+warning. It is the SSH private key used by **gerrit-to-gerrit
+(G2G) replication** — when one Gerrit instance pushes changes to
+*another* Gerrit instance rather than to GitHub. Most LF
+deployments only mirror Gerrit → GitHub via the G2P flow this
+action configures, so the secret is irrelevant and its absence is
+expected. Orgs that *do* run G2G replication should populate the
+secret out of band; the audit reports it as `found` once present.
+This action does not configure or provision G2G replication
+itself.
+
+#### Re-run behaviour (always overwrite)
+
+In `provision` mode, every required secret and variable is
+**always overwritten** with the current run's values, even when
+the initial audit reports them as already present. This is
+deliberate: each fresh Gerrit container build produces a new
+ephemeral SSH key, and tunnel host/port assignments may change
+between runs. Without overwriting, stale `GERRIT_SSH_PRIVKEY` /
+`GERRIT_SERVER` / `GERRIT_KNOWN_HOSTS` / `GERRIT_URL` values on
+the GitHub side would silently diverge from the live Gerrit
+instance — workflows would dispatch successfully and then fail
+at SSH-push or HTTP-API time. The provisioner uses POST for
+absent items and PATCH for existing ones to keep variable
+history clean.
+
+If you do not want overwrite-on-every-run semantics, set
+`g2p_org_setup` to `verify` (audit only) or `skip`.
+
+#### Token requirements (`provision` mode)
+
+Provisioning org-level secrets requires a token with elevated scope
+beyond the default `g2p_github_token`. Provide it via
+`g2p_org_token_map` (recommended) or fall back to `g2p_github_token`:
+
+- **Classic PAT** — `admin:org` scope.
+- **Fine-grained PAT** — `Organization secrets: Read & write` and
+  `Organization variables: Read & write` on the target org.
+
+#### `g2p_org_token_map` format
+
+The input takes a Base64-encoded JSON array of org/token pairs so a
+single secret can carry credentials for multiple target orgs.
+
+Pre-encoding JSON (single org):
+
+```json
+[
+  {"github_org": "modeseven-gerrit-onap",
+   "token": "ghp_DUMMYTOKEN1234567890abcdefABCDEF1234"}
+]
+```
+
+Pre-encoding JSON (multiple orgs):
+
+```json
+[
+  {"github_org": "modeseven-gerrit-onap", "token": "ghp_xxx..."},
+  {"github_org": "modeseven-gerrit-other", "token": "ghp_yyy..."}
+]
+```
+
+Encode it (whitespace tolerated; single-line or wrapped both work):
+
+<!-- markdownlint-disable MD013 -->
+
+```bash
+JSON='[{"github_org":"modeseven-gerrit-onap","token":"ghp_DUMMYTOKEN1234567890abcdefABCDEF1234"}]'
+printf '%s' "$JSON" | base64
+```
+
+<!-- markdownlint-enable MD013 -->
+
+Example resulting value (single line):
+
+```text
+W3siZ2l0aHViX29yZyI6Im1vZGVzZXZlbi1nZXJyaXQtb25hcCIsInRva2VuIjoiZ2hwX0RVTU1ZVE9LRU4xMjM0NTY3ODkwYWJjZGVmQUJDREVGMTIzNCJ9XQ==
+```
+
+Store the encoded string as a repo or org secret (for example
+`G2P_ORG_TOKENS`) and pass it through to the action:
+
+```yaml
+- name: "Start Gerrit with G2P (provision mode)"
+  uses: lfreleng-actions/gerrit-action@main
+  with:
+    gerrit_setup: ${{ vars.GERRIT_SETUP }}
+    g2p_enable: true
+    g2p_github_owner: modeseven-gerrit-onap
+    g2p_github_token: ${{ secrets.G2P_GITHUB_TOKEN }}
+    g2p_org_setup: provision
+    g2p_org_token_map: ${{ secrets.G2P_ORG_TOKENS }}
+```
+
+When `g2p_org_token_map` has no entry for the resolved
+`g2p_github_owner`, the action falls back to `g2p_github_token` and
+emits a warning. See `docs/GITHUB-ORG-VERIFY-CONFIG.md` for the full
+design and error-handling matrix.
 
 ### G2P Validation Modes
 

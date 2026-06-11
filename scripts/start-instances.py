@@ -33,8 +33,10 @@ Usage::
 
 from __future__ import annotations
 
+import ipaddress
 import json
 import logging
+import shlex
 import shutil
 import subprocess
 import sys
@@ -59,7 +61,7 @@ from config import (  # noqa: E402
     InstanceStore,
 )
 from docker_manager import DockerManager  # noqa: E402
-from errors import DockerError, GerritActionError  # noqa: E402
+from errors import ConfigError, DockerError, GerritActionError  # noqa: E402
 from logging_utils import log_group, setup_logging  # noqa: E402
 from outputs import write_summary  # noqa: E402
 
@@ -292,6 +294,20 @@ def fetch_remote_projects(
     params: dict[str, str] = {"n": str(max_projects)}
     if project_filter and project_filter != ".*":
         params["r"] = project_filter
+    # Restrict to ACTIVE projects so READ_ONLY (archived) and HIDDEN
+    # projects are excluded server-side.  Gerrit's REST API natively
+    # supports the ``state`` query parameter, so we let the source
+    # do the filtering rather than fetching everything and dropping
+    # archived entries locally.  Operators who want archived repos
+    # mirrored too can set ``SKIP_ARCHIVED_PROJECTS=false`` (env) or
+    # ``skip_archived_projects: 'false'`` (action input).
+    if config.skip_archived_projects:
+        params["state"] = "ACTIVE"
+        logger.info("  Restricting to ACTIVE projects (SKIP_ARCHIVED_PROJECTS=true)")
+    else:
+        logger.info(
+            "  Including archived (READ_ONLY) projects (SKIP_ARCHIVED_PROJECTS=false)"
+        )
 
     query = "&".join(f"{k}={quote(v, safe='')}" for k, v in params.items())
     full_url = f"{base_url}?{query}"
@@ -374,6 +390,47 @@ def generate_replication_config(
     # Parse sync refs
     sync_refs = [r.strip() for r in config.sync_refs.split(",") if r.strip()]
 
+    # When meta-ref replication is enabled, append the per-project
+    # refspecs that carry NoteDb change metadata (``refs/changes/*``
+    # already covers ``refs/changes/NN/CCCCCC/meta`` by hierarchy),
+    # project ACLs (``refs/meta/config``, ``refs/meta/dashboards``,
+    # ``refs/meta/external-ids`` etc.) and the merge-preview cache.
+    # Duplicates are tolerated by Gerrit but suppressed here so the
+    # generated file stays tidy when an operator already lists the
+    # ref pattern explicitly in ``sync_refs``.
+    #
+    # Note: the per-project remote DOES mirror each project's own
+    # ``refs/meta/config`` (via the ``refs/meta/*`` wildcard).  This
+    # is intentional and is a different trade-off from the magic-repo
+    # remote's handling:
+    #
+    # * Per-project ``refs/meta/config`` defines that project's
+    #   *project-local* ACL (per-ref read / push / submit
+    #   permissions, plus the project's owner-group reference).
+    # * The bootstrap container does not have a meaningful local
+    #   ACL for replicated user projects (they were just pre-
+    #   created as empty bare repos by ``fetch_and_precreate_
+    #   projects``), so mirroring the source's ACL is a strict
+    #   improvement: it lets the deployed Gerrit reflect the
+    #   source server's per-project access rules.
+    # * The bootstrap admin account 1000000 retains the global
+    #   ``administrateServer`` capability (because the magic-repo
+    #   remote excludes ``All-Projects:refs/meta/config`` — see the
+    #   block comment further down), and that capability bypasses
+    #   project-level ACLs, so the admin still sees every replicated
+    #   project regardless of what its per-project ACL says.
+    # * Non-admin / anonymous viewers may be blocked by per-project
+    #   ACLs that reference source-server group UUIDs that do not
+    #   exist locally, but that is the expected behaviour for a
+    #   "mirror the source server" deployment shape.
+    if config.replicate_meta_refs:
+        for extra in (
+            "+refs/meta/*:refs/meta/*",
+            "+refs/cache-automerge/*:refs/cache-automerge/*",
+        ):
+            if extra not in sync_refs:
+                sync_refs.append(extra)
+
     fetch_every_enabled = config.fetch_every_enabled
     fetch_interval = config.fetch_every
 
@@ -432,6 +489,156 @@ def generate_replication_config(
     if project:
         lines.append(f"  projects = {project}")
 
+    # When meta-ref replication is enabled, emit a second remote that
+    # targets Gerrit's ``All-Users`` and ``All-Projects`` repositories
+    # with the broader set of refspecs they need.  These are the
+    # "magic" projects that hold per-account identities, external IDs,
+    # group membership, the change-number sequence and global ACLs.
+    # Without them, replicated changes display authors as
+    # "Gerrit Code Review", group ACLs do not resolve, and any new
+    # change uploaded against the CI Gerrit risks colliding with the
+    # source's change-number sequence.
+    #
+    # We use a distinct ``[remote "<slug>-meta"]`` section so the
+    # primary remote's project filter and per-project refspecs stay
+    # narrowly scoped to user projects.  ``createMissingRepositories``
+    # is set to ``false`` here because Gerrit always creates these
+    # special repos itself during ``gerrit init``.
+    #
+    # CRITICAL: refs/meta/config is INTENTIONALLY EXCLUDED.
+    # ====================================================
+    # An earlier version of this code used a blanket
+    # ``+refs/meta/*:refs/meta/*`` refspec for both magic projects.
+    # That pulled the source server's
+    # ``All-Projects:refs/meta/config`` over the top of the deployed
+    # container's locally-bootstrapped global ACL.  The fallout was
+    # silent but severe:
+    #
+    # * ``refs/meta/config`` on ``All-Projects`` is the
+    #   server-wide ACL definition.  It names the UUID of the
+    #   ``Administrators`` group, plus every per-ref permission
+    #   block (read / push / submit / forge-author / etc.).
+    # * The bootstrap container creates account 1000000 and adds
+    #   it to the *local* Administrators group (with a locally
+    #   generated UUID).  Setup-gerrit-user.py then provisions the
+    #   operator's SSH keys against that account.
+    # * After pull-replication writes the source server's
+    #   ``refs/meta/config`` into the local All-Projects, the
+    #   Administrators group reference resolves to the source
+    #   server's UUID, whose membership is the source server's
+    #   admins — NOT the local account 1000000.  Account 1000000
+    #   still exists in ``refs/users/00/1000000`` (untouched
+    #   because the ``refs/users/*`` fetch typically fails on
+    #   ACL-restricted source servers), but it is no longer in
+    #   any group with ``administrateServer`` capability.
+    # * Every REST endpoint that requires ``administrate-server``
+    #   or ``maintain-server`` then returns 403 against the
+    #   would-be admin.  ``POST /projects/<name>/index.changes``
+    #   needs ``administrate-server``; ``POST /config/server/
+    #   caches/<name>/flush`` needs ``maintain-server``.  Both
+    #   of those calls fired 403 across the board in the
+    #   2026-05-21 14:35 / 14:51 / 15:02 dispatches with the
+    #   blanket-refspec config.
+    # * Operators see the symptom in the deployed Gerrit UI too:
+    #   their account exists (DEVELOPMENT_BECOME_ANY_ACCOUNT
+    #   still works) but the admin UI is locked because the
+    #   Administrators group no longer points at them.
+    #
+    # Fix: enumerate the meta refs we actually need by exact name
+    # so the wildcard never grabs ``refs/meta/config``.  The
+    # specific refs we want are NoteDb-related (the things that
+    # actually let the deployed Gerrit render the source server's
+    # accounts / groups / changes correctly):
+    #
+    # * ``refs/meta/external-ids`` (All-Users) — login → account_id
+    #   map; without this, replicated changes show ``Anonymous
+    #   Coward`` instead of real author names.
+    # * ``refs/meta/group-names`` (All-Users) — group UUID → name
+    #   map; without this, replicated group references render as
+    #   raw UUIDs.
+    # * ``refs/meta/version`` (both) — NoteDb schema version pin;
+    #   harmless to mirror and required for some consistency
+    #   checks the secondary index runs.
+    #
+    # We do NOT enumerate ``refs/meta/config`` for either project
+    # because:
+    #   - All-Projects:refs/meta/config = source's global ACL
+    #     (the hijack risk above).
+    #   - All-Users:refs/meta/config = source's All-Users-specific
+    #     ACL; replicating it has the same hijack effect against
+    #     account-edit / draft-comment permissions on the local
+    #     deployment.
+    if config.replicate_meta_refs:
+        lines.extend(
+            [
+                "",
+                "# Magic-repo remote: All-Users / All-Projects NoteDb refs.",
+                "# Required for accounts, external IDs, groups and the",
+                "# change-number sequence to resolve on the deployed",
+                "# CI Gerrit.  refs/meta/config is INTENTIONALLY",
+                "# EXCLUDED — see the source comment in",
+                "# generate_replication_config for the full rationale",
+                "# (TL;DR: replicating it overwrites the local",
+                "# Administrators-group ACL and breaks reindex /",
+                "# cache-flush / admin UI on the bootstrap account).",
+                f'[remote "{slug}-meta"]',
+                f"  url = {git_url}",
+            ]
+        )
+        if fetch_every_enabled:
+            lines.append(f"  fetchEvery = {fetch_interval}")
+        lines.extend(
+            [
+                f"  timeout = {config.replication_timeout}",
+                f"  connectionTimeout = {connection_timeout_ms}",
+                "  replicationDelay = 0",
+                "  replicationRetry = 60",
+                f"  threads = {config.replication_threads}",
+                "  createMissingRepositories = false",
+                "  replicateHiddenProjects = true",
+                # Refspecs are enumerated rather than wildcarded so
+                # the source server's ``refs/meta/config`` (on either
+                # All-Projects or All-Users) is never pulled.  See the
+                # block comment above for the rationale.  Each refspec
+                # is documented inline so future maintainers can see
+                # which magic project the ref normally lives on and
+                # why we are mirroring it.
+                #
+                # NoteDb identity / membership refs (All-Users):
+                "  fetch = +refs/users/*:refs/users/*",
+                "  fetch = +refs/groups/*:refs/groups/*",
+                "  fetch = +refs/meta/external-ids:refs/meta/external-ids",
+                "  fetch = +refs/meta/group-names:refs/meta/group-names",
+                # Per-user state refs (All-Users); harmless no-ops
+                # against All-Projects because they don't exist there.
+                "  fetch = +refs/draft-comments/*:refs/draft-comments/*",
+                "  fetch = +refs/starred-changes/*:refs/starred-changes/*",
+                # Change-number sequence (All-Projects); also a no-op
+                # against All-Users.  Without this the local container
+                # would start handing out change numbers from 1, which
+                # would collide with the replicated refs/changes/*
+                # numbers on the very first locally-uploaded change.
+                # The test Gerrit is read-only by policy, so this is
+                # belt-and-braces, but cheap to mirror.
+                "  fetch = +refs/sequences/*:refs/sequences/*",
+                # NoteDb schema-version pin (both projects).  Cheap to
+                # mirror and helps some consistency-check paths in the
+                # secondary index.
+                "  fetch = +refs/meta/version:refs/meta/version",
+                # Magic-project filter.  Both names are listed even
+                # though some refspecs only apply to one of them —
+                # the pull-replication plugin silently skips refs
+                # that don't exist for a given project.
+                "  projects = All-Users",
+                "  projects = All-Projects",
+            ]
+        )
+        logger.info(
+            "  Meta-ref replication enabled: "
+            "All-Users / All-Projects NoteDb refs will be mirrored "
+            "(refs/meta/config excluded to preserve local ACL)"
+        )
+
     config_file.parent.mkdir(parents=True, exist_ok=True)
     config_file.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
@@ -441,16 +648,39 @@ def generate_secure_config(
     slug: str,
     config: ActionConfig,
 ) -> None:
-    """Generate ``secure.config`` with authentication credentials."""
+    """Generate ``secure.config`` with authentication credentials.
+
+    Emits a per-remote section for every remote that
+    ``generate_replication_config`` writes into the matching
+    ``replication.config``.  When ``replicate_meta_refs`` is enabled
+    that includes the magic-repo remote (``<slug>-meta``) targeting
+    ``All-Users`` and ``All-Projects`` — without explicit credentials
+    here the plugin falls back to anonymous auth, which the source
+    Gerrit refuses with ``TransportException: not authorized``.
+    """
     auth_type = config.auth_type.lower()
 
     if auth_type == "http_basic":
-        content = (
+        sections = [
             f'[remote "{slug}"]\n'
             f"  username = {config.http_username}\n"
             f"  password = {config.http_password}\n"
-        )
+        ]
+        if config.replicate_meta_refs:
+            # Mirror the credentials onto the magic-repo remote so
+            # the matching ``[remote "<slug>-meta"]`` section emitted
+            # by generate_replication_config can authenticate against
+            # the source Gerrit when fetching All-Users / All-Projects.
+            sections.append(
+                f'[remote "{slug}-meta"]\n'
+                f"  username = {config.http_username}\n"
+                f"  password = {config.http_password}\n"
+            )
+        content = "".join(sections)
     elif auth_type == "bearer_token":
+        # Bearer-token auth applies globally to all remotes via the
+        # ``[auth]`` section, so no per-remote duplication is needed
+        # for the magic-repo remote.
         content = f"[auth]\n  bearerToken = {config.bearer_token}\n"
     else:
         # SSH auth — no secure.config needed
@@ -566,12 +796,23 @@ def init_gerrit_site(
     slug: str,
     canonical_url: str,
     image: str,
+    extra_init_args: str = "",
 ) -> None:
     """Initialise a Gerrit site directory using ``gerrit init``.
 
     Runs the Gerrit image with ``init`` as the command, mounting only
     the individual sub-directories (not the whole ``/var/gerrit``
     directory) so that ``/var/gerrit/bin`` from the image is preserved.
+
+    Parameters
+    ----------
+    extra_init_args:
+        Optional shell-style argument string to pass to ``gerrit init``
+        (from the ``gerrit_init_args`` action input).  Parsed with
+        ``shlex.split`` so callers can use the familiar
+        whitespace-separated form (``--foo bar --baz=qux``) and quote
+        values that contain spaces.  Each resulting token becomes its
+        own argv element.  Empty strings are ignored.
     """
     logger.info("Initializing Gerrit site for %s…", slug)
 
@@ -586,11 +827,46 @@ def init_gerrit_site(
     volumes = {str(instance_dir / sub): f"/var/gerrit/{sub}" for sub in _GERRIT_SUBDIRS}
 
     try:
+        # Pass --batch so init never prompts, and
+        # --install-all-plugins so the bundled plugins from the
+        # image (hooks, download-commands, delete-project,
+        # webhooks, singleusergroup, reviewnotes, etc.) get copied
+        # into the mounted plugins/ directory.  Without this the
+        # mount shadows the image's bundled plugins and Gerrit
+        # starts without the hooks plugin — which silently breaks
+        # G2P because Gerrit never invokes the wrapper scripts in
+        # /var/gerrit/hooks/.
+        command = ["init", "--batch", "--install-all-plugins"]
+        if extra_init_args.strip():
+            # Honour any user-supplied extras.  Parse with
+            # ``shlex.split`` so callers can use the familiar
+            # shell-style whitespace-separated form
+            # (``--foo bar --baz``) and still get quoting handled
+            # correctly for values that contain spaces.  Each
+            # token becomes its own argv element, matching the
+            # behaviour ``gerrit init`` expects.
+            #
+            # ``shlex.split`` raises ``ValueError`` on malformed
+            # input (e.g. an unbalanced quote).  Convert that to a
+            # ConfigError pointing at the offending action input so
+            # the user sees an actionable ``::error::`` line
+            # instead of an unhelpful stack trace from deep inside
+            # the container start path.
+            try:
+                extra_tokens = shlex.split(extra_init_args)
+            except ValueError as exc:
+                raise ConfigError(
+                    f"Invalid 'gerrit_init_args' input ({exc}): {extra_init_args!r}"
+                ) from exc
+            for extra in extra_tokens:
+                if extra:
+                    command.append(extra)
+
         docker.run_ephemeral(
             image,
             volumes=volumes,
             env={"CANONICAL_WEB_URL": canonical_url},
-            command=["init"],
+            command=command,
             timeout=180,
         )
     except DockerError as exc:
@@ -614,6 +890,7 @@ def configure_gerrit(
     api_path: str,
     advertised_ssh_addr: str,
     use_tunnel: bool,
+    tunnel_host: str = "",
 ) -> None:
     """Write ``gerrit.config`` settings via ``git config``.
 
@@ -668,11 +945,18 @@ def configure_gerrit(
     # Remote plugin admin
     if use_tunnel:
         _gc("plugins.allowRemoteAdmin", "false")
-        logger.warning(
-            "⚠️  Tunnel mode active with DEVELOPMENT_BECOME_ANY_ACCOUNT auth."
-        )
-        logger.warning("   Anyone with network access can authenticate as any user.")
-        logger.warning("   Remote plugin admin has been disabled to limit exposure.")
+        if _is_private_tunnel(tunnel_host):
+            logger.info("Tunnel mode active (private network — remote admin disabled).")
+        else:
+            logger.warning(
+                "⚠️  Tunnel mode active with DEVELOPMENT_BECOME_ANY_ACCOUNT auth."
+            )
+            logger.warning(
+                "   Anyone with network access can authenticate as any user."
+            )
+            logger.warning(
+                "   Remote plugin admin has been disabled to limit exposure."
+            )
     else:
         _gc("plugins.allowRemoteAdmin", "true")
 
@@ -842,6 +1126,36 @@ def capture_ssh_host_keys(
 # =====================================================================
 
 
+def _is_private_tunnel(tunnel_host: str) -> bool:
+    """Check whether the tunnel host is a private or VPN address.
+
+    Returns ``True`` when *tunnel_host* is an IPv4 address inside one of
+    the RFC 1918 private ranges (``10.0.0.0/8``, ``172.16.0.0/12``,
+    ``192.168.0.0/16``) or the CGNAT range (``100.64.0.0/10``, which
+    includes Tailscale addresses).  Hostnames that cannot be parsed as
+    an IP address (e.g. ``bore.pub``) are treated as public and return
+    ``False``.
+    """
+    if not tunnel_host:
+        return False
+
+    try:
+        addr = ipaddress.ip_address(tunnel_host)
+    except ValueError:
+        return False
+
+    if not isinstance(addr, ipaddress.IPv4Address):
+        return False
+
+    private_networks = (
+        ipaddress.ip_network("10.0.0.0/8"),
+        ipaddress.ip_network("172.16.0.0/12"),
+        ipaddress.ip_network("192.168.0.0/16"),
+        ipaddress.ip_network("100.64.0.0/10"),
+    )
+    return any(addr in net for net in private_networks)
+
+
 def _resolve_tunnel(
     slug: str,
     config: ActionConfig,
@@ -950,7 +1264,14 @@ def start_instance(
     instance_dir = config.work_path / "instances" / slug
 
     # Step 1: Init site
-    init_gerrit_site(docker, instance_dir, slug, canonical_url, image)
+    init_gerrit_site(
+        docker,
+        instance_dir,
+        slug,
+        canonical_url,
+        image,
+        extra_init_args=config.gerrit_init_args,
+    )
 
     # Step 2: Configure
     configure_gerrit(
@@ -961,6 +1282,7 @@ def start_instance(
         api_path,
         advertised_ssh_addr,
         use_tunnel,
+        tunnel_host=config.tunnel_host,
     )
 
     # Step 3: Plugins

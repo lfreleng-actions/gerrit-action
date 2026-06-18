@@ -97,7 +97,7 @@ jobs:
           echo "Testing outputs from basic test..."
 
           # Check container_ids
-          CONTAINER_IDS='${{ steps.basic-test.outputs.container_ids }}'
+          CONTAINER_IDS="${STEPS_BASIC_TEST_OUTPUTS_CONTAINER_IDS}"
           echo "Container IDs: $CONTAINER_IDS"
 
           if [ -z "$CONTAINER_IDS" ] || [ "$CONTAINER_IDS" = "null" ]; then
@@ -112,6 +112,9 @@ jobs:
           }
 
           echo "Basic test outputs validated ✅"
+
+        env:
+          STEPS_BASIC_TEST_OUTPUTS_CONTAINER_IDS: ${{ steps.basic-test.outputs.container_ids }}
 
   ### Test Multiple Instances ###
   test-multiple-instances:
@@ -188,7 +191,7 @@ jobs:
         shell: bash
         run: |
           # Validate multiple instances
-          INSTANCES='${{ steps.multi-test.outputs.instances }}'
+          INSTANCES="${STEPS_MULTI_TEST_OUTPUTS_INSTANCES}"
           echo "Instances JSON:"
           echo "$INSTANCES" | jq '.'
 
@@ -225,6 +228,9 @@ jobs:
           fi
 
           echo "Multiple instances validated ✅"
+
+        env:
+          STEPS_MULTI_TEST_OUTPUTS_INSTANCES: ${{ steps.multi-test.outputs.instances }}
 
   ### Test Persistent Container ###
   test-persistent:
@@ -294,7 +300,7 @@ jobs:
         run: |
           # Verify container still running
           CONTAINER_ID=$(echo \
-            '${{ steps.persistent.outputs.container_ids }}' | \
+            "${STEPS_PERSISTENT_OUTPUTS_CONTAINER_IDS}" | \
             jq -r '.[0]')
 
           echo "Container ID: $CONTAINER_ID"
@@ -333,6 +339,9 @@ jobs:
             echo "Warning: Container not yet ready for HTTP"
           fi
 
+        env:
+          STEPS_PERSISTENT_OUTPUTS_CONTAINER_IDS: ${{ steps.persistent.outputs.container_ids }}
+
       # Access from another step
       - name: 'Access Gerrit from subsequent step'
         shell: bash
@@ -340,11 +349,14 @@ jobs:
           # Access Gerrit from subsequent step
           echo "Accessing Gerrit in a new step..."
 
-          INSTANCES='${{ steps.persistent.outputs.instances }}'
+          INSTANCES="${STEPS_PERSISTENT_OUTPUTS_INSTANCES}"
           IP=$(echo "$INSTANCES" | jq -r '.persistent.ip')
 
           echo "Gerrit IP: $IP"
           echo "Container is still accessible from new step ✅"
+
+        env:
+          STEPS_PERSISTENT_OUTPUTS_INSTANCES: ${{ steps.persistent.outputs.instances }}
 
       # Manual cleanup
       - name: 'Manual cleanup'
@@ -353,7 +365,7 @@ jobs:
         run: |
           # Manual cleanup
           CONTAINER_ID=$(echo \
-            '${{ steps.persistent.outputs.container_ids }}' | \
+            "${STEPS_PERSISTENT_OUTPUTS_CONTAINER_IDS}" | \
             jq -r '.[0]')
 
           if [ -n "$CONTAINER_ID" ] && [ "$CONTAINER_ID" != "null" ]; then
@@ -362,6 +374,9 @@ jobs:
               echo "Container already stopped"
             echo "Cleanup complete ✅"
           fi
+
+        env:
+          STEPS_PERSISTENT_OUTPUTS_CONTAINER_IDS: ${{ steps.persistent.outputs.container_ids }}
 
   ### Test Input Validation ###
   test-validation:
@@ -513,26 +528,39 @@ jobs:
             echo ""
             echo "| Test | Status |"
             echo "|------|--------|"
-            echo "| Basic Functionality | ${{ needs.test-basic.result }} |"
+            echo "| Basic Functionality | ${NEEDS_TEST_BASIC_RESULT} |"
           # yamllint disable-line rule:line-length
-            echo "| Multiple Instances | ${{ needs.test-multiple-instances.result }} |"  # yamllint disable-line rule:line-length
+            echo "| Multiple Instances | ${NEEDS_TEST_MULTIPLE_INSTANCES_RESULT} |"  # yamllint disable-line rule:line-length
           # yamllint disable-line rule:line-length
-            echo "| Persistent Container | ${{ needs.test-persistent.result }} |"  # yamllint disable-line rule:line-length
-            echo "| Input Validation | ${{ needs.test-validation.result }} |"
-            echo "| No Cache | ${{ needs.test-no-cache.result }} |"
+            echo "| Persistent Container | ${NEEDS_TEST_PERSISTENT_RESULT} |"  # yamllint disable-line rule:line-length
+            echo "| Input Validation | ${NEEDS_TEST_VALIDATION_RESULT} |"
+            echo "| No Cache | ${NEEDS_TEST_NO_CACHE_RESULT} |"
           } >> "$GITHUB_STEP_SUMMARY"
+        env:
+          NEEDS_TEST_BASIC_RESULT: ${{ needs.test-basic.result }}
+          NEEDS_TEST_MULTIPLE_INSTANCES_RESULT: ${{ needs.test-multiple-instances.result }}
+          NEEDS_TEST_PERSISTENT_RESULT: ${{ needs.test-persistent.result }}
+          NEEDS_TEST_VALIDATION_RESULT: ${{ needs.test-validation.result }}
+          NEEDS_TEST_NO_CACHE_RESULT: ${{ needs.test-no-cache.result }}
 
       - name: 'Check for failures'
         shell: bash
         run: |
           # Check for failures
-          if [ "${{ needs.test-basic.result }}" != "success" ] || \
-             [ "${{ needs.test-multiple-instances.result }}" != "success" ] || \  # yamllint disable-line rule:line-length
-             [ "${{ needs.test-persistent.result }}" != "success" ] || \
-             [ "${{ needs.test-validation.result }}" != "success" ] || \
-             [ "${{ needs.test-no-cache.result }}" != "success" ]; then
+          if [ "${NEEDS_TEST_BASIC_RESULT}" != "success" ] || \
+             [ "${NEEDS_TEST_MULTIPLE_INSTANCES_RESULT}" != "success" ] || \
+             [ "${NEEDS_TEST_PERSISTENT_RESULT}" != "success" ] || \
+             [ "${NEEDS_TEST_VALIDATION_RESULT}" != "success" ] || \
+             [ "${NEEDS_TEST_NO_CACHE_RESULT}" != "success" ]; then
             echo "::error::Some tests failed ❌"
             exit 1
           fi
 
           echo "All tests passed! ✅"
+
+        env:
+          NEEDS_TEST_BASIC_RESULT: ${{ needs.test-basic.result }}
+          NEEDS_TEST_MULTIPLE_INSTANCES_RESULT: ${{ needs.test-multiple-instances.result }}
+          NEEDS_TEST_PERSISTENT_RESULT: ${{ needs.test-persistent.result }}
+          NEEDS_TEST_VALIDATION_RESULT: ${{ needs.test-validation.result }}
+          NEEDS_TEST_NO_CACHE_RESULT: ${{ needs.test-no-cache.result }}

@@ -29,6 +29,7 @@ import sys
 from pathlib import Path
 from typing import Any
 from unittest.mock import MagicMock, patch
+from urllib.parse import urlparse
 
 import pytest
 import requests
@@ -2333,11 +2334,14 @@ class TestStartInstance:
                 "test-image:latest",
             )
 
-        # Check canonical_url includes tunnel host
+        # Check canonical_url includes tunnel host and port. Parse the URL
+        # and compare the host/port components exactly rather than matching
+        # substrings, which would also accept lookalike hosts.
         cfg_args = mock_cfg.call_args
         canonical_url = cfg_args[0][2]  # 3rd positional arg
-        assert "tunnel.example.com" in canonical_url
-        assert "9080" in canonical_url
+        parsed = urlparse(canonical_url)
+        assert parsed.hostname == "tunnel.example.com"
+        assert parsed.port == 9080
 
     def test_container_ip_failure_handled(self, tmp_path: Path) -> None:
         docker, instance, config, api_store, inst_store = self._setup_mocks(tmp_path)

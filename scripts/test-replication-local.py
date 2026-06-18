@@ -354,7 +354,13 @@ def _start_container(
           username = {username}
           password = {password}
     """)
-    (etc_dir / "secure.config").write_text(secure_config)
+    secure_path = etc_dir / "secure.config"
+    # Create the file with owner-only permissions before writing the
+    # credentials so they are never briefly world-readable on disk. This
+    # matches the 0600 mode Gerrit itself enforces on secure.config.
+    secure_path.touch(mode=0o600, exist_ok=True)
+    secure_path.chmod(0o600)
+    secure_path.write_text(secure_config)
 
     # Ensure the git directory exists
     git_dir = work_dir / "git"

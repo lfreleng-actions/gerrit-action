@@ -392,7 +392,7 @@ class TestFetchGithubHostKeys:
             stderr="",
         )
         result = fetch_github_host_keys()
-        assert "github.com" in result
+        assert result.split()[0] == "github.com"
         assert "AAAAC3scanresult" in result
 
     @patch("g2p_setup.subprocess.run")

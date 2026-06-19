@@ -554,6 +554,8 @@ runs:
         INPUT_PLUGIN_VERSION: ${{ inputs.plugin_version }}
         INPUT_SYNC_ON_STARTUP: ${{ inputs.sync_on_startup }}
         INPUT_ENABLE_CACHE: ${{ inputs.enable_cache }}
+        INPUT_SSH_AUTH_KEYS_SECONDARY: ${{ inputs.ssh_auth_keys_secondary }}
+        INPUT_SSH_AUTH_USERNAME_SECONDARY: ${{ inputs.ssh_auth_username_secondary }}
       # The only $GITHUB_ENV writes below are WORK_DIR and
       # INSTANCE_COUNT. WORK_DIR is a PID-based /tmp path (consumed by
       # later steps) and is not user-controllable. INSTANCE_COUNT is
@@ -622,6 +624,21 @@ runs:
         FETCH_EVERY="$INPUT_FETCH_EVERY"
         if ! [[ "$FETCH_EVERY" =~ ^[0-9]+[smhSMH]?$ ]]; then
           echo "::error::fetch_every must be a valid interval (e.g., '60s', '5m', '1h', or '0' to disable) ❌"
+          exit 1
+        fi
+
+        # Validate the optional secondary SSH user inputs as a pair.
+        # They are documented as mutually required (see
+        # ssh_auth_keys_secondary / ssh_auth_username_secondary), and
+        # the "Add SSH authentication keys (secondary user)" step is
+        # gated on BOTH being non-empty. Without this check a caller
+        # that sets only one would have the secondary user silently
+        # skipped rather than getting an actionable error.
+        if { [ -n "$INPUT_SSH_AUTH_KEYS_SECONDARY" ] && \
+             [ -z "$INPUT_SSH_AUTH_USERNAME_SECONDARY" ]; } || \
+           { [ -z "$INPUT_SSH_AUTH_KEYS_SECONDARY" ] && \
+             [ -n "$INPUT_SSH_AUTH_USERNAME_SECONDARY" ]; }; then
+          echo "::error::ssh_auth_keys_secondary and ssh_auth_username_secondary must be set together ❌"
           exit 1
         fi
 

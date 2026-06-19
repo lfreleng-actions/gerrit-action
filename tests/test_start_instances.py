@@ -863,6 +863,70 @@ class TestGenerateReplicationConfig:
             "generate_replication_config for the rationale."
         )
 
+    def test_meta_refs_excludes_magic_projects_from_primary(
+        self, tmp_path: Path
+    ) -> None:
+        """Primary remote excludes All-Projects / All-Users.
+
+        When ``replicate_meta_refs`` is on the primary remote gains a
+        ``+refs/meta/*`` wildcard.  With no ``project`` filter set the
+        primary remote would otherwise replicate every project,
+        including the magic ``All-Projects`` / ``All-Users`` repos,
+        letting that wildcard pull ``All-Projects:refs/meta/config``
+        and hijack the local Administrators-group ACL (the same
+        failure mode the magic-repo remote avoids).  The fix emits
+        ``excludeProjects`` lines on the primary remote so its
+        wildcard can never reach the magic projects — only the
+        curated ``<slug>-meta`` remote touches them.
+        """
+        config_file = tmp_path / "replication.config"
+        config = _make_config(replicate_meta_refs=True)
+
+        start_instances.generate_replication_config(
+            config_file,
+            "onap",
+            "gerrit.example.org",
+            "",
+            "gerrit",
+            29418,
+            "",
+            config,
+        )
+
+        content = config_file.read_text()
+        # Restrict the assertions to the PRIMARY remote section so we
+        # don't accidentally match the magic-repo remote's own
+        # ``projects = All-Users`` / ``projects = All-Projects`` lines.
+        primary_section = content.split('[remote "onap-meta"]', 1)[0]
+        assert "excludeProjects = All-Projects" in primary_section, (
+            "primary remote must exclude All-Projects so its "
+            "refs/meta/* wildcard cannot pull All-Projects:"
+            "refs/meta/config and hijack the local ACL"
+        )
+        assert "excludeProjects = All-Users" in primary_section, (
+            "primary remote must exclude All-Users so its "
+            "refs/meta/* wildcard cannot pull All-Users meta refs"
+        )
+
+    def test_meta_refs_no_exclude_when_disabled(self, tmp_path: Path) -> None:
+        """No ``excludeProjects`` lines when meta-ref sync is off."""
+        config_file = tmp_path / "replication.config"
+        config = _make_config(replicate_meta_refs=False)
+
+        start_instances.generate_replication_config(
+            config_file,
+            "onap",
+            "gerrit.example.org",
+            "",
+            "gerrit",
+            29418,
+            "",
+            config,
+        )
+
+        content = config_file.read_text()
+        assert "excludeProjects" not in content
+
     def test_meta_refs_no_duplicate_when_user_specified(self, tmp_path: Path) -> None:
         """Operator-specified ``refs/meta/*`` is not duplicated."""
         config_file = tmp_path / "replication.config"

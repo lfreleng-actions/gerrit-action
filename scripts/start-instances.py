@@ -493,6 +493,30 @@ def generate_replication_config(
     if project:
         lines.append(f"  projects = {project}")
 
+    # When meta-ref replication is on, the primary remote carries a
+    # ``+refs/meta/*`` wildcard (appended above).  With an empty
+    # ``project`` filter the primary remote replicates ALL projects
+    # (including ``All-Projects`` and ``All-Users``); even with a
+    # ``project`` filter set, an operator could write a pattern that
+    # matches them.  In either case that wildcard could pull
+    # ``All-Projects:refs/meta/config`` over the top of the deployed
+    # container's locally-bootstrapped global ACL — the exact
+    # Administrators-group hijack the magic-repo remote below goes to
+    # great lengths to avoid.  The dedicated ``<slug>-meta`` remote is
+    # the only path that should ever touch the magic projects (and it
+    # enumerates NoteDb refs precisely so it never fetches
+    # ``refs/meta/config``).  We therefore emit ``excludeProjects``
+    # for both magic projects *unconditionally* whenever
+    # ``replicate_meta_refs`` is enabled — independent of the
+    # ``project`` filter — so the primary remote's wildcard can never
+    # reach them.  The pull-replication plugin (a fork of the
+    # ``replication`` plugin) supports ``excludeProjects`` for exactly
+    # this: a project must match a ``projects`` pattern AND not match
+    # any ``excludeProjects`` pattern to be replicated.
+    if config.replicate_meta_refs:
+        lines.append("  excludeProjects = All-Projects")
+        lines.append("  excludeProjects = All-Users")
+
     # When meta-ref replication is enabled, emit a second remote that
     # targets Gerrit's ``All-Users`` and ``All-Projects`` repositories
     # with the broader set of refspecs they need.  These are the

@@ -392,7 +392,7 @@ class TestFetchGithubHostKeys:
             stderr="",
         )
         result = fetch_github_host_keys()
-        assert "github.com" in result
+        assert result.split()[0] == "github.com"
         assert "AAAAC3scanresult" in result
 
     @patch("g2p_setup.subprocess.run")
@@ -721,7 +721,24 @@ class TestSetupG2pHooks:
         exec_calls = [c[0][1] for c in docker.exec_cmd.call_args_list]
         assert any(f"mkdir -p {GERRIT_HOOKS_DIR}" in c for c in exec_calls)
 
-    def test_symlink_target_points_to_venv_bin(self) -> None:
+    def test_wrapper_installed_at_hook_path(self) -> None:
+        """The wrapper script is copied to the expected hook path.
+
+        We replaced the previous bare ``ln -sf`` symlink with a thin
+        POSIX-shell wrapper so every Gerrit hook invocation is teed
+        to ``/var/gerrit/logs/g2p-hooks.log``.  This test asserts the
+        destination side of the install: ``docker.cp`` is invoked
+        with the canonical ``<cid>:<GERRIT_HOOKS_DIR>/<hook>`` path,
+        which is the location Gerrit's hooks plugin loads from.
+
+        We do not inspect the wrapper *body* here because
+        ``_write_file_in_container`` deletes the temp source file as
+        soon as ``docker.cp`` returns, so the file content is no
+        longer reachable from the mock's call args.  The wrapper's
+        ``TARGET=`` line is exercised by the in-container
+        ``selftest_g2p_plumbing`` checks once the container is
+        running.
+        """
         docker = _make_docker_mock(exec_test_return=True)
         config = G2PConfig(
             enabled=True,
@@ -729,10 +746,17 @@ class TestSetupG2pHooks:
             hooks=["patchset-created"],
         )
         setup_g2p_hooks(docker, CID, config)
-        exec_calls = [c[0][1] for c in docker.exec_cmd.call_args_list]
-        expected_target = f"{GERRIT_TOOLS_VENV_BIN}/patchset-created"
-        expected_path = f"{GERRIT_HOOKS_DIR}/patchset-created"
-        assert any(f"ln -sf {expected_target} {expected_path}" in c for c in exec_calls)
+        # Assert the destination passed to docker.cp is the
+        # canonical hook path inside the container.
+        assert docker.cp.called, "expected docker.cp() call to install wrapper"
+        cp_calls = docker.cp.call_args_list
+        wrapper_paths = [c[0][1] for c in cp_calls]
+        # docker.cp's destination is rendered as ``<cid>:<path>``,
+        # not the bare path, so match against that combined form.
+        expected = f"{CID}:{GERRIT_HOOKS_DIR}/patchset-created"
+        assert any(p == expected for p in wrapper_paths), (
+            f"expected {expected} in cp calls; saw {wrapper_paths}"
+        )
 
     def test_skips_missing_binary(self) -> None:
         docker = _make_docker_mock(exec_test_return=False)
@@ -746,8 +770,11 @@ class TestSetupG2pHooks:
 
     def test_partial_availability(self) -> None:
         docker = _make_docker_mock()
-        # First call: patchset-created exists, second: comment-added missing
-        docker.exec_test.side_effect = [True, False]
+        # exec_test call sequence:
+        #   1. hooks.jar present?         -> True
+        #   2. patchset-created binary?    -> True
+        #   3. comment-added binary?       -> False
+        docker.exec_test.side_effect = [True, True, False]
         config = G2PConfig(
             enabled=True,
             github_owner="test",
@@ -776,7 +803,17 @@ class TestSetupG2pHooks:
         enabled = setup_g2p_hooks(docker, CID, config)
         assert enabled == ["change-merged"]
 
-    def test_sets_hook_ownership(self) -> None:
+    def test_creates_log_file_with_gerrit_ownership(self) -> None:
+        """The hook log file is pre-created with gerrit ownership.
+
+        The wrapper appends to ``G2P_HOOK_LOG``; pre-creating it as
+        root with ``chown gerrit:gerrit`` avoids a race on the very
+        first hook invocation and lets operators ``tail -F`` it from
+        container start.  This test guards that the chown command
+        runs as root and targets the documented log path.
+        """
+        from g2p_setup import G2P_HOOK_LOG
+
         docker = _make_docker_mock(exec_test_return=True)
         config = G2PConfig(
             enabled=True,
@@ -785,8 +822,10 @@ class TestSetupG2pHooks:
         )
         setup_g2p_hooks(docker, CID, config)
         exec_calls = [c[0][1] for c in docker.exec_cmd.call_args_list]
-        hook_path = f"{GERRIT_HOOKS_DIR}/patchset-created"
-        assert any(f"chown -h gerrit:gerrit {hook_path}" in c for c in exec_calls)
+        assert any(
+            f"touch {G2P_HOOK_LOG}" in c and f"chown gerrit:gerrit {G2P_HOOK_LOG}" in c
+            for c in exec_calls
+        )
 
 
 # ===================================================================
@@ -812,9 +851,10 @@ class TestSetupG2pSsh:
                 stdout="ssh-ed25519 AAAApubkey gerrit-action-g2p",
                 stderr="",
             )
-            public_key = setup_g2p_ssh(docker, CID, config)
+            public_key, private_key = setup_g2p_ssh(docker, CID, config)
 
         assert public_key.startswith("ssh-ed25519")
+        assert "BEGIN OPENSSH PRIVATE KEY" in private_key
         docker.cp.assert_called()
 
     def test_auto_generates_keypair(self) -> None:
@@ -830,9 +870,10 @@ class TestSetupG2pSsh:
                 "-----BEGIN KEY-----\nprivate\n-----END KEY-----",
                 "ssh-ed25519 AAAAgenerated gerrit-action-g2p",
             )
-            public_key = setup_g2p_ssh(docker, CID, config)
+            public_key, private_key = setup_g2p_ssh(docker, CID, config)
 
         assert "AAAAgenerated" in public_key
+        assert "private" in private_key
         mock_keygen.assert_called_once()
 
     def test_keygen_failure_is_warning_not_error(self) -> None:
@@ -846,9 +887,10 @@ class TestSetupG2pSsh:
         with patch("g2p_setup.generate_ssh_keypair") as mock_keygen:
             mock_keygen.side_effect = G2PSetupError("keygen failed")
             # Should not raise
-            public_key = setup_g2p_ssh(docker, CID, config)
+            public_key, private_key = setup_g2p_ssh(docker, CID, config)
 
         assert public_key == ""
+        assert private_key == ""
 
     def test_creates_ssh_directory(self) -> None:
         docker = _make_docker_mock(exec_cmd_return="0")
@@ -996,7 +1038,7 @@ class TestSetupG2p:
         mock_ini.return_value = G2P_INI_PATH
         mock_repl_remote.return_value = True
         mock_hooks.return_value = ["patchset-created", "comment-added"]
-        mock_ssh.return_value = "ssh-ed25519 AAAAkey"
+        mock_ssh.return_value = ("ssh-ed25519 AAAAkey", "-----BEGIN KEY-----")
 
         docker = _make_docker_mock()
         config = G2PConfig(
@@ -1039,7 +1081,7 @@ class TestSetupG2p:
         mock_ini.return_value = G2P_INI_PATH
         mock_repl_remote.return_value = False
         mock_hooks.return_value = []
-        mock_ssh.return_value = ""
+        mock_ssh.return_value = ("", "")
 
         docker = _make_docker_mock()
         config = G2PConfig(enabled=True, github_owner="test")

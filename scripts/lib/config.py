@@ -164,6 +164,22 @@ class ActionConfig:
     require_replication_success: bool = False
     replication_wait_timeout: int = 180
 
+    # NoteDb meta-ref replication.  When true, the action also pulls
+    # the refs that hold Gerrit's open changes, account identities,
+    # external IDs, groups and sequences so the deployed CI Gerrit can
+    # render open changes from the source server.  See
+    # ``generate_replication_config`` for the exact refspecs.
+    #
+    # Off by default because it materially increases initial sync
+    # size on instances with large review histories.
+    replicate_meta_refs: bool = False
+
+    # Run an online reindex (and cache flush) inside each container
+    # after the initial pull-replication sync completes.  Required
+    # for the Gerrit UI to actually show changes that landed via
+    # replicated ``refs/changes/*`` and account/group refs.
+    reindex_after_sync: bool = False
+
     # Behaviour
     check_service: bool = True
     exit: bool = False
@@ -172,6 +188,17 @@ class ActionConfig:
     debug: bool = False
     use_api_path: bool = False
     max_projects: int = 500
+    # When true (the default), the project list fetched from the
+    # source Gerrit is restricted to projects in state ``ACTIVE``,
+    # i.e. ``READ_ONLY`` (archived) and ``HIDDEN`` projects are
+    # excluded.  This is implemented at the REST query level via
+    # ``?state=ACTIVE`` so the source Gerrit does the filtering and
+    # we never enumerate archived projects locally.  Set to false
+    # via the ``SKIP_ARCHIVED_PROJECTS=false`` env var (or the
+    # equivalent ``skip_archived_projects`` action input) to mirror
+    # archived projects too — useful when debugging a specific
+    # archived repository, at the cost of a longer replication.
+    skip_archived_projects: bool = True
 
     # Tunnelling
     tunnel_host: str = ""
@@ -327,6 +354,8 @@ class ActionConfig:
                 env("REQUIRE_REPLICATION_SUCCESS", "false")
             ),
             replication_wait_timeout=int(env("REPLICATION_WAIT_TIMEOUT", "180")),
+            replicate_meta_refs=_str_to_bool(env("REPLICATE_META_REFS", "false")),
+            reindex_after_sync=_str_to_bool(env("REINDEX_AFTER_SYNC", "false")),
             check_service=_str_to_bool(env("CHECK_SERVICE", "true")),
             exit=_str_to_bool(env("EXIT", "false")),
             enable_cache=_str_to_bool(env("ENABLE_CACHE", "false")),
@@ -334,6 +363,7 @@ class ActionConfig:
             debug=_str_to_bool(env("DEBUG", "false")),
             use_api_path=_str_to_bool(env("USE_API_PATH", "false")),
             max_projects=default_max_projects,
+            skip_archived_projects=_str_to_bool(env("SKIP_ARCHIVED_PROJECTS", "true")),
             tunnel_host=env("TUNNEL_HOST", ""),
             tunnel_ports_json=env("TUNNEL_PORTS", ""),
             ssh_auth_keys=env("SSH_AUTH_KEYS", ""),

@@ -23,11 +23,13 @@ from __future__ import annotations
 import importlib
 import importlib.util
 import json
+import logging
 import subprocess
 import sys
 from pathlib import Path
 from typing import Any
 from unittest.mock import MagicMock, patch
+from urllib.parse import urlparse
 
 import pytest
 import requests
@@ -97,6 +99,8 @@ def _make_config(**overrides: Any) -> ActionConfig:
         "fetch_every": "60s",
         "require_replication_success": False,
         "replication_wait_timeout": 180,
+        "replicate_meta_refs": False,
+        "reindex_after_sync": False,
         "check_service": True,
         "exit": False,
         "enable_cache": False,
@@ -524,6 +528,37 @@ class TestFetchRemoteProjects:
         url = mock_get.call_args[0][0]
         assert "n=42" in url
 
+    def test_skip_archived_default_appends_state_active(self) -> None:
+        """Default config skips archived via ``?state=ACTIVE``."""
+        config = _make_config()
+        assert config.skip_archived_projects is True
+        mock_resp = MagicMock()
+        mock_resp.text = ")]}'\n{}"
+        mock_resp.raise_for_status.return_value = None
+
+        with patch("start_instances.requests.get", return_value=mock_resp) as mock_get:
+            start_instances.fetch_remote_projects(
+                "gerrit.example.org", "", "", 100, config
+            )
+
+        url = mock_get.call_args[0][0]
+        assert "state=ACTIVE" in url
+
+    def test_include_archived_omits_state_param(self) -> None:
+        """``skip_archived_projects=False`` keeps the legacy URL shape."""
+        config = _make_config(skip_archived_projects=False)
+        mock_resp = MagicMock()
+        mock_resp.text = ")]}'\n{}"
+        mock_resp.raise_for_status.return_value = None
+
+        with patch("start_instances.requests.get", return_value=mock_resp) as mock_get:
+            start_instances.fetch_remote_projects(
+                "gerrit.example.org", "", "", 100, config
+            )
+
+        url = mock_get.call_args[0][0]
+        assert "state=" not in url
+
 
 # =====================================================================
 # generate_replication_config
@@ -685,6 +720,248 @@ class TestGenerateReplicationConfig:
 
         content = config_file.read_text()
         assert '[remote "my-slug"]' in content
+
+    def test_meta_refs_disabled_by_default(self, tmp_path: Path) -> None:
+        """Default config omits NoteDb meta refs and the magic-repo remote."""
+        config_file = tmp_path / "replication.config"
+        config = _make_config()
+        assert config.replicate_meta_refs is False
+
+        start_instances.generate_replication_config(
+            config_file,
+            "test",
+            "gerrit.example.org",
+            "",
+            "gerrit",
+            29418,
+            "",
+            config,
+        )
+
+        content = config_file.read_text()
+        assert '[remote "test-meta"]' not in content
+        assert "refs/meta/*:refs/meta/*" not in content
+        assert "refs/users/*:refs/users/*" not in content
+        assert "projects = All-Users" not in content
+
+    def test_meta_refs_emits_extra_per_project_refspecs(self, tmp_path: Path) -> None:
+        """Per-project remote gains meta + cache-automerge refspecs."""
+        config_file = tmp_path / "replication.config"
+        config = _make_config(replicate_meta_refs=True)
+
+        start_instances.generate_replication_config(
+            config_file,
+            "test",
+            "gerrit.example.org",
+            "",
+            "gerrit",
+            29418,
+            "",
+            config,
+        )
+
+        content = config_file.read_text()
+        assert "fetch = +refs/meta/*:refs/meta/*" in content
+        assert "fetch = +refs/cache-automerge/*:refs/cache-automerge/*" in content
+        # Sanity: pre-existing default refspecs still present.
+        assert "fetch = +refs/heads/*:refs/heads/*" in content
+
+    def test_meta_refs_emits_magic_repo_remote(self, tmp_path: Path) -> None:
+        """A second ``<slug>-meta`` remote targets All-Users / All-Projects."""
+        config_file = tmp_path / "replication.config"
+        config = _make_config(replicate_meta_refs=True)
+
+        start_instances.generate_replication_config(
+            config_file,
+            "onap",
+            "gerrit.example.org",
+            "",
+            "gerrit",
+            29418,
+            "",
+            config,
+        )
+
+        content = config_file.read_text()
+        assert '[remote "onap-meta"]' in content
+        # The enumerated NoteDb refspecs are present.  The magic-repo
+        # remote intentionally uses explicit ref names (rather than a
+        # ``refs/meta/*`` wildcard) so the source server's
+        # ``refs/meta/config`` is never pulled — see the rationale
+        # in ``generate_replication_config`` for why that matters.
+        for refspec in (
+            "fetch = +refs/users/*:refs/users/*",
+            "fetch = +refs/groups/*:refs/groups/*",
+            "fetch = +refs/meta/external-ids:refs/meta/external-ids",
+            "fetch = +refs/meta/group-names:refs/meta/group-names",
+            "fetch = +refs/draft-comments/*:refs/draft-comments/*",
+            "fetch = +refs/starred-changes/*:refs/starred-changes/*",
+            "fetch = +refs/sequences/*:refs/sequences/*",
+            "fetch = +refs/meta/version:refs/meta/version",
+        ):
+            assert refspec in content, f"missing: {refspec}"
+        # Both magic projects listed explicitly
+        assert "projects = All-Users" in content
+        assert "projects = All-Projects" in content
+        # Magic-repo remote must NOT create missing repos (Gerrit
+        # owns them already) and must allow hidden replication so
+        # All-Users is reachable.
+        assert "createMissingRepositories = false" in content
+        assert "replicateHiddenProjects = true" in content
+
+    def test_meta_refs_excludes_refs_meta_config(self, tmp_path: Path) -> None:
+        """refs/meta/config must NEVER appear in the magic-repo remote.
+
+        Replicating ``All-Projects:refs/meta/config`` from the source
+        server overwrites the deployed container's locally-bootstrapped
+        global ACL.  The fallout is severe and silent: the
+        ``Administrators`` group reference resolves to the source
+        server's UUID, the bootstrap admin account (1000000) is no
+        longer in any admin group, and every REST call gated on
+        ``administrate-server`` / ``maintain-server`` (notably the
+        reindex and cache-flush endpoints used by
+        ``scripts/reindex.py``) returns HTTP 403.  This regression
+        was observed in three consecutive dispatches before the
+        wildcard was replaced with the enumerated refspec list.
+
+        Pinning the exclusion explicitly here ensures a future
+        "helpful" patch that re-introduces ``+refs/meta/*`` fails
+        loudly.
+        """
+        config_file = tmp_path / "replication.config"
+        config = _make_config(replicate_meta_refs=True)
+
+        start_instances.generate_replication_config(
+            config_file,
+            "onap",
+            "gerrit.example.org",
+            "",
+            "gerrit",
+            29418,
+            "",
+            config,
+        )
+
+        content = config_file.read_text()
+        # The literal refspec ``refs/meta/config`` must not appear as
+        # a fetch line, and the wildcard form must not appear inside
+        # the magic-repo remote either.
+        magic_remote_section = content.split('[remote "onap-meta"]', 1)[1]
+        # End the magic-remote section at the next top-level header
+        # (or end-of-file) so we don't accidentally see fetch lines
+        # from a different remote.
+        magic_remote_section = magic_remote_section.split("\n[", 1)[0]
+        assert "refs/meta/config" not in magic_remote_section, (
+            f"refs/meta/config must be excluded from the magic-repo "
+            f"remote (ACL hijack risk); found in section:\n"
+            f"{magic_remote_section}"
+        )
+        assert "+refs/meta/*:refs/meta/*" not in magic_remote_section, (
+            "The blanket refs/meta/* wildcard was re-introduced in "
+            "the magic-repo remote; this pulls refs/meta/config and "
+            "hijacks the local global ACL.  See the comment in "
+            "generate_replication_config for the rationale."
+        )
+
+    def test_meta_refs_excludes_magic_projects_from_primary(
+        self, tmp_path: Path
+    ) -> None:
+        """Primary remote excludes All-Projects / All-Users.
+
+        When ``replicate_meta_refs`` is on the primary remote gains a
+        ``+refs/meta/*`` wildcard.  With no ``project`` filter set the
+        primary remote would otherwise replicate every project,
+        including the magic ``All-Projects`` / ``All-Users`` repos,
+        letting that wildcard pull ``All-Projects:refs/meta/config``
+        and hijack the local Administrators-group ACL (the same
+        failure mode the magic-repo remote avoids).  The fix emits
+        ``excludeProjects`` lines on the primary remote so its
+        wildcard can never reach the magic projects — only the
+        curated ``<slug>-meta`` remote touches them.
+        """
+        config_file = tmp_path / "replication.config"
+        config = _make_config(replicate_meta_refs=True)
+
+        start_instances.generate_replication_config(
+            config_file,
+            "onap",
+            "gerrit.example.org",
+            "",
+            "gerrit",
+            29418,
+            "",
+            config,
+        )
+
+        content = config_file.read_text()
+        # Restrict the assertions to the PRIMARY remote section so we
+        # don't accidentally match the magic-repo remote's own
+        # ``projects = All-Users`` / ``projects = All-Projects`` lines.
+        primary_section = content.split('[remote "onap-meta"]', 1)[0]
+        assert "excludeProjects = All-Projects" in primary_section, (
+            "primary remote must exclude All-Projects so its "
+            "refs/meta/* wildcard cannot pull All-Projects:"
+            "refs/meta/config and hijack the local ACL"
+        )
+        assert "excludeProjects = All-Users" in primary_section, (
+            "primary remote must exclude All-Users so its "
+            "refs/meta/* wildcard cannot pull All-Users meta refs"
+        )
+
+    def test_meta_refs_no_exclude_when_disabled(self, tmp_path: Path) -> None:
+        """No ``excludeProjects`` lines when meta-ref sync is off."""
+        config_file = tmp_path / "replication.config"
+        config = _make_config(replicate_meta_refs=False)
+
+        start_instances.generate_replication_config(
+            config_file,
+            "onap",
+            "gerrit.example.org",
+            "",
+            "gerrit",
+            29418,
+            "",
+            config,
+        )
+
+        content = config_file.read_text()
+        assert "excludeProjects" not in content
+
+    def test_meta_refs_no_duplicate_when_user_specified(self, tmp_path: Path) -> None:
+        """Operator-specified ``refs/meta/*`` is not duplicated."""
+        config_file = tmp_path / "replication.config"
+        config = _make_config(
+            sync_refs="+refs/heads/*:refs/heads/*,+refs/meta/*:refs/meta/*",
+            replicate_meta_refs=True,
+        )
+
+        start_instances.generate_replication_config(
+            config_file,
+            "test",
+            "gerrit.example.org",
+            "",
+            "gerrit",
+            29418,
+            "",
+            config,
+        )
+
+        content = config_file.read_text()
+        # Only the per-project remote section's ``fetch =`` lines
+        # should be considered for the de-dup check.  The magic-repo
+        # remote section uses enumerated ``refs/meta/<name>``
+        # refspecs (no ``refs/meta/*`` wildcard — see the rationale
+        # in ``generate_replication_config`` for why) so it does NOT
+        # contain ``+refs/meta/*:refs/meta/*`` and would not collide
+        # with the per-project remote's wildcard anyway.  We slice
+        # at the magic-repo header purely to keep this assertion
+        # robust if the magic-repo refspec list ever grows to
+        # include some other ``refs/meta/*`` variant.
+        per_project = content.split('[remote "test-meta"]')[0]
+        meta_count = per_project.count("fetch = +refs/meta/*:refs/meta/*")
+        assert meta_count == 1, (
+            f"expected per-project remote to list refs/meta/* once, got {meta_count}"
+        )
 
     def test_replication_timeout_and_connection_timeout(self, tmp_path: Path) -> None:
         config_file = tmp_path / "replication.config"
@@ -850,6 +1127,72 @@ class TestGenerateSecureConfig:
 
         mode = config_file.stat().st_mode & 0o777
         assert mode == 0o600
+
+    def test_http_basic_meta_refs_disabled_no_extra_section(
+        self, tmp_path: Path
+    ) -> None:
+        """With meta-refs off, the primary remote is the only section."""
+        config_file = tmp_path / "secure.config"
+        config = _make_config(
+            auth_type="http_basic",
+            http_username="admin",
+            http_password="secret123",
+            replicate_meta_refs=False,
+        )
+
+        start_instances.generate_secure_config(config_file, "onap", config)
+
+        content = config_file.read_text()
+        assert '[remote "onap"]' in content
+        assert '[remote "onap-meta"]' not in content
+
+    def test_http_basic_meta_refs_mirrors_credentials(self, tmp_path: Path) -> None:
+        """The magic-repo remote inherits the primary credentials.
+
+        Without this duplication the pull-replication plugin falls
+        back to anonymous auth on the ``<slug>-meta`` remote and
+        the source Gerrit rejects the All-Users / All-Projects
+        fetches with ``TransportException: not authorized``.
+        """
+        config_file = tmp_path / "secure.config"
+        config = _make_config(
+            auth_type="http_basic",
+            http_username="admin",
+            http_password="secret123",
+            replicate_meta_refs=True,
+        )
+
+        start_instances.generate_secure_config(config_file, "onap", config)
+
+        content = config_file.read_text()
+        # Primary remote credentials present.
+        assert '[remote "onap"]' in content
+        # Magic-repo remote inherits the same username/password.
+        assert '[remote "onap-meta"]' in content
+        # Both sections list the credentials.
+        assert content.count("username = admin") == 2
+        assert content.count("password = secret123") == 2
+
+    def test_bearer_token_meta_refs_no_per_remote_duplication(
+        self, tmp_path: Path
+    ) -> None:
+        """Bearer-token auth applies globally; no per-remote duplication needed."""
+        config_file = tmp_path / "secure.config"
+        config = _make_config(
+            auth_type="bearer_token",
+            bearer_token="tok-xyz",
+            replicate_meta_refs=True,
+        )
+
+        start_instances.generate_secure_config(config_file, "onap", config)
+
+        content = config_file.read_text()
+        # Only the global [auth] section — no per-remote magic-repo
+        # duplication because bearer-token auth applies to every
+        # fetch via the same header.
+        assert "[auth]" in content
+        assert "bearerToken = tok-xyz" in content
+        assert '[remote "onap-meta"]' not in content
 
 
 # =====================================================================
@@ -1034,8 +1377,65 @@ class TestInitGerritSite:
         docker.run_ephemeral.assert_called_once()
         call_kwargs = docker.run_ephemeral.call_args
         assert call_kwargs[0][0] == "my-image:1.0"
-        assert call_kwargs[1]["command"] == ["init"]
+        # ``--batch`` keeps init non-interactive and
+        # ``--install-all-plugins`` ensures the bundled plugins
+        # (notably ``hooks.jar``) get copied into the mounted
+        # plugins/ directory.  Without this the mount would shadow
+        # the image's bundled set and Gerrit would start without
+        # the hooks plugin, silently breaking G2P.
+        assert call_kwargs[1]["command"] == [
+            "init",
+            "--batch",
+            "--install-all-plugins",
+        ]
         assert "CANONICAL_WEB_URL" in call_kwargs[1]["env"]
+
+    def test_appends_extra_init_args(self, tmp_path: Path) -> None:
+        """Extra init args parse with shell semantics (shlex.split)."""
+        docker = MagicMock()
+        docker.run_ephemeral.return_value = ""
+        instance_dir = tmp_path / "instance"
+
+        with patch.object(start_instances, "_chown_tree"):
+            start_instances.init_gerrit_site(
+                docker,
+                instance_dir,
+                "test",
+                "http://localhost:18080/",
+                "my-image:1.0",
+                extra_init_args="--no-auto-start --dev",
+            )
+
+        command = docker.run_ephemeral.call_args[1]["command"]
+        # Canonical leading args are preserved; extras are appended
+        # after them in the order supplied (shell-style tokenisation).
+        assert command[:3] == ["init", "--batch", "--install-all-plugins"]
+        assert command[3:] == ["--no-auto-start", "--dev"]
+
+    def test_extra_init_args_honours_quoted_values(self, tmp_path: Path) -> None:
+        """Quoted values stay as single argv tokens (shlex semantics)."""
+        docker = MagicMock()
+        docker.run_ephemeral.return_value = ""
+        instance_dir = tmp_path / "instance"
+
+        with patch.object(start_instances, "_chown_tree"):
+            start_instances.init_gerrit_site(
+                docker,
+                instance_dir,
+                "test",
+                "http://localhost:18080/",
+                "my-image:1.0",
+                extra_init_args='--config "value with spaces" --flag',
+            )
+
+        command = docker.run_ephemeral.call_args[1]["command"]
+        # The quoted ``value with spaces`` survives as a single
+        # element rather than being split on the embedded space.
+        assert command[3:] == [
+            "--config",
+            "value with spaces",
+            "--flag",
+        ]
 
     def test_volumes_map_subdirs(self, tmp_path: Path) -> None:
         docker = MagicMock()
@@ -1072,6 +1472,42 @@ class TestInitGerritSite:
                 "http://localhost:18080/",
                 "img:latest",
             )
+
+    def test_extra_init_args_raises_config_error_on_unbalanced_quote(
+        self, tmp_path: Path
+    ) -> None:
+        """Malformed ``gerrit_init_args`` produces an actionable ConfigError.
+
+        ``shlex.split`` raises ``ValueError`` on an unbalanced quote
+        (or other lexical malformation).  The previous implementation
+        let that propagate out as a bare ``ValueError`` from deep in
+        the container-start path, which surfaces in the workflow as a
+        Python stack trace with no hint that the cause was a bad
+        action input.  We now convert it to ``ConfigError`` (a
+        ``GerritActionError`` subclass) whose message names the input
+        and quotes the offending value so the user can fix it.
+        """
+        from errors import ConfigError
+
+        docker = MagicMock()
+        instance_dir = tmp_path / "instance"
+
+        with (
+            patch.object(start_instances, "_chown_tree"),
+            pytest.raises(ConfigError, match="Invalid 'gerrit_init_args'"),
+        ):
+            start_instances.init_gerrit_site(
+                docker,
+                instance_dir,
+                "test",
+                "http://localhost:18080/",
+                "img:latest",
+                # Unbalanced double quote — shlex.split raises ValueError.
+                extra_init_args='--config "unterminated',
+            )
+        # docker.run_ephemeral must NOT have been invoked: the error
+        # is raised before the command list is assembled.
+        docker.run_ephemeral.assert_not_called()
 
 
 # =====================================================================
@@ -1134,6 +1570,7 @@ class TestConfigureGerrit:
         assert len(auth_calls) == 1
 
     def test_tunnel_mode_disables_remote_admin(self, tmp_path: Path) -> None:
+        """Public tunnel disables remote plugin admin."""
         instance_dir = tmp_path / "instance"
         (instance_dir / "etc").mkdir(parents=True)
         (instance_dir / "etc" / "gerrit.config").write_text("")
@@ -1153,19 +1590,106 @@ class TestConfigureGerrit:
                 "",
                 "tunnel.example.com:12345",
                 True,
+                tunnel_host="bore.pub",
             )
 
         admin_calls = [c for c in calls_made if "plugins.allowRemoteAdmin" in c]
         assert any("false" in c for c in admin_calls)
 
-    def test_no_tunnel_enables_remote_admin(self, tmp_path: Path) -> None:
+    def test_private_tunnel_no_warning(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """Private tunnel (Tailscale) disables admin without warnings."""
         instance_dir = tmp_path / "instance"
         (instance_dir / "etc").mkdir(parents=True)
         (instance_dir / "etc" / "gerrit.config").write_text("")
 
-        calls_made = []
+        calls_made: list[list[str]] = []
 
         def record_call(*args: Any, **kwargs: Any) -> subprocess.CompletedProcess[str]:
+            """Record subprocess invocations."""
+            calls_made.append(args[0])
+            return _cp()
+
+        with (
+            caplog.at_level(logging.DEBUG, logger="start_instances"),
+            patch("start_instances.subprocess.run", side_effect=record_call),
+        ):
+            start_instances.configure_gerrit(
+                instance_dir,
+                "test",
+                "http://100.100.50.1:8080/",
+                "http://*:8080/",
+                "",
+                "100.100.50.1:29418",
+                True,
+                tunnel_host="100.100.50.1",
+            )
+
+        admin_calls = [c for c in calls_made if "plugins.allowRemoteAdmin" in c]
+        assert any("false" in c for c in admin_calls)
+
+        warning_msgs = [r for r in caplog.records if r.levelno == logging.WARNING]
+        assert len(warning_msgs) == 0
+
+        info_msgs = [
+            r
+            for r in caplog.records
+            if r.levelno == logging.INFO and "private network" in r.message
+        ]
+        assert len(info_msgs) == 1
+
+    def test_public_tunnel_emits_warning(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """Public tunnel emits security warnings about dev auth."""
+        instance_dir = tmp_path / "instance"
+        (instance_dir / "etc").mkdir(parents=True)
+        (instance_dir / "etc" / "gerrit.config").write_text("")
+
+        calls_made: list[list[str]] = []
+
+        def record_call(*args: Any, **kwargs: Any) -> subprocess.CompletedProcess[str]:
+            """Record subprocess invocations."""
+            calls_made.append(args[0])
+            return _cp()
+
+        with (
+            caplog.at_level(logging.DEBUG, logger="start_instances"),
+            patch("start_instances.subprocess.run", side_effect=record_call),
+        ):
+            start_instances.configure_gerrit(
+                instance_dir,
+                "test",
+                "http://bore.pub:8080/",
+                "http://*:8080/",
+                "",
+                "bore.pub:12345",
+                True,
+                tunnel_host="bore.pub",
+            )
+
+        admin_calls = [c for c in calls_made if "plugins.allowRemoteAdmin" in c]
+        assert any("false" in c for c in admin_calls)
+
+        warning_msgs = [
+            r
+            for r in caplog.records
+            if r.levelno == logging.WARNING
+            and "DEVELOPMENT_BECOME_ANY_ACCOUNT" in r.message
+        ]
+        assert len(warning_msgs) >= 1
+
+    def test_no_tunnel_enables_remote_admin(self, tmp_path: Path) -> None:
+        """No tunnel enables remote plugin admin."""
+        instance_dir = tmp_path / "instance"
+        (instance_dir / "etc").mkdir(parents=True)
+        (instance_dir / "etc" / "gerrit.config").write_text("")
+
+        calls_made: list[list[str]] = []
+
+        def record_call(*args: Any, **kwargs: Any) -> subprocess.CompletedProcess[str]:
+            """Record subprocess invocations."""
             calls_made.append(args[0])
             return _cp()
 
@@ -1211,6 +1735,46 @@ class TestConfigureGerrit:
         ]
         assert len(redirect_calls) == 1
         assert "/r/login/" in redirect_calls[0][-1]
+
+
+class TestIsPrivateTunnel:
+    """Tests for _is_private_tunnel()."""
+
+    def test_tailscale_ip(self) -> None:
+        """Tailscale IP in CGNAT range is private."""
+        assert start_instances._is_private_tunnel("100.100.50.1") is True
+
+    def test_cgnat_boundary(self) -> None:
+        """First usable address in CGNAT range is private."""
+        assert start_instances._is_private_tunnel("100.64.0.1") is True
+
+    def test_non_cgnat_100x(self) -> None:
+        """Address below CGNAT range is public."""
+        assert start_instances._is_private_tunnel("100.63.255.255") is False
+
+    def test_rfc1918_10x(self) -> None:
+        """RFC 1918 10.0.0.0/8 address is private."""
+        assert start_instances._is_private_tunnel("10.0.0.1") is True
+
+    def test_rfc1918_172_16x(self) -> None:
+        """RFC 1918 172.16.0.0/12 address is private."""
+        assert start_instances._is_private_tunnel("172.16.0.1") is True
+
+    def test_rfc1918_192_168x(self) -> None:
+        """RFC 1918 192.168.0.0/16 address is private."""
+        assert start_instances._is_private_tunnel("192.168.1.1") is True
+
+    def test_public_ip(self) -> None:
+        """Public IP address is not private."""
+        assert start_instances._is_private_tunnel("8.8.8.8") is False
+
+    def test_hostname(self) -> None:
+        """Hostname that is not an IP returns False."""
+        assert start_instances._is_private_tunnel("bore.pub") is False
+
+    def test_empty_string(self) -> None:
+        """Empty string returns False."""
+        assert start_instances._is_private_tunnel("") is False
 
 
 # =====================================================================
@@ -1834,11 +2398,14 @@ class TestStartInstance:
                 "test-image:latest",
             )
 
-        # Check canonical_url includes tunnel host
+        # Check canonical_url includes tunnel host and port. Parse the URL
+        # and compare the host/port components exactly rather than matching
+        # substrings, which would also accept lookalike hosts.
         cfg_args = mock_cfg.call_args
         canonical_url = cfg_args[0][2]  # 3rd positional arg
-        assert "tunnel.example.com" in canonical_url
-        assert "9080" in canonical_url
+        parsed = urlparse(canonical_url)
+        assert parsed.hostname == "tunnel.example.com"
+        assert parsed.port == 9080
 
     def test_container_ip_failure_handled(self, tmp_path: Path) -> None:
         docker, instance, config, api_store, inst_store = self._setup_mocks(tmp_path)

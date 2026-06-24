@@ -76,6 +76,82 @@ _REPLICATION_ERROR_PATTERNS = [
     "Connection refused",
 ]
 
+# Patterns that match the pull-replication plugin's known *soft*
+# failure modes.  When a line that already matched one of
+# ``_REPLICATION_ERROR_PATTERNS`` ALSO matches one of these patterns,
+# the resulting ``ErrorMatch`` is flagged ``is_soft_failure=True`` and
+# excluded from the ``has_user_project_errors`` /
+# ``has_magic_repo_errors`` failure gates.  Soft failures surface as a
+# clearly-labelled warning block so the operator can see them in the
+# workflow output without the action treating them as a fatal stop.
+#
+# Current entries:
+#
+# * ``InexistentRefTransportException`` — raised by the pull-
+#   replication plugin when an explicitly-named refspec resolves to
+#   no advertised ref on the remote.  This is expected in two
+#   legitimate situations:
+#
+#   - The magic-repo remote's refspecs are heterogeneous across the
+#     two magic projects ``All-Users`` and ``All-Projects``.  E.g.
+#     ``refs/meta/external-ids`` only exists on All-Users; asking
+#     for it on All-Projects raises this exception.  The blanket
+#     ``+refs/meta/*:refs/meta/*`` wildcard used to mask this by
+#     letting the plugin walk the remote's ref advertisement and
+#     skip what isn't there, but the explicit refspec list we
+#     adopted to keep ``refs/meta/config`` out of the wildcard
+#     surface inevitably names refs that are absent from one or
+#     other of the magic projects.  The exception is informational,
+#     not a fault.
+#
+#   - The source server's ACL hides certain refs (notably
+#     ``All-Users:refs/meta/external-ids``, which holds per-user
+#     PII) from non-admin replication credentials.  From the plugin's
+#     perspective the ref "does not exist" because the smart-http
+#     refs advertisement does not list it; the underlying cause is
+#     a missing read grant on the source.  Either way the right
+#     action is the same: log it, do not fail the workflow, and let
+#     the operator know the deployed Gerrit will run in a degraded-
+#     NoteDb-rendering mode for that ref.
+_SOFT_FAILURE_PATTERNS = [
+    "InexistentRefTransportException",
+    # The JGit-level cause line that pull-replication wraps into
+    # ``InexistentRefTransportException``.  Appears on the ``Caused
+    # by:`` line of the trace as e.g.::
+    #
+    #     Caused by: org.eclipse.jgit.errors.TransportException:
+    #         Remote does not have refs/meta/external-ids available
+    #         for fetch.
+    #
+    # Including the cause-line phrase here means the soft flag fires
+    # on that line independently of the stateful stack-trace
+    # propagation below, so a soft exception is still correctly
+    # classified even if the headline is outside the 500-line scan
+    # window.
+    r"Remote does not have .* available for fetch",
+]
+
+# Stack-trace continuation lines.  Java exceptions span multiple
+# lines: a headline (e.g. ``InexistentRefTransportException: ...``),
+# zero or more ``\tat <FQN>(<file>:<line>)`` frames, and optionally
+# a ``Caused by: <FQN>: ...`` line that introduces the next nested
+# exception.  All these lines belong to the same logical exception
+# and share its classification — a stack frame after a soft
+# exception is itself a soft failure, even if the frame text alone
+# doesn't mention the soft exception's class name.
+#
+# ``check_replication_errors`` uses this regex to identify
+# continuation lines as it scans the grep output in order, and
+# propagates the most recent headline's ``is_soft_failure`` flag
+# onto them.  Without this propagation, the
+# ``PermanentTransportException.wrapIfPermanentTransportException``
+# wrapper frame and the ``Caused by: org.eclipse.jgit.errors.
+# TransportException: ...`` line of an ``InexistentRefTransport``
+# exception would each be classified as a separate hard
+# user-project error and fail the workflow, even though they belong
+# to the same logical soft failure as the headline.
+_CONTINUATION_LINE_RE = re.compile(r"^\s*(?:at\s|Caused by:)")
+
 # Patterns for detecting replication errors in the **container** logs.
 #
 # These must be much more selective than the pull_replication_log patterns
@@ -84,11 +160,32 @@ _REPLICATION_ERROR_PATTERNS = [
 # or "Permission denied" cause false positives when e.g. the email
 # subsystem cannot reach an SMTP server.
 #
+# All patterns require a replication verb (``fetch``, ``replicat``,
+# ``remote``) *and* an error verb (``error``, ``failed``,
+# ``exception``).  Mentioning the plugin name alone is not enough:
+# ``Loaded plugin pull-replication, version v3.5.6`` and similar
+# lifecycle lines never imply a fault, and the previous
+# ``pull-replication.*(?:error|failed|exception)`` rule trip-fired
+# whenever a plugin-loader / JVM-init message containing one of
+# those bare words landed on the same line as the plugin name.
+#
 # Only patterns that unambiguously indicate a replication failure belong
 # here.
 _CONTAINER_ERROR_PATTERNS = [
     "Cannot replicate",
-    r"pull-replication.*(?:error|failed|exception)",
+    # Plugin name + replication verb + error verb, in any order on the
+    # same line.  The triple-anchor requirement keeps generic startup /
+    # plugin-loader lines out of the false-positive surface.
+    (
+        r"pull-replication.*"
+        r"(?:fetch|replicat|remote).*"
+        r"(?:error|failed|exception)"
+    ),
+    (
+        r"pull-replication.*"
+        r"(?:error|failed|exception).*"
+        r"(?:fetch|replicat|remote)"
+    ),
     r"TransportException.*(?:fetch|replicate|remote)",
     "git-upload-pack not permitted",
 ]
@@ -219,6 +316,310 @@ class _StabilityTracker:
         return self._prev_snapshot.timestamp - self._last_change_time
 
 
+# Gerrit special projects.  When ``replicate_meta_refs`` is enabled
+# the action emits a second ``[remote "<slug>-meta"]`` section that
+# targets these repositories with a broader refspec set.  Errors
+# against them in the authoritative log are classified separately
+# from user-project errors: the source server's ACL on All-Users
+# typically requires admin scope (because it holds per-user PII),
+# and a non-admin replication credential can fail there even when
+# it has full read on every user project.  We never want a magic-
+# repo permission denial alone to fail the workflow, because the
+# core feature — per-project replication — still works in that
+# case; the operator just loses NoteDb account/group rendering in
+# the deployed Gerrit's UI.
+_MAGIC_REPO_NAMES: tuple[str, ...] = (
+    "All-Users",
+    "All-Projects",
+    "All-External-IDs",
+    "Sequences",
+)
+
+# Pattern matched against an authoritative-log line to determine
+# whether the offending fetch targeted a magic repository.  The
+# pull-replication plugin writes both ``Cannot replicate from
+# https://.../All-Users.git`` headlines and follow-on stack-trace
+# lines such as ``TransportException: https://.../All-Users.git:
+# not authorized``; either form is enough to attribute the match.
+_MAGIC_REPO_RE = re.compile(
+    r"/(" + "|".join(re.escape(name) for name in _MAGIC_REPO_NAMES) + r")\.git",
+    re.IGNORECASE,
+)
+
+
+@dataclass
+class ErrorMatch:
+    """A single line that matched a replication-error pattern.
+
+    Attributes
+    ----------
+    source:
+        Which log source the match came from.  One of
+        ``"pull_replication_log"`` (the per-event log file Gerrit's
+        pull-replication plugin writes) or ``"container_logs"`` (the
+        Gerrit container's combined stdout/stderr captured via
+        ``docker logs``).  Useful so callers can apply different
+        tolerance to the authoritative per-event log vs. the broader
+        heuristic container scan.
+    pattern:
+        The regex (string form) that matched the line.  Logged on
+        every detection so a re-run never leaves operators guessing
+        which rule fired.
+    line:
+        The matching line itself, with the trailing newline stripped.
+    is_magic_repo:
+        True when the matched line references one of Gerrit's special
+        repositories (see ``_MAGIC_REPO_NAMES``).  These come from the
+        opt-in ``<slug>-meta`` magic-repo remote that ``replicate_
+        meta_refs`` enables.  Callers should treat these matches as
+        a degraded-feature warning rather than a fatal replication
+        failure — the source server's ACL on ``All-Users`` etc. is
+        commonly stricter than its ACL on ordinary projects, and a
+        permission denial there does not affect user-project
+        replication.  See :class:`ReplicationErrorReport`'s
+        ``has_user_project_errors`` / ``has_magic_repo_errors``
+        properties for the structured accessors.
+    is_soft_failure:
+        True when the matched line also matches one of
+        ``_SOFT_FAILURE_PATTERNS`` — known benign exception classes
+        emitted by the pull-replication plugin (e.g.
+        ``InexistentRefTransportException``).  Soft failures are
+        excluded from every fatal-error gate; they only surface as
+        warnings under their own heading so the operator can see
+        them without the action stopping.  See
+        :class:`ReplicationErrorReport.has_soft_failures`.
+    """
+
+    source: str
+    pattern: str
+    line: str
+    is_magic_repo: bool = False
+    is_soft_failure: bool = False
+
+
+@dataclass
+class ReplicationErrorReport:
+    """Structured result from a replication-error scan.
+
+    Separates the per-event log (authoritative) from the broader
+    container log (advisory), so callers can choose tolerance per
+    source instead of fusing them into a single bool that throws
+    away which source and which pattern triggered.
+
+    The previous ``check_replication_errors() -> bool`` interface
+    made every detection a hard failure even when the only signal
+    came from container-startup chatter that happened to match the
+    deliberately-broad ``pull-replication.*(error|failed|exception)``
+    pattern.  Callers can now distinguish authoritative replication
+    failures (per-event log) from heuristic warnings (container log)
+    and decide independently how to react.
+    """
+
+    log_file_matches: list[ErrorMatch] = field(default_factory=list)
+    """Matches from ``/var/gerrit/logs/pull_replication_log``."""
+
+    container_log_matches: list[ErrorMatch] = field(default_factory=list)
+    """Matches from ``docker logs`` (container stdout/stderr)."""
+
+    @property
+    def has_authoritative_errors(self) -> bool:
+        """True when the per-event replication log has matches.
+
+        This is the high-confidence signal: every line in that file
+        is replication-related, so a pattern hit there reflects an
+        actual replication failure.
+        """
+        return bool(self.log_file_matches)
+
+    @property
+    def has_user_project_errors(self) -> bool:
+        """True when the per-event log has matches against user projects.
+
+        Excludes matches whose URL references one of Gerrit's magic
+        repositories (``All-Users``, ``All-Projects``,
+        ``All-External-IDs``, ``Sequences``) AND excludes matches
+        flagged as soft failures (see ``has_soft_failures``).  This
+        is the gate the verification callers use to decide whether
+        to fail the workflow: user-project replication failures
+        that are not known-benign soft failures are real problems
+        and warrant aborting the deployment.
+        """
+        return any(
+            not m.is_magic_repo and not m.is_soft_failure for m in self.log_file_matches
+        )
+
+    @property
+    def has_magic_repo_errors(self) -> bool:
+        """True when the per-event log has matches against magic repos.
+
+        These come from the ``<slug>-meta`` remote that
+        ``replicate_meta_refs`` enables.  A typical cause is the
+        source server's stricter ACL on ``All-Users`` (which holds
+        per-user PII) requiring admin-level read access that the
+        replication service account does not have.  User-project
+        replication is unaffected when only this property is true;
+        the deployed Gerrit's UI just loses NoteDb account / group
+        rendering for replicated changes.
+
+        Soft failures (see ``has_soft_failures``) are excluded so
+        they surface under their own heading and never inflate
+        the magic-repo signal.
+        """
+        return any(
+            m.is_magic_repo and not m.is_soft_failure for m in self.log_file_matches
+        )
+
+    @property
+    def has_soft_failures(self) -> bool:
+        """True when the per-event log has known-benign soft failures.
+
+        Soft failures are pull-replication plugin exceptions whose
+        meaning is informational rather than fatal.  Currently this
+        is dominated by ``InexistentRefTransportException``, which
+        the plugin raises when an explicitly-named refspec resolves
+        to no advertised ref on the remote.  That happens routinely
+        with the magic-repo remote's enumerated refspecs because:
+
+        * The two magic projects (``All-Users`` and
+          ``All-Projects``) have different ref sets; e.g.
+          ``refs/meta/external-ids`` only lives on All-Users, so
+          asking for it on All-Projects always raises this.
+        * Source-server ACLs commonly hide certain refs (e.g.
+          ``All-Users:refs/meta/external-ids``) from non-admin
+          replication credentials; the smart-http advertisement
+          simply omits them and the plugin treats the absence as a
+          permanent failure.
+
+        Neither case is something the action can fix — the right
+        action is to surface the soft failures in the log and let
+        replication continue.
+        """
+        return any(m.is_soft_failure for m in self.log_file_matches)
+
+    @property
+    def has_advisory_errors(self) -> bool:
+        """True when the container log has matches.
+
+        The container log captures everything Gerrit writes to
+        stdout/stderr (plugin loader, JVM startup, web UI, email).
+        Even with narrow patterns this source produces occasional
+        false positives during startup.  Callers should surface
+        these for diagnosis but not treat them as fatal on their
+        own.
+        """
+        return bool(self.container_log_matches)
+
+    @property
+    def has_any_errors(self) -> bool:
+        """True if either source produced at least one match."""
+        return self.has_authoritative_errors or self.has_advisory_errors
+
+    # ------------------------------------------------------------------
+    # Diagnostic helpers — collapse the report into log lines the
+    # caller can route to ``logger.warning`` / ``logger.error``.
+    # ------------------------------------------------------------------
+
+    def format_matches(
+        self,
+        *,
+        max_per_source: int = 20,
+        sources: tuple[str, ...] | None = None,
+        magic_repo: bool | None = None,
+        soft_failure: bool | None = None,
+        only_lines: set[str] | None = None,
+    ) -> list[str]:
+        """Return human-readable lines describing matches.
+
+        Each block starts with a heading that identifies the source
+        and pattern, followed by up to *max_per_source* matching
+        lines indented for readability.  Returns an empty list when
+        no matches remain after filtering.
+
+        Parameters
+        ----------
+        max_per_source:
+            Truncate each per-pattern block to this many lines.
+            Excess lines are summarised on a trailing
+            ``… N more line(s) truncated`` row.
+        sources:
+            Restrict the output to matches whose ``source`` is in
+            the given tuple (e.g. ``("pull_replication_log",)`` to
+            exclude the container-log advisory matches).  ``None``
+            (the default) includes every source.
+        magic_repo:
+            Restrict the output by magic-repo classification:
+            ``True`` keeps only magic-repo matches (those whose
+            ``is_magic_repo`` is True), ``False`` keeps only
+            non-magic (user-project) matches, and ``None`` (the
+            default) keeps both.
+        soft_failure:
+            Restrict the output by soft-failure classification:
+            ``True`` keeps only soft failures (e.g.
+            ``InexistentRefTransportException``), ``False`` keeps
+            only non-soft (real) failures, and ``None`` (the
+            default) keeps both.
+        only_lines:
+            Restrict the output to matches whose ``line`` text is
+            in the given set.  ``None`` (the default) keeps every
+            match.  Used by the wait-loop callers to pass a set of
+            "newly-discovered" lines so the heading they print only
+            contains those lines and not every match accumulated
+            across the whole report — the per-loop dedup sets
+            (``seen_advisory`` / ``seen_soft_failure`` /
+            ``seen_magic_repo`` / ``seen_user_project``) gate the
+            heading itself, and ``only_lines`` here scopes the body
+            so each unique match is logged exactly once.
+
+        Callers print warnings under four separate headings
+        (advisory / soft-failure / magic-repo / user-project) and
+        rely on these filters to keep the same line from appearing
+        under more than one heading.
+        """
+        # Map source label → list of ``ErrorMatch`` objects, in the
+        # order the caller normally prints them.  Filtering keeps
+        # the ``ErrorMatch`` shape so we can inspect ``is_magic_repo``
+        # per match, rather than the previous string-only buckets.
+        source_buckets: tuple[tuple[str, str, list[ErrorMatch]], ...] = (
+            (
+                "pull_replication_log",
+                "pull_replication_log (authoritative)",
+                self.log_file_matches,
+            ),
+            (
+                "container_logs",
+                "container_logs (advisory)",
+                self.container_log_matches,
+            ),
+        )
+
+        out: list[str] = []
+        for source_key, label, matches in source_buckets:
+            if sources is not None and source_key not in sources:
+                continue
+            filtered = [
+                m
+                for m in matches
+                if (magic_repo is None or m.is_magic_repo is magic_repo)
+                and (soft_failure is None or m.is_soft_failure is soft_failure)
+                and (only_lines is None or m.line in only_lines)
+            ]
+            if not filtered:
+                continue
+            # Group by pattern so callers can see which rule fired.
+            by_pattern: dict[str, list[str]] = {}
+            for m in filtered:
+                by_pattern.setdefault(m.pattern, []).append(m.line)
+            for pattern, lines in by_pattern.items():
+                out.append(f"  {label} — pattern={pattern!r} — {len(lines)} match(es):")
+                for line in lines[:max_per_source]:
+                    out.append(f"    {line.rstrip()}")
+                if len(lines) > max_per_source:
+                    out.append(
+                        f"    … {len(lines) - max_per_source} more line(s) truncated"
+                    )
+        return out
+
+
 # ---------------------------------------------------------------------------
 # Plugin and configuration checks
 # ---------------------------------------------------------------------------
@@ -285,21 +686,47 @@ def check_secure_config(docker: DockerManager, cid: str) -> bool:
 # ---------------------------------------------------------------------------
 
 
-def check_replication_errors(docker: DockerManager, cid: str) -> bool:
-    """Check for replication errors in logs.
+def check_replication_errors(
+    docker: DockerManager,
+    cid: str,
+) -> ReplicationErrorReport:
+    """Scan replication-related logs for known error patterns.
 
-    The pull_replication_log is the **primary** source of truth.  We
-    also do a narrowly-scoped scan of container logs for replication-
-    specific patterns, but intentionally skip generic terms like
-    ``Connection refused`` or ``ERROR`` that frequently appear for
-    non-replication reasons (e.g. email delivery failures).
+    Two sources are scanned independently:
 
-    Returns *True* if errors were found (i.e. replication is failing).
+    * The per-event ``pull_replication_log`` file inside the Gerrit
+      container (the **authoritative** source — every line is
+      replication-related, so a pattern hit reflects an actual
+      replication failure).  Up to the last 500 lines are searched
+      for ``_REPLICATION_ERROR_PATTERNS``.
+    * ``docker logs`` against the Gerrit container (the **advisory**
+      source — captures everything Gerrit writes to stdout/stderr;
+      includes plugin loader output, JVM startup, web UI, email).
+      Up to the last 2000 lines are searched for the narrower
+      ``_CONTAINER_ERROR_PATTERNS``.
+
+    Returns a :class:`ReplicationErrorReport` that records every
+    matching line together with the source and the regex that fired.
+    Callers decide how to react: typically failures only on
+    ``has_authoritative_errors``, warnings on ``has_advisory_errors``.
+
+    The previous boolean interface fused both sources and lost the
+    per-source attribution, which led to false-positive failures
+    when container-startup chatter happened to match the
+    deliberately-broad ``pull-replication.*(error|failed|exception)``
+    rule.  Returning a structured report removes the guesswork:
+    every detection now carries the offending line, pattern, and
+    source, ready for ``logger`` output.
     """
+    report = ReplicationErrorReport()
+
     # --- 1. pull_replication_log (authoritative) ---
     if docker.exec_test(cid, "-f /var/gerrit/logs/pull_replication_log"):
         try:
-            # Build a grep pattern from the replication-specific patterns.
+            # We use grep -E (one OR'd alternation) for speed inside
+            # the container, then attribute each matched line back to
+            # the specific pattern in Python so the report carries
+            # accurate per-rule provenance.
             grep_pattern = "|".join(_REPLICATION_ERROR_PATTERNS)
             result = docker.exec_cmd(
                 cid,
@@ -307,21 +734,101 @@ def check_replication_errors(docker: DockerManager, cid: str) -> bool:
                 f"grep -iE '{grep_pattern}'",
                 check=False,
             )
-            if result.strip():
-                return True
+            # ``check_replication_errors`` scans matches in the order
+            # ``grep`` emits them, which is the order they appear in
+            # the log file.  Because every line in a Java stack trace
+            # contains a class name with ``TransportException`` in it
+            # (the plugin's own classes plus the ``Caused by:`` line),
+            # grep returns every frame of a multi-line exception.  We
+            # walk them in order, tag the headline by its exception
+            # class, and propagate that classification onto the
+            # subsequent stack frames / ``Caused by:`` lines until the
+            # next headline resets the state.  Without this, the
+            # generic ``PermanentTransportException.wrapIfPermanent…``
+            # wrapper frame and the JGit ``Caused by:`` line of an
+            # ``InexistentRefTransportException`` would each get tagged
+            # as a separate hard failure and fail the workflow on
+            # what is in fact a single soft exception.
+            current_soft_state = False
+            for line in result.splitlines():
+                line = line.rstrip()
+                if not line:
+                    continue
+                matched_pattern = next(
+                    (
+                        p
+                        for p in _REPLICATION_ERROR_PATTERNS
+                        if re.search(p, line, re.IGNORECASE)
+                    ),
+                    "|".join(_REPLICATION_ERROR_PATTERNS),
+                )
+                line_matches_soft = any(
+                    re.search(p, line, re.IGNORECASE) for p in _SOFT_FAILURE_PATTERNS
+                )
+                is_continuation = bool(_CONTINUATION_LINE_RE.match(line))
+                if line_matches_soft:
+                    # Explicit soft-pattern match: this line itself
+                    # carries a known-soft exception class or the
+                    # JGit cause phrase.  Mark soft and update the
+                    # propagation state so any subsequent stack
+                    # frames inherit the flag.
+                    is_soft = True
+                    current_soft_state = True
+                elif is_continuation:
+                    # Stack frame or ``Caused by:`` line: inherit the
+                    # most recent exception headline's classification.
+                    # If no headline has been seen yet (the scan
+                    # window started mid-trace), inherit ``False`` and
+                    # let the operator see the line under the
+                    # user-project heading; that is the conservative
+                    # default.
+                    is_soft = current_soft_state
+                else:
+                    # Non-continuation, non-soft headline.  Reset the
+                    # propagation state so a subsequent stack frame
+                    # cannot inherit a stale soft flag from an
+                    # earlier exception in the same scan window.
+                    is_soft = False
+                    current_soft_state = False
+                report.log_file_matches.append(
+                    ErrorMatch(
+                        source="pull_replication_log",
+                        pattern=matched_pattern,
+                        line=line,
+                        is_magic_repo=bool(_MAGIC_REPO_RE.search(line)),
+                        is_soft_failure=is_soft,
+                    )
+                )
         except DockerError:
             pass
 
     # --- 2. Container logs (narrow, replication-specific patterns only) ---
+    #
+    # Note: this path is intentionally treated as a *secondary*
+    # signal.  Some failure modes (plugin-load errors, JGit
+    # ``TransportException`` stack traces that never reach the
+    # per-event log) only ever appear here, so we cannot drop the
+    # source entirely.  But its patterns must remain narrow because
+    # the underlying stream carries everything Gerrit logs.  The
+    # caller (verify_single_instance / wait_for_replication) is
+    # responsible for deciding whether to fail or merely warn on
+    # these matches — see ``has_advisory_errors``.
     try:
         logs = docker.container_logs(cid, tail=2000)
         for pattern in _CONTAINER_ERROR_PATTERNS:
-            if re.search(pattern, logs, re.IGNORECASE):
-                return True
+            for line in logs.splitlines():
+                if re.search(pattern, line, re.IGNORECASE):
+                    report.container_log_matches.append(
+                        ErrorMatch(
+                            source="container_logs",
+                            pattern=pattern,
+                            line=line.rstrip(),
+                        )
+                    )
     except DockerError:
         pass
 
-    return False
+    return report
 
 
 def get_completed_repo_count(docker: DockerManager, cid: str) -> int:
@@ -865,6 +1372,16 @@ def wait_for_replication(
     interval = 5
     consecutive_errors = 0  # require 2 in a row before failing fast
     initial_count = count_repositories(docker, cid)
+    # Track the set of already-warned diagnostic lines per source so we
+    # only log each unique advisory / magic-repo / user-project match
+    # once across the poll loop.  Without this guard the same
+    # ``Cannot replicate from ... All-Users.git`` line is re-emitted
+    # on every interval (≈12x per minute), drowning the legitimate
+    # progress lines and the final summary.
+    seen_advisory: set[str] = set()
+    seen_soft_failure: set[str] = set()
+    seen_magic_repo: set[str] = set()
+    seen_user_project: set[str] = set()
 
     logger.info("  Initial repository count: %d", initial_count)
     if project:
@@ -887,7 +1404,116 @@ def wait_for_replication(
         elapsed += interval
 
         # ---- 1. Error check (require 2 consecutive hits) ----
-        if check_replication_errors(docker, cid):
+        #
+        # Failure gating distinguishes three sources, in order of
+        # confidence:
+        #
+        # * ``has_user_project_errors`` (authoritative per-event log,
+        #   user projects) — gates the consecutive-hit counter that
+        #   can ultimately fail the workflow.
+        # * ``has_magic_repo_errors`` (authoritative per-event log,
+        #   All-Users / All-Projects / ...) — surfaced as warnings
+        #   but never fatal: the source server's ACL on these repos
+        #   is commonly stricter than its ACL on user projects, and
+        #   a non-admin replication credential can fail there while
+        #   user-project replication completes fine.  See
+        #   ``ReplicationErrorReport.has_magic_repo_errors`` for the
+        #   rationale.
+        # * ``has_advisory_errors`` (container ``docker logs``) —
+        #   also informational only.
+        error_report = check_replication_errors(docker, cid)
+        # Always surface what matched so subsequent debug runs know
+        # which source / regex fired — the 50-line tail dumped on
+        # failure rarely contains the matching line itself.  Each
+        # heading is scoped to its own source / classification via
+        # format_matches() filters, so the same line never appears
+        # under more than one heading.  We deduplicate against the
+        # per-loop ``seen_*`` sets so each unique match is logged
+        # exactly once, even though the underlying scan re-runs on
+        # every interval and the same magic-repo failure line tends
+        # to persist for the whole poll session.
+        if error_report.has_advisory_errors and debug:
+            new_lines = [
+                m.line
+                for m in error_report.container_log_matches
+                if m.line not in seen_advisory
+            ]
+            if new_lines:
+                logger.debug("  Advisory replication signals (informational):")
+                new_set = set(new_lines)
+                for diag in error_report.format_matches(
+                    sources=("container_logs",), only_lines=new_set
+                ):
+                    logger.debug(diag)
+                seen_advisory.update(new_lines)
+        if error_report.has_soft_failures:
+            # Soft failures (e.g. InexistentRefTransportException)
+            # are surfaced under their own heading so the operator
+            # knows the plugin tried to fetch a ref that didn't exist
+            # or wasn't visible on the remote.  These never count
+            # toward the failure threshold — they are an expected
+            # consequence of the magic-repo remote's enumerated
+            # refspec list spanning two heterogeneous magic projects
+            # and tightly-ACL'd source servers.
+            new_lines = [
+                m.line
+                for m in error_report.log_file_matches
+                if m.is_soft_failure and m.line not in seen_soft_failure
+            ]
+            if new_lines:
+                logger.warning(
+                    "  Soft replication failures (refs missing on remote "
+                    "or hidden by source ACL; will not fail verification):"
+                )
+                new_set = set(new_lines)
+                for diag in error_report.format_matches(
+                    sources=("pull_replication_log",),
+                    soft_failure=True,
+                    only_lines=new_set,
+                ):
+                    logger.warning(diag)
+                seen_soft_failure.update(new_lines)
+        if error_report.has_magic_repo_errors:
+            new_lines = [
+                m.line
+                for m in error_report.log_file_matches
+                if m.is_magic_repo
+                and not m.is_soft_failure
+                and m.line not in seen_magic_repo
+            ]
+            if new_lines:
+                logger.warning(
+                    "  Magic-repo replication errors (degraded NoteDb "
+                    "rendering; user-project replication unaffected):"
+                )
+                new_set = set(new_lines)
+                for diag in error_report.format_matches(
+                    sources=("pull_replication_log",),
+                    magic_repo=True,
+                    soft_failure=False,
+                    only_lines=new_set,
+                ):
+                    logger.warning(diag)
+                seen_magic_repo.update(new_lines)
+        if error_report.has_user_project_errors:
+            new_lines = [
+                m.line
+                for m in error_report.log_file_matches
+                if not m.is_magic_repo
+                and not m.is_soft_failure
+                and m.line not in seen_user_project
+            ]
+            if new_lines:
+                logger.warning("  Authoritative replication-log errors:")
+                new_set = set(new_lines)
+                for diag in error_report.format_matches(
+                    sources=("pull_replication_log",),
+                    magic_repo=False,
+                    soft_failure=False,
+                    only_lines=new_set,
+                ):
+                    logger.warning(diag)
+                seen_user_project.update(new_lines)
             consecutive_errors += 1
             if consecutive_errors >= 2:
                 logger.error("")
@@ -1184,33 +1810,61 @@ def verify_single_instance(
     check_secure_config(docker, cid)
 
     # Step 3: Error check
+    #
+    # Failure gating is identical to ``wait_for_replication``'s step 1:
+    # only authoritative user-project errors can fail verification.
+    # Magic-repo failures (``All-Users`` etc.) and container-log
+    # advisory signals surface as warnings so the operator sees them
+    # without the action bailing on environmental ACL restrictions
+    # or startup chatter.
     logger.info("")
     logger.info("Step 3: Checking for replication errors…")
-    if check_replication_errors(docker, cid):
+    error_report = check_replication_errors(docker, cid)
+    if error_report.has_advisory_errors:
+        logger.warning(
+            "  Advisory replication signals in container logs "
+            "(informational, will not fail verification):"
+        )
+        for diag in error_report.format_matches(sources=("container_logs",)):
+            logger.warning(diag)
+    if error_report.has_soft_failures:
+        logger.warning(
+            "  Soft replication failures (refs missing on remote "
+            "or hidden by source ACL; will not fail verification):"
+        )
+        for diag in error_report.format_matches(
+            sources=("pull_replication_log",), soft_failure=True
+        ):
+            logger.warning(diag)
+    if error_report.has_magic_repo_errors:
+        logger.warning(
+            "  Magic-repo replication errors (degraded NoteDb "
+            "rendering; user-project replication unaffected, "
+            "will not fail verification):"
+        )
+        for diag in error_report.format_matches(
+            sources=("pull_replication_log",),
+            magic_repo=True,
+            soft_failure=False,
+        ):
+            logger.warning(diag)
+    if error_report.has_user_project_errors:
+        logger.error("Replication errors detected in pull_replication_log! ❌")
+        for diag in error_report.format_matches(
+            sources=("pull_replication_log",),
+            magic_repo=False,
+            soft_failure=False,
+        ):
+            logger.error(diag)
         result.error = "Replication errors detected"
-        logger.error("Replication errors detected! ❌")
-        log_tail = show_pull_replication_log(docker, cid)
-        logger.error("  Pull replication log (recent):")
+        # Dump the full 500-line tail — same window the scan uses,
+        # so the matching line is guaranteed to be in the dump even
+        # if the operator scrolls back from the format_matches
+        # output to the surrounding context.
+        log_tail = show_pull_replication_log(docker, cid, lines=500)
+        logger.error("  Pull replication log (last 500 lines):")
         for line in log_tail.splitlines():
             logger.error("    %s", line)
-
-        # Show only replication-specific error lines from container logs.
-        # Use the same narrow patterns as check_replication_errors() to
-        # avoid dumping unrelated Gerrit errors (email, account mgmt, etc.)
-        try:
-            container_logs = docker.container_logs(cid, tail=3000)
-            repl_error_pattern = "|".join(_CONTAINER_ERROR_PATTERNS)
-            error_lines = [
-                line
-                for line in container_logs.splitlines()
-                if re.search(repl_error_pattern, line, re.IGNORECASE)
-            ]
-            if error_lines:
-                logger.error("  Replication-related container log errors:")
-                for line in error_lines[-20:]:
-                    logger.error("    %s", line.strip())
-        except DockerError:
-            pass
         return result
 
     logger.info("  No replication errors detected ✅")

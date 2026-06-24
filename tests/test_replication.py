@@ -35,6 +35,31 @@ from unittest.mock import MagicMock, patch
 import pytest
 from conftest import make_completed_process
 from errors import DockerError, ReplicationError
+from replication import ErrorMatch, ReplicationErrorReport
+
+# Convenience helpers so the existing ``return_value=False/True`` mocks
+# read as the new structured report without sprinkling boilerplate at
+# every patch site.
+_NO_ERRORS = ReplicationErrorReport()
+
+
+def _authoritative_error_report() -> ReplicationErrorReport:
+    """Build a report that looks like a real per-event log hit.
+
+    Used in places where the original tests asserted a True return
+    from ``check_replication_errors``; mirrors that semantically as a
+    single pull_replication_log match.
+    """
+    return ReplicationErrorReport(
+        log_file_matches=[
+            ErrorMatch(
+                source="pull_replication_log",
+                pattern="TransportException",
+                line="TransportException: simulated by mock",
+            )
+        ]
+    )
+
 
 # =========================================================================
 # Dataclasses
@@ -448,7 +473,12 @@ class TestCheckReplicationErrors:
             ),
         ]
 
-        assert check_replication_errors(docker, "abc123") is False
+        report = check_replication_errors(docker, "abc123")
+        assert report.has_any_errors is False
+        assert report.has_authoritative_errors is False
+        assert report.has_advisory_errors is False
+        assert report.log_file_matches == []
+        assert report.container_log_matches == []
 
     def test_error_in_pull_replication_log(self, mock_docker):
         from replication import check_replication_errors
@@ -459,9 +489,19 @@ class TestCheckReplicationErrors:
             make_completed_process(returncode=0),
             # grep for errors: found
             make_completed_process(stdout="ERROR: Cannot replicate from origin"),
+            # container_logs: clean
+            make_completed_process(stdout="INFO: ready"),
         ]
 
-        assert check_replication_errors(docker, "abc123") is True
+        report = check_replication_errors(docker, "abc123")
+        assert report.has_any_errors is True
+        assert report.has_authoritative_errors is True
+        assert report.has_advisory_errors is False
+        assert len(report.log_file_matches) == 1
+        match = report.log_file_matches[0]
+        assert match.source == "pull_replication_log"
+        assert match.pattern == "Cannot replicate"
+        assert "Cannot replicate from origin" in match.line
 
     def test_transport_exception_in_log(self, mock_docker):
         from replication import check_replication_errors
@@ -472,9 +512,13 @@ class TestCheckReplicationErrors:
             make_completed_process(returncode=0),
             # grep: found TransportException
             make_completed_process(stdout="TransportException: Connection timed out"),
+            # container_logs: clean
+            make_completed_process(stdout="INFO: ready"),
         ]
 
-        assert check_replication_errors(docker, "abc123") is True
+        report = check_replication_errors(docker, "abc123")
+        assert report.has_authoritative_errors is True
+        assert report.log_file_matches[0].pattern == "TransportException"
 
     def test_error_in_container_logs(self, mock_docker):
         from replication import check_replication_errors
@@ -490,7 +534,20 @@ class TestCheckReplicationErrors:
             ),
         ]
 
-        assert check_replication_errors(docker, "abc123") is True
+        report = check_replication_errors(docker, "abc123")
+        # Per-event log file was absent, so all hits are advisory.
+        assert report.has_authoritative_errors is False
+        assert report.has_advisory_errors is True
+        assert report.has_any_errors is True
+        # Both lines must be recorded, each with their attribution.
+        patterns = {m.pattern for m in report.container_log_matches}
+        # The "Cannot replicate" rule matches the first line; the
+        # "pull-replication.*(error|failed|exception)" rule matches
+        # the second line.
+        assert "Cannot replicate" in patterns
+        assert any("pull-replication" in p for p in patterns)
+        for m in report.container_log_matches:
+            assert m.source == "container_logs"
 
     def test_email_error_not_flagged_as_replication_error(self, mock_docker):
         """Email delivery failures must NOT be flagged as replication errors.
@@ -517,8 +574,9 @@ class TestCheckReplicationErrors:
             ),
         ]
 
-        # Must return False — email errors are not replication errors
-        assert check_replication_errors(docker, "abc123") is False
+        # Must report no errors — email errors are not replication errors
+        report = check_replication_errors(docker, "abc123")
+        assert report.has_any_errors is False
 
     def test_generic_permission_denied_not_flagged(self, mock_docker):
         """Generic 'Permission denied' in container logs should not trigger.
@@ -537,7 +595,8 @@ class TestCheckReplicationErrors:
             ),
         ]
 
-        assert check_replication_errors(docker, "abc123") is False
+        report = check_replication_errors(docker, "abc123")
+        assert report.has_any_errors is False
 
     def test_no_log_file_no_container_errors(self, mock_docker):
         from replication import check_replication_errors
@@ -550,7 +609,8 @@ class TestCheckReplicationErrors:
             make_completed_process(stdout="INFO: Gerrit Code Review 3.13.1 ready"),
         ]
 
-        assert check_replication_errors(docker, "abc123") is False
+        report = check_replication_errors(docker, "abc123")
+        assert report.has_any_errors is False
 
     def test_docker_error_treated_as_no_errors(self, mock_docker):
         from replication import check_replication_errors
@@ -565,8 +625,559 @@ class TestCheckReplicationErrors:
             DockerError("logs failed"),
         ]
 
-        # DockerError during log reading should not raise; should return False
-        assert check_replication_errors(docker, "abc123") is False
+        # DockerError during log reading should not raise; report is empty
+        report = check_replication_errors(docker, "abc123")
+        assert report.has_any_errors is False
+
+    def test_format_matches_groups_by_source_and_pattern(self, mock_docker):
+        """format_matches() must surface source + pattern + line(s)."""
+        from replication import check_replication_errors
+
+        docker, mock_run = mock_docker
+        mock_run.side_effect = [
+            # exec_test: log file exists
+            make_completed_process(returncode=0),
+            # grep: one TransportException hit in the per-event log
+            make_completed_process(stdout="TransportException: fetch failed"),
+            # container_logs: also has a "Cannot replicate" line
+            make_completed_process(stdout="Cannot replicate from origin\n"),
+        ]
+
+        report = check_replication_errors(docker, "abc123")
+        lines = report.format_matches()
+        # Both sources must appear, each labelled with the regex.
+        joined = "\n".join(lines)
+        assert "pull_replication_log (authoritative)" in joined
+        assert "container_logs (advisory)" in joined
+        assert "TransportException" in joined
+        assert "Cannot replicate" in joined
+
+    def test_format_matches_filters_by_source(self):
+        """``sources=`` keyword restricts output to the named source(s).
+
+        Callers print three separate headings (advisory /
+        magic-repo / user-project) and rely on filtering to keep
+        the same line from appearing under more than one heading.
+        """
+        from replication import ErrorMatch, ReplicationErrorReport
+
+        report = ReplicationErrorReport(
+            log_file_matches=[
+                ErrorMatch(
+                    source="pull_replication_log",
+                    pattern="TransportException",
+                    line="TransportException: /aai/resources.git: 500",
+                )
+            ],
+            container_log_matches=[
+                ErrorMatch(
+                    source="container_logs",
+                    pattern="Cannot replicate",
+                    line="Cannot replicate from origin",
+                )
+            ],
+        )
+
+        # Per-event-log only — container_log heading must be absent.
+        log_only = "\n".join(report.format_matches(sources=("pull_replication_log",)))
+        assert "pull_replication_log (authoritative)" in log_only
+        assert "container_logs (advisory)" not in log_only
+        assert "TransportException" in log_only
+        assert "Cannot replicate" not in log_only
+
+        # Container-log only — the reverse.
+        ctr_only = "\n".join(report.format_matches(sources=("container_logs",)))
+        assert "container_logs (advisory)" in ctr_only
+        assert "pull_replication_log (authoritative)" not in ctr_only
+        assert "Cannot replicate" in ctr_only
+        assert "TransportException" not in ctr_only
+
+    def test_format_matches_filters_by_magic_repo_flag(self):
+        """``magic_repo=True/False`` restricts output by the magic-repo flag.
+
+        Lets the magic-repo and user-project headings each render
+        only their own ``ErrorMatch`` entries from the per-event log,
+        which would otherwise both be returned together.
+        """
+        from replication import ErrorMatch, ReplicationErrorReport
+
+        report = ReplicationErrorReport(
+            log_file_matches=[
+                ErrorMatch(
+                    source="pull_replication_log",
+                    pattern="Cannot replicate",
+                    line="Cannot replicate from /All-Users.git",
+                    is_magic_repo=True,
+                ),
+                ErrorMatch(
+                    source="pull_replication_log",
+                    pattern="Cannot replicate",
+                    line="Cannot replicate from /aai/resources.git",
+                    is_magic_repo=False,
+                ),
+            ]
+        )
+
+        magic_only = "\n".join(report.format_matches(magic_repo=True))
+        assert "All-Users.git" in magic_only
+        assert "aai/resources.git" not in magic_only
+
+        user_only = "\n".join(report.format_matches(magic_repo=False))
+        assert "aai/resources.git" in user_only
+        assert "All-Users.git" not in user_only
+
+        # Combined source+magic filter (the wait_for_replication
+        # call shape) must not leak the container_log advisory.
+        report.container_log_matches.append(
+            ErrorMatch(
+                source="container_logs",
+                pattern="pull-replication",
+                line="unrelated advisory",
+            )
+        )
+        scoped = "\n".join(
+            report.format_matches(sources=("pull_replication_log",), magic_repo=False)
+        )
+        assert "aai/resources.git" in scoped
+        assert "All-Users.git" not in scoped
+        assert "unrelated advisory" not in scoped
+
+    def test_plugin_loader_lifecycle_not_flagged(self, mock_docker):
+        """Bare plugin-loader / lifecycle mentions must not trip the check.
+
+        Until the container pattern was tightened to require both a
+        replication verb (``fetch`` / ``replicat`` / ``remote``) AND
+        an error verb (``error`` / ``failed`` / ``exception``) on the
+        same line, a benign startup line such as
+        ``Loaded plugin pull-replication, version v3.5.6`` could be
+        followed (anywhere on later lines) by an unrelated
+        ``ExceptionInInitializerError`` from another subsystem and
+        the broad rule would falsely fire.  These container-log
+        lines must now be silently ignored.
+        """
+        from replication import check_replication_errors
+
+        docker, mock_run = mock_docker
+        mock_run.side_effect = [
+            # exec_test: log file does NOT exist
+            make_completed_process(returncode=1),
+            # container_logs: plugin-loader chatter + an unrelated
+            # "exception" word that previously made the broad rule fire.
+            make_completed_process(
+                stdout=(
+                    "[2026-05-21T13:45:33.383Z] [main] INFO  "
+                    "com.google.gerrit.server.plugins.PluginLoader : "
+                    "Loaded plugin pull-replication, version v3.5.6\n"
+                    "[2026-05-21T13:45:33.500Z] [main] INFO  "
+                    "com.google.gerrit.server.email.SmtpEmailSender : "
+                    "SMTP connection refused; an exception was logged\n"
+                )
+            ),
+        ]
+
+        report = check_replication_errors(docker, "abc123")
+        assert report.has_any_errors is False, (
+            f"unexpected matches: {report.format_matches()}"
+        )
+
+    def test_real_fetch_failure_still_flagged(self, mock_docker):
+        """A genuine pull-replication fetch failure must still match.
+
+        The tightened triple-anchor rule (plugin name + replication
+        verb + error verb) must continue to catch the only failure
+        modes the container-log scan exists for.
+        """
+        from replication import check_replication_errors
+
+        docker, mock_run = mock_docker
+        mock_run.side_effect = [
+            # exec_test: log file does NOT exist
+            make_completed_process(returncode=1),
+            # container_logs: a real failure — plugin name + fetch + failed.
+            make_completed_process(
+                stdout=(
+                    "[2026-05-21T13:45:40.000Z] [pull-replication-1] ERROR "
+                    "com.gerritforge.gerrit.plugins.replication.pull.fetch.X : "
+                    "pull-replication fetch failed for remote onap-meta: "
+                    "java.io.IOException: 403 Forbidden\n"
+                )
+            ),
+        ]
+
+        report = check_replication_errors(docker, "abc123")
+        assert report.has_advisory_errors is True
+        assert report.has_authoritative_errors is False
+
+    def test_magic_repo_match_classified_as_magic(self, mock_docker):
+        """All-Users / All-Projects URLs in matches set ``is_magic_repo``.
+
+        Replication failures against Gerrit's special repositories
+        (``All-Users``, ``All-Projects``, ``All-External-IDs``,
+        ``Sequences``) are commonly driven by stricter source-side
+        ACLs and should be surfaced separately from real user-project
+        failures.  ``check_replication_errors`` tags each match
+        accordingly so ``has_user_project_errors`` /
+        ``has_magic_repo_errors`` can be queried independently.
+        """
+        from replication import check_replication_errors
+
+        docker, mock_run = mock_docker
+        mock_run.side_effect = [
+            # exec_test: log file exists
+            make_completed_process(returncode=0),
+            # grep: both an All-Users failure and a user-project failure.
+            make_completed_process(
+                stdout=(
+                    "[ts] [aaa] Cannot replicate from "
+                    "https://gerrit.onap.org/r/a/All-Users.git\n"
+                    "[ts] [bbb] Cannot replicate from "
+                    "https://gerrit.onap.org/r/a/aai/resources.git\n"
+                )
+            ),
+            # container_logs: clean
+            make_completed_process(stdout="INFO: ready"),
+        ]
+
+        report = check_replication_errors(docker, "abc123")
+        assert report.has_authoritative_errors is True
+        # User-project gate should fire (one of the two lines is a
+        # user project) but the magic-repo gate should also be set.
+        assert report.has_user_project_errors is True
+        assert report.has_magic_repo_errors is True
+        # Per-match flag must agree with the URL it contains.
+        by_magic = {m.is_magic_repo: m for m in report.log_file_matches}
+        assert True in by_magic and False in by_magic
+        assert "All-Users.git" in by_magic[True].line
+        assert "aai/resources.git" in by_magic[False].line
+
+    def test_only_magic_repo_errors_do_not_set_user_project_flag(self, mock_docker):
+        """All-Users-only failures must not trip the user-project gate.
+
+        This is the exact failure mode the previous deployment hit:
+        the workflow's service-account credentials are not admin on
+        the source Gerrit, so ``All-Users`` fetches return 401/403
+        while every user project replicates fine.  The verification
+        callers must classify that as a magic-repo (advisory)
+        failure so the deployment still succeeds.
+        """
+        from replication import check_replication_errors
+
+        docker, mock_run = mock_docker
+        mock_run.side_effect = [
+            make_completed_process(returncode=0),
+            make_completed_process(
+                stdout=(
+                    "[ts] [aaa] Cannot replicate from "
+                    "https://gerrit.onap.org/r/a/All-Users.git\n"
+                    "org.eclipse.jgit.errors.TransportException: "
+                    "https://gerrit.onap.org/r/a/All-Users.git: "
+                    "not authorized\n"
+                )
+            ),
+            make_completed_process(stdout="INFO: ready"),
+        ]
+
+        report = check_replication_errors(docker, "abc123")
+        assert report.has_authoritative_errors is True
+        assert report.has_magic_repo_errors is True
+        # Crucially: no user-project failures — the workflow should
+        # not abort on this combination.
+        assert report.has_user_project_errors is False
+        # Both matched lines must be tagged as magic-repo.
+        assert all(m.is_magic_repo for m in report.log_file_matches)
+
+    def test_all_four_magic_repo_names_detected(self, mock_docker):
+        """All-Users / All-Projects / All-External-IDs / Sequences classify."""
+        from replication import check_replication_errors
+
+        docker, mock_run = mock_docker
+        mock_run.side_effect = [
+            make_completed_process(returncode=0),
+            make_completed_process(
+                stdout=(
+                    "[ts] Cannot replicate from "
+                    "https://g.example.org/All-Users.git\n"
+                    "[ts] Cannot replicate from "
+                    "https://g.example.org/All-Projects.git\n"
+                    "[ts] Cannot replicate from "
+                    "https://g.example.org/All-External-IDs.git\n"
+                    "[ts] Cannot replicate from "
+                    "https://g.example.org/Sequences.git\n"
+                )
+            ),
+            make_completed_process(stdout="INFO: ready"),
+        ]
+
+        report = check_replication_errors(docker, "abc123")
+        assert report.has_magic_repo_errors is True
+        assert report.has_user_project_errors is False
+        assert len(report.log_file_matches) == 4
+        assert all(m.is_magic_repo for m in report.log_file_matches)
+
+    def test_inexistent_ref_classified_as_soft_failure(self, mock_docker):
+        """InexistentRefTransportException is a soft failure.
+
+        The pull-replication plugin raises this exception when an
+        explicitly-named refspec resolves to no advertised ref on
+        the remote.  That happens routinely with the magic-repo
+        remote's enumerated refspecs because the two magic projects
+        have different ref sets, and because source-server ACLs
+        hide certain refs (notably All-Users:refs/meta/external-ids,
+        which holds per-user PII) from non-admin replication
+        credentials.  Neither situation is something the action can
+        fix; the right behaviour is to log and continue.
+
+        The match must be tagged ``is_soft_failure=True`` so the
+        verification callers can route it to its own warning heading
+        instead of failing the workflow on it.
+        """
+        from replication import check_replication_errors
+
+        docker, mock_run = mock_docker
+        mock_run.side_effect = [
+            make_completed_process(returncode=0),
+            make_completed_process(
+                stdout=(
+                    "com.gerritforge.gerrit.plugins.replication.pull.fetch."
+                    "InexistentRefTransportException: Ref "
+                    "refs/meta/external-ids does not exist on remote\n"
+                )
+            ),
+            make_completed_process(stdout="INFO: ready"),
+        ]
+
+        report = check_replication_errors(docker, "abc123")
+        assert len(report.log_file_matches) == 1
+        match = report.log_file_matches[0]
+        assert match.is_soft_failure is True
+        # Soft failures are excluded from the failure gates.
+        assert report.has_soft_failures is True
+        assert report.has_user_project_errors is False
+        # Even when the URL would normally classify as magic-repo,
+        # the soft-failure flag wins: the magic-repo gate is also
+        # False.  (In this synthetic case the line has no URL so
+        # is_magic_repo is also False, but the principle applies
+        # to both flags.)
+        assert report.has_magic_repo_errors is False
+
+    def test_soft_failure_excluded_from_user_project_gate(self):
+        """A soft-failure user-project match must not trip the fail gate.
+
+        Even a non-magic-repo line that happens to be a soft
+        failure should NOT cause ``has_user_project_errors`` to
+        fire, because the underlying cause (missing ref on remote)
+        is not actionable from the action's side.
+        """
+        from replication import ErrorMatch, ReplicationErrorReport
+
+        report = ReplicationErrorReport(
+            log_file_matches=[
+                ErrorMatch(
+                    source="pull_replication_log",
+                    pattern="TransportException",
+                    line=(
+                        "InexistentRefTransportException: Ref "
+                        "refs/meta/version does not exist on remote"
+                    ),
+                    is_magic_repo=False,
+                    is_soft_failure=True,
+                )
+            ]
+        )
+        assert report.has_soft_failures is True
+        assert report.has_user_project_errors is False
+        assert report.has_magic_repo_errors is False
+
+    def test_real_user_project_error_still_fails_alongside_soft(self):
+        """A real user-project error coexists with soft-failure lines.
+
+        The soft-failure classification must not mask a genuine
+        user-project failure that arrives in the same scan window.
+        ``has_user_project_errors`` should still fire on the real
+        match, while the soft-failure flag scopes the
+        InexistentRefTransportException line to the soft heading.
+        """
+        from replication import ErrorMatch, ReplicationErrorReport
+
+        report = ReplicationErrorReport(
+            log_file_matches=[
+                # Soft failure (expected, informational only).
+                ErrorMatch(
+                    source="pull_replication_log",
+                    pattern="TransportException",
+                    line=(
+                        "InexistentRefTransportException: Ref "
+                        "refs/meta/external-ids does not exist on remote"
+                    ),
+                    is_magic_repo=True,
+                    is_soft_failure=True,
+                ),
+                # Genuine user-project failure (should fail the run).
+                ErrorMatch(
+                    source="pull_replication_log",
+                    pattern="Cannot replicate",
+                    line=(
+                        "Cannot replicate from "
+                        "https://gerrit.onap.org/r/a/aai/resources.git"
+                    ),
+                    is_magic_repo=False,
+                    is_soft_failure=False,
+                ),
+            ]
+        )
+        assert report.has_soft_failures is True
+        assert report.has_user_project_errors is True
+        assert report.has_magic_repo_errors is False
+
+    def test_format_matches_filters_by_soft_failure(self):
+        """``soft_failure=True/False`` restricts output accordingly.
+
+        The wait_for_replication / verify_single_instance callers
+        rely on this filter to keep the three heading blocks
+        (soft / magic-repo / user-project) disjoint when the same
+        scan contains lines from multiple classes.
+        """
+        from replication import ErrorMatch, ReplicationErrorReport
+
+        report = ReplicationErrorReport(
+            log_file_matches=[
+                ErrorMatch(
+                    source="pull_replication_log",
+                    pattern="TransportException",
+                    line="InexistentRefTransportException: refs/meta/version",
+                    is_soft_failure=True,
+                ),
+                ErrorMatch(
+                    source="pull_replication_log",
+                    pattern="Cannot replicate",
+                    line="Cannot replicate from /aai/resources.git",
+                    is_soft_failure=False,
+                ),
+            ]
+        )
+
+        soft_only = "\n".join(report.format_matches(soft_failure=True))
+        assert "InexistentRefTransportException" in soft_only
+        assert "aai/resources.git" not in soft_only
+
+        real_only = "\n".join(report.format_matches(soft_failure=False))
+        assert "aai/resources.git" in real_only
+        assert "InexistentRefTransportException" not in real_only
+
+    def test_soft_failure_propagates_across_stack_trace(self, mock_docker):
+        """Stack-trace frames inherit the headline exception's soft flag.
+
+        Java exceptions span multiple lines: a headline, zero or more
+        ``\tat <FQN>(<file>:<line>)`` frames, and optionally a
+        ``Caused by: <FQN>: ...`` line.  Every line of an
+        ``InexistentRefTransportException`` trace contains some class
+        with ``TransportException`` in its name, so grep returns all
+        of them, but only the headline carries the
+        ``InexistentRefTransportException`` substring.  The frames
+        further down the trace mention the generic
+        ``PermanentTransportException.wrapIfPermanentTransportException``
+        wrapper and the JGit ``Caused by: TransportException:
+        Remote does not have <ref> available for fetch.`` line.
+
+        Without stateful propagation, those frames would each be
+        classified as separate hard user-project errors and the
+        workflow would fail on what is in fact a single soft
+        exception.  This test pins the propagation behaviour against
+        the exact trace shape observed in the 2026-05-22 17:58
+        dispatch.
+        """
+        from replication import check_replication_errors
+
+        docker, mock_run = mock_docker
+        mock_run.side_effect = [
+            make_completed_process(returncode=0),
+            make_completed_process(
+                stdout=(
+                    # Headline (explicit soft class).
+                    "com.gerritforge.gerrit.plugins.replication.pull.fetch."
+                    "InexistentRefTransportException: Ref "
+                    "refs/meta/external-ids does not exist on remote\n"
+                    # First few frames mention the soft class directly.
+                    "\tat com.gerritforge.gerrit.plugins.replication.pull."
+                    "fetch.InexistentRefTransportException."
+                    "wrapException(InexistentRefTransportException."
+                    "java:51)\n"
+                    "\tat com.gerritforge.gerrit.plugins.replication.pull."
+                    "fetch.InexistentRefTransportException."
+                    "getOptionalPermanentFailure("
+                    "InexistentRefTransportException.java:40)\n"
+                    # Wrapper frame: generic, no soft-class mention.
+                    "\tat com.gerritforge.gerrit.plugins.replication.pull."
+                    "fetch.PermanentTransportException."
+                    "wrapIfPermanentTransportException("
+                    "PermanentTransportException.java:31)\n"
+                    # ``Caused by:`` line: matches the JGit-cause
+                    # phrase soft pattern directly.
+                    "Caused by: org.eclipse.jgit.errors."
+                    "TransportException: Remote does not have "
+                    "refs/meta/external-ids available for fetch.\n"
+                )
+            ),
+            make_completed_process(stdout="INFO: ready"),
+        ]
+
+        report = check_replication_errors(docker, "abc123")
+        # Every matching line must be classified as soft — the
+        # generic ``PermanentTransportException`` wrapper frame
+        # inherits from the preceding ``InexistentRefTransport…``
+        # headline / frames, and the ``Caused by:`` line matches
+        # the JGit cause phrase explicitly.
+        assert len(report.log_file_matches) == 5
+        assert all(m.is_soft_failure for m in report.log_file_matches), [
+            (m.is_soft_failure, m.line[:80]) for m in report.log_file_matches
+        ]
+        # No fatal gate fires.
+        assert report.has_user_project_errors is False
+        assert report.has_magic_repo_errors is False
+        assert report.has_soft_failures is True
+
+    def test_real_failure_after_soft_resets_propagation(self, mock_docker):
+        """A non-soft headline resets the propagation state.
+
+        The propagation must not leak the soft flag across an
+        exception boundary — if a soft trace ends and a real
+        ``Cannot replicate`` failure starts immediately after, the
+        real failure (and any of its own continuation frames) must
+        be classified as a hard user-project error.
+        """
+        from replication import check_replication_errors
+
+        docker, mock_run = mock_docker
+        mock_run.side_effect = [
+            make_completed_process(returncode=0),
+            make_completed_process(
+                stdout=(
+                    # Soft exception (headline + one frame).
+                    "com.gerritforge.gerrit.plugins.replication.pull.fetch."
+                    "InexistentRefTransportException: Ref refs/meta/version "
+                    "does not exist on remote\n"
+                    "\tat com.gerritforge.gerrit.plugins.replication.pull."
+                    "fetch.InexistentRefTransportException.wrapException("
+                    "InexistentRefTransportException.java:51)\n"
+                    # Real failure: new non-continuation headline.
+                    "[2026-05-22 18:00:00,000] [aaa] Cannot replicate from "
+                    "https://gerrit.onap.org/r/a/aai/resources.git\n"
+                    "\tat org.eclipse.jgit.transport.TransportHttp.connect("
+                    "TransportHttp.java:696)\n"
+                )
+            ),
+            make_completed_process(stdout="INFO: ready"),
+        ]
+
+        report = check_replication_errors(docker, "abc123")
+        # Expect 4 matches: soft headline, soft frame, real headline,
+        # real frame inheriting from the real headline.
+        assert len(report.log_file_matches) == 4
+        soft_flags = [m.is_soft_failure for m in report.log_file_matches]
+        assert soft_flags == [True, True, False, False], soft_flags
+        # The user-project gate fires on the real failure.
+        assert report.has_user_project_errors is True
+        assert report.has_soft_failures is True
 
 
 # =========================================================================
@@ -1100,7 +1711,7 @@ class TestWaitForReplication:
     @patch("replication.get_git_disk_usage_human", return_value="500M")
     @patch("replication.check_pull_replication_log", return_value=True)
     @patch("replication.check_replication_has_content", return_value=True)
-    @patch("replication.check_replication_errors", return_value=False)
+    @patch("replication.check_replication_errors", return_value=_NO_ERRORS)
     @patch("replication.take_snapshot")
     @patch("replication.count_repositories")
     @patch("replication.time.sleep")
@@ -1149,7 +1760,10 @@ class TestWaitForReplication:
 
     @patch("replication.show_pull_replication_log", return_value="error log")
     @patch("replication.list_repositories", return_value="/var/gerrit/git/a.git")
-    @patch("replication.check_replication_errors", return_value=True)
+    @patch(
+        "replication.check_replication_errors",
+        return_value=_authoritative_error_report(),
+    )
     @patch("replication.take_snapshot")
     @patch("replication.count_repositories", return_value=5)
     @patch("replication.time.sleep")
@@ -1204,7 +1818,11 @@ class TestWaitForReplication:
 
         docker = MagicMock()
         # Error on first poll, then clears, then repo count matches
-        mock_errors.side_effect = [True, False, False]
+        mock_errors.side_effect = [
+            _authoritative_error_report(),
+            _NO_ERRORS,
+            _NO_ERRORS,
+        ]
         mock_snap.side_effect = [
             ReplicationSnapshot(
                 timestamp=100.0,
@@ -1239,12 +1857,219 @@ class TestWaitForReplication:
         )
         assert result is True
 
+    @patch("replication.check_replication_errors")
+    @patch("replication.check_pull_replication_log", return_value=True)
+    @patch("replication.check_replication_has_content", return_value=True)
+    @patch("replication.take_snapshot")
+    @patch("replication.count_repositories", return_value=10)
+    @patch("replication.time.sleep")
+    def test_persistent_magic_repo_error_logged_once(
+        self,
+        mock_sleep,
+        mock_count,
+        mock_snap,
+        mock_has_content,
+        mock_log_ok,
+        mock_errors,
+        caplog,
+    ):
+        """The same magic-repo failure line is logged once per wait loop.
+
+        ``check_replication_errors`` is re-run on every interval
+        (≈5s) and a persistent All-Users permission denial returns
+        the same matching line every time.  Without dedup the wait
+        loop would emit the warning block ≈12 times per minute,
+        burying real progress lines.  The ``seen_magic_repo`` set
+        guarantees we log each unique line exactly once.
+        """
+        from replication import (
+            ErrorMatch,
+            ReplicationErrorReport,
+            ReplicationSnapshot,
+            wait_for_replication,
+        )
+
+        magic_report = ReplicationErrorReport(
+            log_file_matches=[
+                ErrorMatch(
+                    source="pull_replication_log",
+                    pattern="Cannot replicate",
+                    line="Cannot replicate from /All-Users.git",
+                    is_magic_repo=True,
+                )
+            ]
+        )
+        # Same persistent magic-repo error on every poll until
+        # completion.
+        mock_errors.side_effect = [magic_report, magic_report, magic_report]
+        mock_snap.side_effect = [
+            ReplicationSnapshot(
+                timestamp=t,
+                completed_count=10,
+                disk_usage_kb=500000,
+                log_line_count=100,
+                repo_count=10,
+            )
+            for t in (100.0, 105.0, 110.0)
+        ]
+
+        docker = MagicMock()
+        with caplog.at_level("WARNING"):
+            result = wait_for_replication(
+                docker,
+                "abc123",
+                "onap",
+                timeout=30,
+                expected_count=10,
+                stability_window=60,
+            )
+        assert result is True
+        # The magic-repo warning heading appears exactly once,
+        # even though check_replication_errors returned the same
+        # match three times.
+        magic_headings = [
+            rec
+            for rec in caplog.records
+            if "Magic-repo replication errors" in rec.getMessage()
+        ]
+        assert len(magic_headings) == 1, (
+            f"expected one magic-repo warning, got {len(magic_headings)}: "
+            f"{[r.getMessage() for r in magic_headings]}"
+        )
+
+    @patch("replication.check_replication_errors")
+    @patch("replication.check_pull_replication_log", return_value=True)
+    @patch("replication.check_replication_has_content", return_value=True)
+    @patch("replication.take_snapshot")
+    @patch("replication.count_repositories")
+    @patch("replication.time.sleep")
+    def test_new_match_does_not_reemit_earlier_lines(
+        self,
+        mock_sleep,
+        mock_count,
+        mock_snap,
+        mock_has_content,
+        mock_log_ok,
+        mock_errors,
+        caplog,
+    ):
+        """A new match line on poll N must not re-emit lines from N-1.
+
+        Regression test for the dedup bug Copilot flagged on PR #40:
+        the ``seen_*`` sets gated whether the *heading* was printed,
+        but ``format_matches()`` then dumped every match in the
+        report.  As a result, when poll N discovered ONE new line,
+        the diagnostic block re-printed all previously-seen lines
+        too.  Over a long wait loop with multiple distinct failure
+        lines drifting in, this produced quadratic log volume even
+        with the dedup in place.
+
+        Fix: ``format_matches()`` now accepts an ``only_lines``
+        keyword that scopes the body to the newly-discovered lines.
+        The dedup set still gates the heading; ``only_lines`` scopes
+        the body so each unique match appears exactly once in the
+        whole-loop output.
+        """
+        from replication import (
+            ErrorMatch,
+            ReplicationErrorReport,
+            ReplicationSnapshot,
+            wait_for_replication,
+        )
+
+        # Poll 1: one soft-failure line.  Poll 2: that same line
+        # plus a second new soft-failure line.  Poll 3: all stable.
+        line_a = (
+            "InexistentRefTransportException: "
+            "Ref refs/meta/external-ids does not exist on remote"
+        )
+        line_b = (
+            "InexistentRefTransportException: "
+            "Ref refs/meta/version does not exist on remote"
+        )
+
+        def report_with(*lines: str) -> ReplicationErrorReport:
+            return ReplicationErrorReport(
+                log_file_matches=[
+                    ErrorMatch(
+                        source="pull_replication_log",
+                        pattern="TransportException",
+                        line=line,
+                        is_soft_failure=True,
+                    )
+                    for line in lines
+                ]
+            )
+
+        mock_errors.side_effect = [
+            report_with(line_a),
+            report_with(line_a, line_b),
+            report_with(line_a, line_b),
+        ]
+        # Three polls: under-count, under-count, then at-count to exit.
+        mock_count.side_effect = [5, 5, 5, 10, 10]
+        mock_snap.side_effect = [
+            ReplicationSnapshot(
+                timestamp=100.0,
+                completed_count=5,
+                disk_usage_kb=500000,
+                log_line_count=100,
+                repo_count=5,
+            ),
+            ReplicationSnapshot(
+                timestamp=105.0,
+                completed_count=7,
+                disk_usage_kb=600000,
+                log_line_count=120,
+                repo_count=7,
+            ),
+            ReplicationSnapshot(
+                timestamp=110.0,
+                completed_count=10,
+                disk_usage_kb=700000,
+                log_line_count=140,
+                repo_count=10,
+            ),
+        ]
+
+        docker = MagicMock()
+        with caplog.at_level("WARNING"):
+            result = wait_for_replication(
+                docker,
+                "abc123",
+                "onap",
+                timeout=30,
+                expected_count=10,
+                stability_window=60,
+            )
+        assert result is True
+
+        # Across the whole loop, line_a must appear in the body of
+        # the soft-failure heading exactly once (poll 1), and line_b
+        # must appear exactly once (poll 2).  Without the only_lines
+        # filter, poll 2 would have emitted both line_a and line_b
+        # under its heading, double-printing line_a.
+        all_msgs = "\n".join(rec.getMessage() for rec in caplog.records)
+        assert all_msgs.count("refs/meta/external-ids") == 1, all_msgs
+        assert all_msgs.count("refs/meta/version") == 1, all_msgs
+        # And there should be exactly two soft-failure headings: one
+        # for the new line on poll 1, one for the new line on poll 2.
+        soft_headings = [
+            rec
+            for rec in caplog.records
+            if "Soft replication failures" in rec.getMessage()
+        ]
+        assert len(soft_headings) == 2, (
+            f"expected two soft-failure warnings, got {len(soft_headings)}: "
+            f"{[r.getMessage() for r in soft_headings]}"
+        )
+
     @patch("replication.show_pull_replication_log", return_value="log tail")
     @patch("replication.list_repositories", return_value="repos")
     @patch("replication.get_git_disk_usage_human", return_value="100M")
     @patch("replication.check_pull_replication_log", return_value=False)
     @patch("replication.check_replication_has_content", return_value=False)
-    @patch("replication.check_replication_errors", return_value=False)
+    @patch("replication.check_replication_errors", return_value=_NO_ERRORS)
     @patch("replication.take_snapshot")
     @patch("replication.count_repositories", return_value=2)
     @patch("replication.time.sleep")
@@ -1294,7 +2119,7 @@ class TestWaitForReplication:
     @patch("replication.get_git_disk_usage_human", return_value="200M")
     @patch("replication.check_pull_replication_log", return_value=True)
     @patch("replication.check_replication_has_content", return_value=True)
-    @patch("replication.check_replication_errors", return_value=False)
+    @patch("replication.check_replication_errors", return_value=_NO_ERRORS)
     @patch("replication.take_snapshot")
     @patch("replication.count_repositories")
     @patch("replication.time.sleep")
@@ -1334,7 +2159,7 @@ class TestWaitForReplication:
     @patch("replication.get_git_disk_usage_human", return_value="86M")
     @patch("replication.check_pull_replication_log", return_value=True)
     @patch("replication.check_replication_has_content", return_value=True)
-    @patch("replication.check_replication_errors", return_value=False)
+    @patch("replication.check_replication_errors", return_value=_NO_ERRORS)
     @patch("replication.take_snapshot")
     @patch("replication.count_repositories", return_value=36)
     @patch("replication.time.sleep")
@@ -1380,7 +2205,7 @@ class TestWaitForReplication:
     @patch("replication.get_git_disk_usage_human", return_value="86M")
     @patch("replication.check_pull_replication_log", return_value=False)
     @patch("replication.check_replication_has_content", return_value=False)
-    @patch("replication.check_replication_errors", return_value=False)
+    @patch("replication.check_replication_errors", return_value=_NO_ERRORS)
     @patch("replication.take_snapshot")
     @patch("replication.count_repositories", return_value=36)
     @patch("replication.time.sleep")
@@ -1585,7 +2410,7 @@ class TestVerifySingleInstance:
     @patch("replication.get_completed_repo_count", return_value=10)
     @patch("replication.count_repositories", return_value=10)
     @patch("replication.wait_for_replication", return_value=True)
-    @patch("replication.check_replication_errors", return_value=False)
+    @patch("replication.check_replication_errors", return_value=_NO_ERRORS)
     @patch("replication.check_secure_config", return_value=True)
     @patch("replication.show_replication_config", return_value="[remote]")
     @patch("replication.check_replication_config", return_value=True)
@@ -1705,7 +2530,10 @@ class TestVerifySingleInstance:
     @patch("replication.show_replication_config", return_value="[remote]")
     @patch("replication.check_replication_config", return_value=True)
     @patch("replication.verify_plugin_loaded", return_value=True)
-    @patch("replication.check_replication_errors", return_value=True)
+    @patch(
+        "replication.check_replication_errors",
+        return_value=_authoritative_error_report(),
+    )
     def test_replication_errors_detected(
         self,
         mock_errors,
@@ -1737,6 +2565,143 @@ class TestVerifySingleInstance:
         result = verify_single_instance(docker, "onap", instance)
         assert result.success is False
         assert "error" in result.error.lower()
+
+    @patch("replication.get_git_disk_usage_mb", return_value=500)
+    @patch("replication.get_git_disk_usage_human", return_value="500M")
+    @patch("replication.get_completed_repo_count", return_value=10)
+    @patch("replication.count_repositories", return_value=10)
+    @patch("replication.wait_for_replication", return_value=True)
+    @patch("replication.check_secure_config", return_value=True)
+    @patch("replication.show_replication_config", return_value="[remote]")
+    @patch("replication.check_replication_config", return_value=True)
+    @patch("replication.verify_plugin_loaded", return_value=True)
+    @patch(
+        "replication.check_replication_errors",
+        return_value=ReplicationErrorReport(
+            container_log_matches=[
+                ErrorMatch(
+                    source="container_logs",
+                    pattern="pull-replication.*(fetch|replicat|remote).*"
+                    "(error|failed|exception)",
+                    line="pull-replication fetch failed for remote onap-meta",
+                )
+            ]
+        ),
+    )
+    def test_advisory_only_errors_do_not_fail_verification(
+        self,
+        mock_errors,
+        mock_plugin,
+        mock_config,
+        mock_show_config,
+        mock_secure,
+        mock_wait,
+        mock_count,
+        mock_completed,
+        mock_disk_human,
+        mock_disk_mb,
+    ):
+        """Container-log-only matches must warn but not fail.
+
+        Step 3 of ``verify_single_instance`` previously fused the two
+        sources via the old boolean return.  A single hit on the
+        broad ``pull-replication.*(error|failed|exception)`` rule —
+        which trip-fired against benign Gerrit startup chatter —
+        was enough to abort the whole workflow.  The structured
+        report now gates failure on ``has_authoritative_errors``
+        only; advisory matches are surfaced as warnings so the
+        operator can see them, and verification continues.
+        """
+        from replication import verify_single_instance
+
+        docker = MagicMock()
+        docker.container_exists.return_value = True
+        docker.container_state.return_value = "running"
+        docker.exec_test.return_value = True
+
+        instance = {
+            "cid": "abc123def456",
+            "gerrit_host": "gerrit.example.org",
+            "project": "",
+            "expected_project_count": 10,
+        }
+
+        result = verify_single_instance(docker, "onap", instance)
+        # Advisory-only matches must not abort verification — the
+        # later steps (wait_for_replication / disk usage) decide
+        # success.
+        assert result.success is True
+        assert result.error == ""
+
+    @patch("replication.get_git_disk_usage_mb", return_value=500)
+    @patch("replication.get_git_disk_usage_human", return_value="500M")
+    @patch("replication.get_completed_repo_count", return_value=10)
+    @patch("replication.count_repositories", return_value=10)
+    @patch("replication.wait_for_replication", return_value=True)
+    @patch("replication.check_secure_config", return_value=True)
+    @patch("replication.show_replication_config", return_value="[remote]")
+    @patch("replication.check_replication_config", return_value=True)
+    @patch("replication.verify_plugin_loaded", return_value=True)
+    @patch(
+        "replication.check_replication_errors",
+        return_value=ReplicationErrorReport(
+            log_file_matches=[
+                ErrorMatch(
+                    source="pull_replication_log",
+                    pattern="Cannot replicate",
+                    line=(
+                        "[ts] [aaa] Cannot replicate from "
+                        "https://gerrit.onap.org/r/a/All-Users.git"
+                    ),
+                    is_magic_repo=True,
+                )
+            ]
+        ),
+    )
+    def test_magic_repo_only_errors_do_not_fail_verification(
+        self,
+        mock_errors,
+        mock_plugin,
+        mock_config,
+        mock_show_config,
+        mock_secure,
+        mock_wait,
+        mock_count,
+        mock_completed,
+        mock_disk_human,
+        mock_disk_mb,
+    ):
+        """All-Users-only authoritative errors must warn but not fail.
+
+        This is the exact failure mode the previous deployment hit:
+        the source Gerrit's ACL on All-Users requires admin scope,
+        but the workflow's HTTP service-account credentials are not
+        admin.  Every user-project fetch succeeds; only All-Users
+        returns 401/403.  ``verify_single_instance`` must classify
+        that as a magic-repo (advisory) failure so the deployment
+        completes — the operator just loses NoteDb account / group
+        rendering for replicated changes, which is the documented
+        degraded mode for this combination.
+        """
+        from replication import verify_single_instance
+
+        docker = MagicMock()
+        docker.container_exists.return_value = True
+        docker.container_state.return_value = "running"
+        docker.exec_test.return_value = True
+
+        instance = {
+            "cid": "abc123def456",
+            "gerrit_host": "gerrit.example.org",
+            "project": "",
+            "expected_project_count": 10,
+        }
+
+        result = verify_single_instance(docker, "onap", instance)
+        # Magic-repo-only matches must not abort verification —
+        # user-project replication is unaffected.
+        assert result.success is True
+        assert result.error == ""
 
     def test_docker_error_during_container_check(self):
         from replication import verify_single_instance

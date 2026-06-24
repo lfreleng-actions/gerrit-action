@@ -122,6 +122,81 @@ inputs:
       Set to a higher value if you need to replicate more projects.
     required: false
     default: '800'
+  skip_archived_projects:
+    description: |
+      Skip archived (``READ_ONLY``) and hidden projects when fetching
+      the project list from the source Gerrit.  When ``'true'`` (the
+      default) the action passes ``?state=ACTIVE`` to the source
+      Gerrit's ``/projects/`` REST endpoint so archived projects are
+      filtered out server-side and never get pre-created locally;
+      pull-replication consequently does not mirror them, which can
+      roughly halve initial sync time on instances that carry a large
+      historical archive (ONAP is 181 active + 214 read_only = 395
+      total).  Set to ``'false'`` to mirror archived projects too —
+      necessary when debugging or backfilling a specific archived
+      repository.
+    required: false
+    default: 'true'
+  replicate_meta_refs:
+    description: |
+      Mirror Gerrit NoteDb meta refs in addition to the normal heads /
+      tags / changes refs.  Required for the deployed CI Gerrit to
+      render *open changes* (votes, comments, status), per-account
+      identities and group memberships from the source server.
+
+      Concretely, when ``'true'`` the generated ``replication.config``
+      gains:
+
+        * ``+refs/meta/*:refs/meta/*`` and
+          ``+refs/cache-automerge/*:refs/cache-automerge/*`` on every
+          per-project remote (per-project ACLs + merge-preview cache).
+        * A second ``[remote "<slug>-meta"]`` section targeted at
+          ``All-Users`` and ``All-Projects`` that pulls a curated set
+          of enumerated NoteDb refs:
+
+            - ``refs/users/*``, ``refs/groups/*`` (account &
+              group definitions)
+            - ``refs/meta/external-ids`` (login → account_id map)
+            - ``refs/meta/group-names`` (group UUID → name)
+            - ``refs/meta/version`` (NoteDb schema pin)
+            - ``refs/sequences/*`` (change-number sequence)
+            - ``refs/draft-comments/*``, ``refs/starred-changes/*``
+              (per-user state)
+
+      ``refs/meta/config`` is INTENTIONALLY EXCLUDED from the
+      magic-repo remote.  Pulling the source server's
+      ``All-Projects:refs/meta/config`` would overwrite the deployed
+      container's locally-bootstrapped global ACL and silently
+      strip ``administrate-server`` from the bootstrap admin
+      account, breaking the reindex / cache-flush REST calls and
+      the admin UI on the deployed Gerrit.  See the block comment
+      in ``scripts/start-instances.py::generate_replication_config``
+      for the full rationale.
+
+      Off by default because it materially increases initial sync
+      size on instances with large review histories.  Combine with
+      ``reindex_after_sync: 'true'`` so the Gerrit Lucene index
+      reflects the replicated NoteDb state in the UI.
+    required: false
+    default: 'false'
+  reindex_after_sync:
+    description: |
+      After the initial pull-replication sync completes, run an
+      online reindex (and cache flush) inside each Gerrit container.
+      Required for replicated changes to actually show up in the UI
+      and search results, because Gerrit's dashboard queries hit the
+      Lucene secondary index, not NoteDb directly.
+
+      The reindex iterates over every replicated project and issues
+      ``POST /a/projects/<name>/index.changes``, then flushes the
+      ``accounts``, ``groups`` and ``external_ids_map`` caches via
+      ``POST /a/config/server/caches/`` so newly replicated account /
+      group refs become visible without a container restart.
+
+      Has no effect when ``sync_on_startup`` is ``'false'``.  Off by
+      default; typically enabled together with ``replicate_meta_refs``.
+    required: false
+    default: 'false'
   require_replication_success:
     description: |
       If true and sync_on_startup is true, the workflow will fail
@@ -207,6 +282,33 @@ inputs:
 
       Example:
         ssh_auth_username: 'myusername'
+    required: false
+    default: ''
+  ssh_auth_keys_secondary:
+    description: |
+      Additional SSH public keys to register on a *second* Gerrit
+      account, distinct from the one configured via
+      ssh_auth_username / ssh_auth_keys.
+
+      Intended for deployments that want to keep an automated bot
+      identity (primary) separate from one or more human identities
+      (secondary) on the same ephemeral Gerrit. The primary user
+      typically owns the keypair whose private half is consumed by
+      downstream GitHub Actions workflows (e.g.
+      lfreleng-actions/gerrit-review-action), while the secondary
+      user holds long-lived human keys (e.g. Secure Enclave-backed
+      keys) for interactive SSH / UI access.
+
+      When set, ssh_auth_username_secondary must also be set. Both
+      fields use the same format as the primary pair.
+    required: false
+    default: ''
+  ssh_auth_username_secondary:
+    description: |
+      Gerrit username to create for the *second* SSH account.
+      Required when ssh_auth_keys_secondary is set; ignored
+      otherwise. See ssh_auth_keys_secondary for the intended
+      bot/human split.
     required: false
     default: ''
   tunnel_host:
@@ -322,6 +424,49 @@ inputs:
       Auto-fetched via ssh-keyscan when not provided.
     required: false
     default: ''
+  g2p_org_setup:
+    description: |
+      Controls GitHub org verification and auto-provisioning.
+      Options:
+        provision - Audit AND always-overwrite required org
+                    secrets and variables on every run, even
+                    when they already exist.  Overwrite is
+                    deliberate because each container build
+                    produces a fresh ephemeral SSH key and may
+                    bind to different tunnel host / ports
+                    between runs; leaving stale values on the
+                    GitHub side would silently break downstream
+                    workflows.  Use `g2p_org_token_map` to
+                    supply an elevated token per org.
+        verify   - Audit and report only (default).  No writes
+                    to the GitHub org.
+        skip     - Do not audit org configuration.
+    required: false
+    default: 'verify'
+  g2p_org_token_map:
+    description: |
+      Base64-encoded JSON array mapping GitHub org names
+      to PATs for org-level provisioning. Recommended when
+      g2p_org_setup is 'provision' so each target org can
+      use a dedicated admin:org-scoped token; otherwise
+      g2p_github_token is used as a fallback.
+
+      JSON schema (pre-encoding):
+        [
+          {"github_org": "my-org",     "token": "ghp_xxx..."},
+          {"github_org": "other-org",  "token": "ghp_yyy..."}
+        ]
+
+      Encoding (whitespace is tolerated; single line or
+      wrapped both work):
+        printf '%s' "$JSON" | base64
+
+      Store the resulting string as a repo/org secret
+      (e.g. G2P_ORG_TOKENS) and pass it via this input.
+
+      See docs/GITHUB-ORG-VERIFY-CONFIG.md for details.
+    required: false
+    default: ''
 
 outputs:
   container_ids:
@@ -376,6 +521,18 @@ outputs:
   g2p_ssh_public_key:
     description: "Public key for downstream deploy-key setup"
     value: ${{ steps.configure-g2p.outputs.g2p_ssh_public_key || steps.g2p-defaults.outputs.g2p_ssh_public_key }}
+  g2p_org_audit_results:
+    description: >-
+      JSON array of org-level audit check results.
+    value: >-
+      ${{ steps.configure-g2p.outputs.g2p_org_audit_results
+         || steps.g2p-defaults.outputs.g2p_org_audit_results }}
+  g2p_org_provisioned:
+    description: >-
+      Whether any org items were auto-provisioned.
+    value: >-
+      ${{ steps.configure-g2p.outputs.g2p_org_provisioned
+         || steps.g2p-defaults.outputs.g2p_org_provisioned }}
 
 runs:
   using: "composite"
@@ -397,6 +554,8 @@ runs:
         INPUT_PLUGIN_VERSION: ${{ inputs.plugin_version }}
         INPUT_SYNC_ON_STARTUP: ${{ inputs.sync_on_startup }}
         INPUT_ENABLE_CACHE: ${{ inputs.enable_cache }}
+        INPUT_SSH_AUTH_KEYS_SECONDARY: ${{ inputs.ssh_auth_keys_secondary }}
+        INPUT_SSH_AUTH_USERNAME_SECONDARY: ${{ inputs.ssh_auth_username_secondary }}
       # The only $GITHUB_ENV writes below are WORK_DIR and
       # INSTANCE_COUNT. WORK_DIR is a PID-based /tmp path (consumed by
       # later steps) and is not user-controllable. INSTANCE_COUNT is
@@ -465,6 +624,21 @@ runs:
         FETCH_EVERY="$INPUT_FETCH_EVERY"
         if ! [[ "$FETCH_EVERY" =~ ^[0-9]+[smhSMH]?$ ]]; then
           echo "::error::fetch_every must be a valid interval (e.g., '60s', '5m', '1h', or '0' to disable) ❌"
+          exit 1
+        fi
+
+        # Validate the optional secondary SSH user inputs as a pair.
+        # They are documented as mutually required (see
+        # ssh_auth_keys_secondary / ssh_auth_username_secondary), and
+        # the "Add SSH authentication keys (secondary user)" step is
+        # gated on BOTH being non-empty. Without this check a caller
+        # that sets only one would have the secondary user silently
+        # skipped rather than getting an actionable error.
+        if { [ -n "$INPUT_SSH_AUTH_KEYS_SECONDARY" ] && \
+             [ -z "$INPUT_SSH_AUTH_USERNAME_SECONDARY" ]; } || \
+           { [ -z "$INPUT_SSH_AUTH_KEYS_SECONDARY" ] && \
+             [ -n "$INPUT_SSH_AUTH_USERNAME_SECONDARY" ]; }; then
+          echo "::error::ssh_auth_keys_secondary and ssh_auth_username_secondary must be set together ❌"
           exit 1
         fi
 
@@ -614,6 +788,9 @@ runs:
         TUNNEL_HOST: ${{ inputs.tunnel_host }}
         TUNNEL_PORTS: ${{ inputs.tunnel_ports }}
         MAX_PROJECTS: ${{ inputs.max_projects }}
+        SKIP_ARCHIVED_PROJECTS: ${{ inputs.skip_archived_projects }}
+        REPLICATE_META_REFS: ${{ inputs.replicate_meta_refs }}
+        REINDEX_AFTER_SYNC: ${{ inputs.reindex_after_sync }}
       run: |
         # Start Gerrit instances (Python)
         python3 "${{ github.action_path }}/scripts/start-instances.py"
@@ -641,6 +818,25 @@ runs:
         DEBUG: ${{ inputs.debug }}
       run: |
         # Add SSH authentication keys for user access (Python)
+        python3 "${{ github.action_path }}/scripts/setup-gerrit-user.py" \
+          --instances-file "$WORK_DIR/instances.json" \
+          --loop-instances
+
+    # Optional second account: keep bot/human identities separate.
+    # Reuses the same setup-gerrit-user.py entry point; the script
+    # is idempotent and safe to invoke per-instance a second time.
+    - name: "Add SSH authentication keys (secondary user)"
+      if: >-
+        inputs.ssh_auth_keys_secondary != '' &&
+        inputs.ssh_auth_username_secondary != ''
+      shell: bash
+      env:
+        SSH_AUTH_KEYS: ${{ inputs.ssh_auth_keys_secondary }}
+        SSH_AUTH_USERNAME: ${{ inputs.ssh_auth_username_secondary }}
+        USE_API_PATH: ${{ inputs.use_api_path }}
+        DEBUG: ${{ inputs.debug }}
+      run: |
+        # Add SSH auth keys for the secondary Gerrit account (Python)
         python3 "${{ github.action_path }}/scripts/setup-gerrit-user.py" \
           --instances-file "$WORK_DIR/instances.json" \
           --loop-instances
@@ -673,6 +869,22 @@ runs:
         # Verify replication success (Python)
         python3 "${{ github.action_path }}/scripts/verify-replication.py"
 
+    # Reindex changes and flush stale caches after replication.
+    # Required when replicate_meta_refs is enabled so the Gerrit UI
+    # actually shows the replicated open changes; harmless no-op when
+    # the flag is left at its default.
+    - name: "Reindex changes and flush caches"
+      if: inputs.sync_on_startup == 'true' && inputs.reindex_after_sync == 'true'
+      shell: bash
+      env:
+        REINDEX_AFTER_SYNC: ${{ inputs.reindex_after_sync }}
+        SYNC_ON_STARTUP: ${{ inputs.sync_on_startup }}
+        USE_API_PATH: ${{ inputs.use_api_path }}
+        DEBUG: ${{ inputs.debug }}
+      run: |
+        # Reindex Gerrit changes and flush caches (Python)
+        python3 "${{ github.action_path }}/scripts/reindex.py"
+
     # Set default G2P outputs when disabled
     - name: "Set G2P defaults (disabled)"
       if: inputs.g2p_enable != 'true'
@@ -688,6 +900,42 @@ runs:
         echo "g2p_validation_results=[]" >> "$GITHUB_OUTPUT"
         echo "g2p_token_provided=false" >> "$GITHUB_OUTPUT"
         echo "g2p_ssh_public_key=" >> "$GITHUB_OUTPUT"
+        echo "g2p_org_audit_results=[]" >> "$GITHUB_OUTPUT"
+        echo "g2p_org_provisioned=false" >> "$GITHUB_OUTPUT"
+
+    # Install PyNaCl on the runner when we will auto-provision
+    # org-level secrets.  PyNaCl is required for sealed-box
+    # encryption of GitHub Actions secrets; install only when
+    # actually needed.  A plain user-level pip install keeps
+    # this step self-contained: no setup-uv dependency and no
+    # interaction with the runner's PEP 668 system Python.
+    - name: "Install PyNaCl (provision mode)"
+      if: >-
+        inputs.g2p_enable == 'true' &&
+        inputs.g2p_org_setup == 'provision'
+      shell: bash
+      run: |
+        # Install PyNaCl for org secret provisioning.
+        #
+        # Version pin rationale:
+        # * PyNaCl 1.x has been the stable major for years and
+        #   provides the libsodium ``SealedBox`` API
+        #   ``provision_org_secret()`` calls.  Pinning to the 1.x
+        #   line keeps the action's behaviour stable while still
+        #   picking up patch / minor-version security fixes
+        #   between dispatches.
+        # * Without a pin, an upstream PyNaCl 2.0 release
+        #   (whenever it happens) could drop or rename the
+        #   ``SealedBox`` interface and break every provision-mode
+        #   dispatch with no advance signal.
+        # * The lower bound 1.5 is the first PyNaCl release that
+        #   ships modern manylinux wheels for the cpython versions
+        #   GitHub runners ship today; older releases would force
+        #   a slow source build of libsodium on each run.
+        set -euo pipefail
+        echo "Installing PyNaCl (user site)…"
+        python3 -m pip install --user --upgrade 'PyNaCl>=1.5,<2'
+        python3 -c "import nacl.public; print('PyNaCl OK')"
 
     # Configure G2P (gerrit_to_platform)
     - name: "Configure G2P integration"
@@ -708,7 +956,13 @@ runs:
         G2P_VALIDATE_REPOS: ${{ inputs.g2p_validate_repos }}
         G2P_SSH_PRIVATE_KEY: ${{ inputs.g2p_ssh_private_key }}
         G2P_GITHUB_KNOWN_HOSTS: ${{ inputs.g2p_github_known_hosts }}
+        G2P_ORG_SETUP: ${{ inputs.g2p_org_setup }}
+        G2P_ORG_TOKEN_MAP: ${{ inputs.g2p_org_token_map }}
         DEBUG: ${{ inputs.debug }}
+        USE_API_PATH: ${{ inputs.use_api_path }}
+        TUNNEL_HOST: ${{ inputs.tunnel_host }}
+        TUNNEL_PORTS: ${{ inputs.tunnel_ports }}
+        SSH_AUTH_USERNAME: ${{ inputs.ssh_auth_username }}
       run: |
         # Configure gerrit_to_platform inside containers (Python)
         python3 "${{ github.action_path }}/scripts/configure-g2p.py"
@@ -741,21 +995,48 @@ runs:
       run: |
         # Containers will continue/persist (Python)
         python3 - <<'PY'
-        import json, os, pathlib
+        import json, os, pathlib, sys
+
         summary = os.environ.get('GITHUB_STEP_SUMMARY', '')
-        if not summary:
-            exit(0)
-        lines = ['**Containers Status** 🐳', '',
-                 'Containers have detached and will continue/persist', '',
-                 'To manually cleanup later, run:', '```bash']
-        instances_path = pathlib.Path(os.environ.get('WORK_DIR', '')) / 'instances.json'
+        instances_path = (
+            pathlib.Path(os.environ.get('WORK_DIR', ''))
+            / 'instances.json'
+        )
+
+        cids: list[str] = []
         if instances_path.is_file():
             data = json.loads(instances_path.read_text())
             for slug in sorted(data):
                 cid = data[slug].get('cid', '')
                 if cid:
+                    cids.append(cid)
+
+        # Always print a human-readable status to stdout so the
+        # step is never silent in the Actions console.
+        print('🐳 Containers have detached and will continue/persist')
+        if cids:
+            print('To manually clean up later, run:')
+            for cid in cids:
+                print(f'  docker kill {cid}')
+        else:
+            print('(no container IDs were recorded)')
+        sys.stdout.flush()
+
+        if summary:
+            lines = [
+                '**Containers Status** 🐳',
+                '',
+                'Containers have detached and will continue/persist',
+                '',
+            ]
+            if cids:
+                lines.extend([
+                    'To manually cleanup later, run:',
+                    '```bash',
+                ])
+                for cid in cids:
                     lines.append(f'docker kill {cid}')
-        lines.extend(['```', ''])
-        with open(summary, 'a') as fh:
-            fh.write('\n'.join(lines) + '\n')
+                lines.extend(['```', ''])
+            with open(summary, 'a') as fh:
+                fh.write('\n'.join(lines) + '\n')
         PY

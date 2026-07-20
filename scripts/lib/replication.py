@@ -676,8 +676,8 @@ def check_secure_config(docker: DockerManager, cid: str) -> bool:
             logger.info("  secure.config sections:")
             for line in sections.splitlines():
                 logger.info("    %s", line)
-    except DockerError:
-        pass
+    except DockerError as exc:
+        logger.debug("Could not read secure.config sections: %s", exc)
     return True
 
 
@@ -799,8 +799,8 @@ def check_replication_errors(
                         is_soft_failure=is_soft,
                     )
                 )
-        except DockerError:
-            pass
+        except DockerError as exc:
+            logger.debug("Could not read pull_replication_log: %s", exc)
 
     # --- 2. Container logs (narrow, replication-specific patterns only) ---
     #
@@ -825,8 +825,8 @@ def check_replication_errors(
                             line=line.rstrip(),
                         )
                     )
-    except DockerError:
-        pass
+    except DockerError as exc:
+        logger.debug("Could not read container logs: %s", exc)
 
     return report
 
@@ -918,8 +918,8 @@ def check_pull_replication_log(
             if debug:
                 logger.debug("    Found replication errors in log")
             return False
-    except DockerError:
-        pass
+    except DockerError as exc:
+        logger.debug("Could not tail pull_replication_log: %s", exc)
 
     completed_count = get_completed_repo_count(docker, cid)
     if debug:
@@ -1141,8 +1141,8 @@ def trigger_replication(
                     if "Loaded plugin pull-replication" in line:
                         logger.info("  %s", line.strip())
                         break
-            except DockerError:
-                pass
+            except DockerError as exc:
+                logger.debug("Could not read plugin load logs: %s", exc)
         else:
             # Check if jar file exists
             if docker.exec_test(cid, "-f /var/gerrit/plugins/pull-replication.jar"):
@@ -1221,8 +1221,8 @@ def trigger_replication(
                     if "completed" in log_content:
                         logger.info("✅ Replication activity detected and completed")
                         break
-            except DockerError:
-                pass
+            except DockerError as exc:
+                logger.debug("Could not read pull_replication_log: %s", exc)
 
         time.sleep(5)
         waited += 5
@@ -1898,8 +1898,8 @@ def verify_single_instance(
             )
             for line in sample.splitlines():
                 logger.info("    %s", line)
-        except DockerError:
-            pass
+        except DockerError as exc:
+            logger.debug("Could not list sample replicated repositories: %s", exc)
 
     except ReplicationError as exc:
         result.error = str(exc)
@@ -1921,8 +1921,8 @@ def verify_single_instance(
                 logger.error("  Recent replication logs:")
                 for line in repl_lines[-20:]:
                     logger.error("    %s", line.strip())
-        except DockerError:
-            pass
+        except DockerError as log_exc:
+            logger.debug("Could not retrieve replication logs: %s", log_exc)
         return result
 
     # Step 5: Final stats

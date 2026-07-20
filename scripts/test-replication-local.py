@@ -269,8 +269,8 @@ def _build_image(docker: DockerManager, gerrit_version: str) -> str:
         if result.returncode == 0:
             logger.info("Reusing existing image %s", tag)
             return tag
-    except DockerError:
-        pass
+    except DockerError as exc:
+        logger.debug("Image inspect failed for %s: %s", tag, exc)
 
     dockerfile = SCRIPT_DIR.parent / "Dockerfile"
     if not dockerfile.exists():
@@ -414,8 +414,8 @@ def _wait_for_gerrit_ready(docker: DockerManager, cid: str, timeout: int = 120) 
             logs = docker.container_logs(cid, tail=200)
             if "Gerrit Code Review" in logs and "ready" in logs.lower():
                 return True
-        except DockerError:
-            pass
+        except DockerError as exc:
+            logger.debug("Could not read container logs while waiting: %s", exc)
         time.sleep(3)
     return False
 
@@ -875,8 +875,8 @@ def run_scenario(
                 logs = docker.container_logs(ctx.cid, tail=50)
                 for line in logs.splitlines()[-20:]:
                     logger.error("    %s", line.strip())
-            except DockerError:
-                pass
+            except DockerError as exc:
+                logger.debug("Could not dump container logs: %s", exc)
             return result
 
         # Give pull-replication time for the first fetch cycle

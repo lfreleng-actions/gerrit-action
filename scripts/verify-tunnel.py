@@ -373,8 +373,8 @@ def run() -> int:
                             f"- Response time: {result.elapsed_ms:.0f}ms\n"
                             f"- Attempt: {attempt}/{max_attempts}\n\n"
                         )
-                except OSError:
-                    pass
+                except OSError as exc:
+                    logger.debug("Could not write step summary: %s", exc)
 
             return 0
 
@@ -474,8 +474,8 @@ def run() -> int:
             lines.append("")
             with open(summary_file, "a") as fh:
                 fh.write("\n".join(lines) + "\n")
-        except OSError:
-            pass
+        except OSError as exc:
+            logger.debug("Could not write step summary: %s", exc)
 
     return 1
 

@@ -1268,8 +1268,9 @@ class GerritDevClient:
                 try:
                     self.post(f"config/server/caches/{cache}/flush")
                     logger.debug(f"Flushed cache: {cache}")
-                except GerritAPIError:
-                    pass  # Cache may not exist or flush not supported
+                except GerritAPIError as exc:
+                    # Cache may not exist or flush may not be supported.
+                    logger.debug("Cache '%s' flush skipped: %s", cache, exc)
 
     # =========================================================================
     # High-level Operations

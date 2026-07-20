@@ -740,8 +740,8 @@ def check_instance(
         try:
             tail = docker.container_logs(cid, tail=50)
             logger.error("Container logs (last 50 lines):\n%s", tail)
-        except DockerError:
-            pass
+        except DockerError as log_exc:
+            logger.debug("Could not retrieve container logs for %s: %s", slug, log_exc)
 
     return result
 
@@ -833,8 +833,8 @@ def check_all_instances(
         ps_output = docker.ps(filter_name="gerrit-")
         if ps_output:
             logger.info("%s", ps_output)
-    except DockerError:
-        pass
+    except DockerError as exc:
+        logger.debug("Could not query container status: %s", exc)
     logger.info("")
 
     if failed:

@@ -1454,8 +1454,8 @@ def start_instance(
         try:
             ps_output = docker.ps(filter_name=container_name)
             logger.debug("Container status:\n%s", ps_output)
-        except DockerError:
-            pass
+        except DockerError as exc:
+            logger.debug("Could not query container status: %s", exc)
 
     return True
 

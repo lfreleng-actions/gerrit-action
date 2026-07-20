@@ -284,8 +284,8 @@ def run() -> int:
             logger.warning("%s", ps_output)
         else:
             logger.info("No Gerrit containers remaining ✅")
-    except DockerError:
-        pass
+    except DockerError as exc:
+        logger.debug("Could not query remaining Gerrit containers: %s", exc)
     logger.info("")
 
     return 1 if cleanup_failed > 0 else 0

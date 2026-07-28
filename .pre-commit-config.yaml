@@ -3,6 +3,7 @@
 # SPDX-FileCopyrightText: 2025 The Linux Foundation
 
 ci:
+  autofix_prs: false
   # pre-commit.ci sandbox lacks network access and project venv;
   # skip basedpyright (needs venv for import resolution),
   # gha-workflow-linter (needs network for schema fetching), and

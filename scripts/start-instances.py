@@ -5,19 +5,25 @@
 """Start Gerrit instances based on JSON configuration.
 
 This script is the main orchestrator for provisioning one or more local
-Gerrit containers.  It handles:
+Gerrit containers.  Each provisioning step lives in a sibling module
+under ``scripts/lib``; what remains here is the order those steps run
+in, the per-instance and run-wide orchestration, and the process exit
+codes:
 
-- Docker image management (check/build custom image)
-- SSH authentication setup (private key, known_hosts, ssh_config)
-- Remote project list fetching (REST API with auth)
-- Replication configuration generation (replication.config, secure.config)
-- Plugin download (pull-replication, additional plugins)
-- Gerrit site initialisation (``gerrit init`` via Docker)
-- Gerrit configuration (``gerrit.config`` via ``git config``)
-- Project pre-creation (bare git repos for fetchEvery mode)
-- Container startup (``docker run`` with volumes, ports, env)
-- SSH host key capture from running containers
-- Instance metadata persistence (``instances.json``)
+- :mod:`startup_image` — the Docker image instances are started from
+- :mod:`startup_endpoints` — local ports, tunnel resolution and URLs
+- :mod:`startup_site_layout` — site sub-directories, mounts, ownership
+- :mod:`startup_site_init` — bootstrapping a site with ``gerrit init``
+- :mod:`startup_gerrit_config` — ``gerrit.config`` settings
+- :mod:`startup_plugins` — pull-replication and additional plugin JARs
+- :mod:`startup_ssh` — replication SSH auth and host-key capture
+- :mod:`startup_source_projects` — the source Gerrit's project list
+- :mod:`startup_replication_config` and :mod:`startup_secure_config` —
+  ``replication.config`` rendering and its matching credentials
+- :mod:`startup_precreate` — bare git repos for ``fetchEvery`` mode
+- :mod:`startup_container` — starting the container and recording it
+- :mod:`startup_run_context` — collaborators shared across a whole run
+- :mod:`startup_summary` — the closing step summary table
 
 Replaces ``start-instances.sh`` (~1,100 lines).
 
@@ -33,19 +39,9 @@ Usage::
 
 from __future__ import annotations
 
-import ipaddress
-import json
 import logging
-import shlex
-import shutil
-import subprocess
 import sys
-import time
 from pathlib import Path
-from typing import Any
-from urllib.parse import quote
-
-import requests
 
 # ---------------------------------------------------------------------------
 # Path setup – ensure ``scripts/lib`` is importable
@@ -61,49 +57,67 @@ from config import (  # noqa: E402
     InstanceStore,
 )
 from docker_manager import DockerManager  # noqa: E402
-from errors import ConfigError, DockerError, GerritActionError  # noqa: E402
+from errors import GerritActionError  # noqa: E402
 from logging_utils import log_group, setup_logging  # noqa: E402
-from outputs import write_summary  # noqa: E402
+from startup_container import (  # noqa: E402
+    build_instance_metadata,
+    launch_gerrit_container,
+    remove_bundled_replication_plugin,
+    report_started_instance,
+)
+from startup_endpoints import (  # noqa: E402
+    InstanceEndpoints,
+    is_private_tunnel,
+    log_instance_banner,
+    resolve_instance_endpoints,
+    resolve_tunnel,
+    write_env_sh,
+)
+from startup_gerrit_config import configure_gerrit  # noqa: E402
+from startup_image import build_or_reuse_image, verify_custom_image  # noqa: E402
+from startup_plugins import (  # noqa: E402
+    download_additional_plugins,
+    download_file,
+    download_plugin,
+)
+from startup_precreate import (  # noqa: E402
+    fetch_and_precreate_projects,
+    resolve_project_list,
+)
+from startup_replication_config import (  # noqa: E402
+    ReplicationSource,
+    render_replication_config,
+)
+from startup_run_context import StartupRunContext  # noqa: E402
+from startup_secure_config import generate_secure_config  # noqa: E402
+from startup_site_init import init_gerrit_site  # noqa: E402
+from startup_site_layout import GERRIT_SUBDIRS, chown_tree  # noqa: E402
+from startup_ssh import capture_ssh_host_keys, setup_ssh_auth  # noqa: E402
+from startup_summary import write_startup_summary  # noqa: E402
 
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# Constants
+# Re-exports of helpers that moved into sibling modules
+#
+# These names are still referenced as attributes of *this* module — by
+# the functions below and by callers that import them from here — so
+# they keep their original spelling at this level.
+#
+# ``generate_replication_config`` is now nothing more than the renderer
+# itself: the grouping it used to perform is done by its caller, which
+# builds the :class:`ReplicationSource` directly.
 # ---------------------------------------------------------------------------
-
-# Gerrit container runs as UID:GID 1000:1000
-_GERRIT_UID = 1000
-_GERRIT_GID = 1000
-
-# Sub-directories mounted into the container under /var/gerrit/
-_GERRIT_SUBDIRS = (
-    "git",
-    "cache",
-    "index",
-    "data",
-    "etc",
-    "logs",
-    "plugins",
-    "tmp",
-)
-
-# Plugin download URLs (primary and fallback)
-_PLUGIN_URL_TEMPLATE = (
-    "https://gerrit-ci.gerritforge.com/job/"
-    "plugin-pull-replication-gh-bazel-{version}/"
-    "lastSuccessfulBuild/artifact/"
-    "bazel-bin/plugins/pull-replication/pull-replication.jar"
-)
-_PLUGIN_ALT_URL_TEMPLATE = (
-    "https://github.com/GerritForge/pull-replication/releases/"
-    "download/{version}/pull-replication.jar"
-)
-
-# Plugin cache directory
-_PLUGIN_CACHE_DIR = Path("/tmp/gerrit-plugins")
-
-# Gerrit API responses carry this XSSI-protection prefix
-_XSSI_PREFIX = ")]}'\n"
+_GERRIT_SUBDIRS = GERRIT_SUBDIRS
+_chown_tree = chown_tree
+_download_file = download_file
+_is_private_tunnel = is_private_tunnel
+_resolve_project_list = resolve_project_list
+_resolve_tunnel = resolve_tunnel
+_verify_custom_image = verify_custom_image
+_write_env_sh = write_env_sh
+_write_startup_summary = write_startup_summary
+generate_replication_config = render_replication_config
 
 
 # =====================================================================
@@ -117,1047 +131,11 @@ def ensure_custom_image(
 ) -> str:
     """Ensure the custom Gerrit image is available and return its tag.
 
-    If the image already exists (e.g. built by a prior Docker layer
-    cache step), it is reused.  Otherwise it is built from the
-    Dockerfile alongside this script.  If the Dockerfile is missing the
-    official ``gerritcodereview/gerrit`` image is used as a fallback.
+    Resolves the build context — the repository root, which holds the
+    ``Dockerfile`` alongside this script's directory — and delegates to
+    :func:`startup_image.build_or_reuse_image`.
     """
-    image: str = config.custom_image
-
-    if docker.image_exists(image):
-        logger.info("Custom image %s already exists ✅", image)
-        return image
-
-    dockerfile_dir = str(SCRIPT_DIR.parent)
-    dockerfile_path = Path(dockerfile_dir) / "Dockerfile"
-
-    if not dockerfile_path.exists():
-        logger.warning(
-            "Custom image not found and Dockerfile not available at %s",
-            dockerfile_path,
-        )
-        fallback = f"gerritcodereview/gerrit:{config.gerrit_version}"
-        logger.warning("Falling back to official image: %s", fallback)
-        return fallback
-
-    logger.info("Building custom Gerrit image with uv and gerrit_to_platform…")
-    logger.info("  Base image: gerritcodereview/gerrit:%s", config.gerrit_version)
-    logger.info("  Custom image: %s", image)
-
-    try:
-        docker.build_image(
-            tag=image,
-            dockerfile_dir=dockerfile_dir,
-            build_args={"GERRIT_VERSION": config.gerrit_version},
-            timeout=600,
-        )
-        logger.info("Custom image built successfully ✅")
-    except DockerError as exc:
-        logger.warning("Failed to build custom image: %s", exc)
-        fallback = f"gerritcodereview/gerrit:{config.gerrit_version}"
-        logger.warning("Falling back to official image: %s", fallback)
-        return fallback
-
-    # Verify components are present in the image
-    _verify_custom_image(docker, image)
-
-    return image
-
-
-def _verify_custom_image(docker: DockerManager, image: str) -> None:
-    """Log verification of uv and gerrit-to-platform inside the image."""
-    logger.info("Verifying custom image components…")
-    try:
-        out = docker.run_ephemeral(
-            image, entrypoint="", command=["uv", "--version"], timeout=30
-        )
-        logger.info("  uv: %s ✅", out.strip())
-    except DockerError:
-        logger.warning("  uv not found in custom image")
-
-    try:
-        out = docker.run_ephemeral(
-            image, entrypoint="", command=["which", "change-merged"], timeout=30
-        )
-        logger.info("  gerrit-to-platform: %s ✅", out.strip())
-    except DockerError:
-        logger.warning("  gerrit-to-platform not found in custom image")
-
-
-# =====================================================================
-# SSH authentication setup
-# =====================================================================
-
-
-def setup_ssh_auth(
-    instance_dir: Path,
-    gerrit_host: str,
-    ssh_user: str,
-    ssh_port: int,
-    ssh_private_key: str,
-    ssh_known_hosts: str,
-) -> None:
-    """Create the SSH directory structure for replication auth.
-
-    Writes the private key, known_hosts (or fetches via ssh-keyscan),
-    and an SSH config file into ``<instance_dir>/ssh/``.
-    """
-    ssh_dir = instance_dir / "ssh"
-    ssh_dir.mkdir(parents=True, exist_ok=True)
-    ssh_dir.chmod(0o700)
-
-    # Private key
-    id_rsa = ssh_dir / "id_rsa"
-    id_rsa.write_text(ssh_private_key, encoding="utf-8")
-    id_rsa.chmod(0o600)
-
-    # Known hosts
-    known_hosts = ssh_dir / "known_hosts"
-    if ssh_known_hosts:
-        known_hosts.write_text(ssh_known_hosts, encoding="utf-8")
-    else:
-        logger.info("Auto-fetching SSH host key for %s:%d…", gerrit_host, ssh_port)
-        try:
-            result = subprocess.run(
-                ["ssh-keyscan", "-H", "-p", str(ssh_port), gerrit_host],
-                capture_output=True,
-                text=True,
-                timeout=30,
-            )
-            known_hosts.write_text(result.stdout, encoding="utf-8")
-        except (subprocess.TimeoutExpired, FileNotFoundError, OSError) as exc:
-            logger.warning(
-                "Could not fetch SSH host key for %s:%d: %s",
-                gerrit_host,
-                ssh_port,
-                exc,
-            )
-            known_hosts.touch()
-    known_hosts.chmod(0o644)
-
-    # SSH config
-    ssh_config = ssh_dir / "config"
-    ssh_config.write_text(
-        f"Host {gerrit_host}\n"
-        f"  HostName {gerrit_host}\n"
-        f"  User {ssh_user}\n"
-        f"  Port {ssh_port}\n"
-        f"  IdentityFile /var/gerrit/ssh/id_rsa\n"
-        f"  StrictHostKeyChecking yes\n"
-        f"  UserKnownHostsFile /var/gerrit/ssh/known_hosts\n",
-        encoding="utf-8",
-    )
-    ssh_config.chmod(0o600)
-
-
-# =====================================================================
-# Remote project list fetching
-# =====================================================================
-
-
-def fetch_remote_projects(
-    gerrit_host: str,
-    api_path: str,
-    project_filter: str,
-    max_projects: int,
-    config: ActionConfig,
-) -> list[str]:
-    """Fetch the project list from a remote Gerrit server's REST API.
-
-    Parameters
-    ----------
-    gerrit_host:
-        Hostname of the remote Gerrit server.
-    api_path:
-        Detected API path prefix (e.g. ``"/r"``).
-    project_filter:
-        Regex or empty string to filter projects.
-    max_projects:
-        Maximum number of projects to return.
-    config:
-        Action config (for auth credentials).
-
-    Returns
-    -------
-    list[str]
-        Project names (keys from the Gerrit ``/projects/`` endpoint).
-    """
-    logger.info("Fetching project list from %s…", gerrit_host)
-
-    # Build URL
-    path = api_path.strip("/")
-    if path:
-        base_url = f"https://{gerrit_host}/{path}/projects/"
-    else:
-        base_url = f"https://{gerrit_host}/projects/"
-
-    params: dict[str, str] = {"n": str(max_projects)}
-    if project_filter and project_filter != ".*":
-        params["r"] = project_filter
-    # Restrict to ACTIVE projects so READ_ONLY (archived) and HIDDEN
-    # projects are excluded server-side.  Gerrit's REST API natively
-    # supports the ``state`` query parameter, so we let the source
-    # do the filtering rather than fetching everything and dropping
-    # archived entries locally.  Operators who want archived repos
-    # mirrored too can set ``SKIP_ARCHIVED_PROJECTS=false`` (env) or
-    # ``skip_archived_projects: 'false'`` (action input).
-    if config.skip_archived_projects:
-        params["state"] = "ACTIVE"
-        logger.info("  Restricting to ACTIVE projects (SKIP_ARCHIVED_PROJECTS=true)")
-    else:
-        logger.info(
-            "  Including archived (READ_ONLY) projects (SKIP_ARCHIVED_PROJECTS=false)"
-        )
-
-    query = "&".join(f"{k}={quote(v, safe='')}" for k, v in params.items())
-    full_url = f"{base_url}?{query}"
-    logger.info("  API URL: %s", full_url)
-
-    # Build request kwargs
-    kwargs: dict[str, Any] = {"timeout": (30, 60)}
-    auth_type = config.auth_type.lower()
-
-    if auth_type == "http_basic" and config.http_username and config.http_password:
-        kwargs["auth"] = (config.http_username, config.http_password)
-        logger.info("  Using HTTP basic authentication")
-    elif auth_type == "bearer_token" and config.bearer_token:
-        kwargs["headers"] = {"Authorization": f"Bearer {config.bearer_token}"}
-        logger.info("  Using bearer token authentication")
-    else:
-        logger.info("  Using anonymous access for REST API")
-
-    try:
-        resp = requests.get(full_url, **kwargs)
-        resp.raise_for_status()
-    except requests.RequestException as exc:
-        logger.warning("Failed to fetch project list from %s: %s", gerrit_host, exc)
-        return []
-
-    # Strip XSSI prefix and parse JSON
-    body = resp.text
-    if body.startswith(_XSSI_PREFIX):
-        body = body[len(_XSSI_PREFIX) :]
-    elif body.startswith(")]}'"):
-        # Variant without trailing newline
-        body = body.split("\n", 1)[-1]
-
-    try:
-        data = json.loads(body)
-        projects = list(data.keys())
-    except (json.JSONDecodeError, AttributeError) as exc:
-        logger.warning("Failed to parse project list response: %s", exc)
-        return []
-
-    logger.info("  Found %d projects on remote server", len(projects))
-    return projects
-
-
-# =====================================================================
-# Replication configuration
-# =====================================================================
-
-
-def generate_replication_config(
-    config_file: Path,
-    slug: str,
-    gerrit_host: str,
-    project: str,
-    remote_ssh_user: str,
-    remote_ssh_port: int,
-    api_path: str,
-    config: ActionConfig,
-) -> None:
-    """Generate ``replication.config`` for the pull-replication plugin.
-
-    The generated config uses ``fetchEvery`` for polling-based
-    replication rather than ``apiUrl`` (the two are mutually exclusive).
-    """
-    auth_type = config.auth_type.lower()
-
-    # Build the git URL
-    if auth_type == "ssh":
-        git_url = (
-            f"ssh://{remote_ssh_user}@{gerrit_host}:{remote_ssh_port}/${{name}}.git"
-        )
-    else:
-        # HTTP-based auth uses /a/ prefix for authenticated access
-        path = api_path.strip("/")
-        if path:
-            git_url = f"https://{gerrit_host}/{path}/a/${{name}}.git"
-        else:
-            git_url = f"https://{gerrit_host}/a/${{name}}.git"
-
-    # Parse sync refs
-    sync_refs = [r.strip() for r in config.sync_refs.split(",") if r.strip()]
-
-    # When meta-ref replication is enabled, append the per-project
-    # refspecs that carry NoteDb change metadata (``refs/changes/*``
-    # already covers ``refs/changes/NN/CCCCCC/meta`` by hierarchy)
-    # and per-project ACL / dashboard config (``refs/meta/config``,
-    # ``refs/meta/dashboards`` etc.) plus the merge-preview cache.
-    # (Account/group-scoped NoteDb refs such as
-    # ``refs/meta/external-ids`` live on ``All-Users`` — not on
-    # normal per-project repos — and are fetched by the dedicated
-    # ``<slug>-meta`` remote, not by this per-project wildcard.)
-    # Duplicates are tolerated by Gerrit but suppressed here so the
-    # generated file stays tidy when an operator already lists the
-    # ref pattern explicitly in ``sync_refs``.
-    #
-    # Note: the per-project remote DOES mirror each project's own
-    # ``refs/meta/config`` (via the ``refs/meta/*`` wildcard).  This
-    # is intentional and is a different trade-off from the magic-repo
-    # remote's handling:
-    #
-    # * Per-project ``refs/meta/config`` defines that project's
-    #   *project-local* ACL (per-ref read / push / submit
-    #   permissions, plus the project's owner-group reference).
-    # * The bootstrap container does not have a meaningful local
-    #   ACL for replicated user projects (they were just pre-
-    #   created as empty bare repos by ``fetch_and_precreate_
-    #   projects``), so mirroring the source's ACL is a strict
-    #   improvement: it lets the deployed Gerrit reflect the
-    #   source server's per-project access rules.
-    # * The bootstrap admin account 1000000 retains the global
-    #   ``administrateServer`` capability (because the magic-repo
-    #   remote excludes ``All-Projects:refs/meta/config`` — see the
-    #   block comment further down), and that capability bypasses
-    #   project-level ACLs, so the admin still sees every replicated
-    #   project regardless of what its per-project ACL says.
-    # * Non-admin / anonymous viewers may be blocked by per-project
-    #   ACLs that reference source-server group UUIDs that do not
-    #   exist locally, but that is the expected behaviour for a
-    #   "mirror the source server" deployment shape.
-    if config.replicate_meta_refs:
-        for extra in (
-            "+refs/meta/*:refs/meta/*",
-            "+refs/cache-automerge/*:refs/cache-automerge/*",
-        ):
-            if extra not in sync_refs:
-                sync_refs.append(extra)
-
-    fetch_every_enabled = config.fetch_every_enabled
-    fetch_interval = config.fetch_every
-
-    # Calculate connection timeout (at least 2 minutes, in milliseconds)
-    timeout_ms = config.replication_timeout * 1000
-    connection_timeout_ms = max(timeout_ms, 120_000)
-
-    # Build the config file content
-    lines = [
-        "# Pull-replication configuration",
-        "# Auto-generated by gerrit-server-action",
-        "#",
-        "# This configuration uses fetchEvery for polling-based replication.",
-        "# The plugin will poll the source Gerrit at the configured interval",
-        "# to fetch any new or changed refs.",
-        "",
-        "[gerrit]",
-        f"  replicateOnStartup = {str(config.sync_on_startup).lower()}",
-        "  autoReload = true",
-        "",
-        "[replication]",
-        "  lockErrorMaxRetries = 5",
-        "  maxRetries = 5",
-        "  useCGitClient = false",
-        "  refsBatchSize = 50",
-        "",
-        f'[remote "{slug}"]',
-        f"  url = {git_url}",
-    ]
-
-    if fetch_every_enabled:
-        lines.append(f"  fetchEvery = {fetch_interval}")
-        logger.info("  Fetch interval (polling): %s", fetch_interval)
-    else:
-        logger.info("  Automatic polling disabled (interval=%s)", fetch_interval)
-
-    lines.extend(
-        [
-            f"  timeout = {config.replication_timeout}",
-            f"  connectionTimeout = {connection_timeout_ms}",
-            "  replicationDelay = 0",
-            "  replicationRetry = 60",
-            f"  threads = {config.replication_threads}",
-            "  createMissingRepositories = true",
-            "  replicateHiddenProjects = false",
-        ]
-    )
-
-    logger.info("  Git URL for replication: %s", git_url)
-
-    # Fetch refspecs
-    for ref in sync_refs:
-        lines.append(f"  fetch = {ref}")
-
-    # Project filter
-    if project:
-        lines.append(f"  projects = {project}")
-
-    # When meta-ref replication is on, the primary remote carries a
-    # ``+refs/meta/*`` wildcard (appended above).  With an empty
-    # ``project`` filter the primary remote replicates ALL projects
-    # (including ``All-Projects`` and ``All-Users``); even with a
-    # ``project`` filter set, an operator could write a pattern that
-    # matches them.  In either case that wildcard could pull
-    # ``All-Projects:refs/meta/config`` over the top of the deployed
-    # container's locally-bootstrapped global ACL — the exact
-    # Administrators-group hijack the magic-repo remote below goes to
-    # great lengths to avoid.  The dedicated ``<slug>-meta`` remote is
-    # the only path that should ever touch the magic projects (and it
-    # enumerates NoteDb refs precisely so it never fetches
-    # ``refs/meta/config``).  We therefore emit ``excludeProjects``
-    # for both magic projects *unconditionally* whenever
-    # ``replicate_meta_refs`` is enabled — independent of the
-    # ``project`` filter — so the primary remote's wildcard can never
-    # reach them.  The pull-replication plugin (a fork of the
-    # ``replication`` plugin) supports ``excludeProjects`` for exactly
-    # this: a project must match a ``projects`` pattern AND not match
-    # any ``excludeProjects`` pattern to be replicated.
-    if config.replicate_meta_refs:
-        lines.append("  excludeProjects = All-Projects")
-        lines.append("  excludeProjects = All-Users")
-
-    # When meta-ref replication is enabled, emit a second remote that
-    # targets Gerrit's ``All-Users`` and ``All-Projects`` repositories
-    # with the broader set of refspecs they need.  These are the
-    # "magic" projects that hold per-account identities, external IDs,
-    # group membership, the change-number sequence and global ACLs.
-    # Without them, replicated changes display authors as
-    # "Gerrit Code Review", group ACLs do not resolve, and any new
-    # change uploaded against the CI Gerrit risks colliding with the
-    # source's change-number sequence.
-    #
-    # We use a distinct ``[remote "<slug>-meta"]`` section so the
-    # primary remote's project filter and per-project refspecs stay
-    # narrowly scoped to user projects.  ``createMissingRepositories``
-    # is set to ``false`` here because Gerrit always creates these
-    # special repos itself during ``gerrit init``.
-    #
-    # CRITICAL: refs/meta/config is INTENTIONALLY EXCLUDED.
-    # ====================================================
-    # An earlier version of this code used a blanket
-    # ``+refs/meta/*:refs/meta/*`` refspec for both magic projects.
-    # That pulled the source server's
-    # ``All-Projects:refs/meta/config`` over the top of the deployed
-    # container's locally-bootstrapped global ACL.  The fallout was
-    # silent but severe:
-    #
-    # * ``refs/meta/config`` on ``All-Projects`` is the
-    #   server-wide ACL definition.  It names the UUID of the
-    #   ``Administrators`` group, plus every per-ref permission
-    #   block (read / push / submit / forge-author / etc.).
-    # * The bootstrap container creates account 1000000 and adds
-    #   it to the *local* Administrators group (with a locally
-    #   generated UUID).  Setup-gerrit-user.py then provisions the
-    #   operator's SSH keys against that account.
-    # * After pull-replication writes the source server's
-    #   ``refs/meta/config`` into the local All-Projects, the
-    #   Administrators group reference resolves to the source
-    #   server's UUID, whose membership is the source server's
-    #   admins — NOT the local account 1000000.  Account 1000000
-    #   still exists in ``refs/users/00/1000000`` (untouched
-    #   because the ``refs/users/*`` fetch typically fails on
-    #   ACL-restricted source servers), but it is no longer in
-    #   any group with ``administrateServer`` capability.
-    # * Every REST endpoint that requires ``administrate-server``
-    #   or ``maintain-server`` then returns 403 against the
-    #   would-be admin.  ``POST /projects/<name>/index.changes``
-    #   needs ``administrate-server``; ``POST /config/server/
-    #   caches/<name>/flush`` needs ``maintain-server``.  Both
-    #   of those calls fired 403 across the board in the
-    #   2026-05-21 14:35 / 14:51 / 15:02 dispatches with the
-    #   blanket-refspec config.
-    # * Operators see the symptom in the deployed Gerrit UI too:
-    #   their account exists (DEVELOPMENT_BECOME_ANY_ACCOUNT
-    #   still works) but the admin UI is locked because the
-    #   Administrators group no longer points at them.
-    #
-    # Fix: enumerate the meta refs we actually need by exact name
-    # so the wildcard never grabs ``refs/meta/config``.  The
-    # specific refs we want are NoteDb-related (the things that
-    # actually let the deployed Gerrit render the source server's
-    # accounts / groups / changes correctly):
-    #
-    # * ``refs/meta/external-ids`` (All-Users) — login → account_id
-    #   map; without this, replicated changes show ``Anonymous
-    #   Coward`` instead of real author names.
-    # * ``refs/meta/group-names`` (All-Users) — group UUID → name
-    #   map; without this, replicated group references render as
-    #   raw UUIDs.
-    # * ``refs/meta/version`` (both) — NoteDb schema version pin;
-    #   harmless to mirror and required for some consistency
-    #   checks the secondary index runs.
-    #
-    # We do NOT enumerate ``refs/meta/config`` for either project
-    # because:
-    #   - All-Projects:refs/meta/config = source's global ACL
-    #     (the hijack risk above).
-    #   - All-Users:refs/meta/config = source's All-Users-specific
-    #     ACL; replicating it has the same hijack effect against
-    #     account-edit / draft-comment permissions on the local
-    #     deployment.
-    if config.replicate_meta_refs:
-        lines.extend(
-            [
-                "",
-                "# Magic-repo remote: All-Users / All-Projects NoteDb refs.",
-                "# Required for accounts, external IDs, groups and the",
-                "# change-number sequence to resolve on the deployed",
-                "# CI Gerrit.  refs/meta/config is INTENTIONALLY",
-                "# EXCLUDED — see the source comment in",
-                "# generate_replication_config for the full rationale",
-                "# (TL;DR: replicating it overwrites the local",
-                "# Administrators-group ACL and breaks reindex /",
-                "# cache-flush / admin UI on the bootstrap account).",
-                f'[remote "{slug}-meta"]',
-                f"  url = {git_url}",
-            ]
-        )
-        if fetch_every_enabled:
-            lines.append(f"  fetchEvery = {fetch_interval}")
-        lines.extend(
-            [
-                f"  timeout = {config.replication_timeout}",
-                f"  connectionTimeout = {connection_timeout_ms}",
-                "  replicationDelay = 0",
-                "  replicationRetry = 60",
-                f"  threads = {config.replication_threads}",
-                "  createMissingRepositories = false",
-                "  replicateHiddenProjects = true",
-                # Refspecs are enumerated rather than wildcarded so
-                # the source server's ``refs/meta/config`` (on either
-                # All-Projects or All-Users) is never pulled.  See the
-                # block comment above for the rationale.  Each refspec
-                # is documented inline so future maintainers can see
-                # which magic project the ref normally lives on and
-                # why we are mirroring it.
-                #
-                # NoteDb identity / membership refs (All-Users):
-                "  fetch = +refs/users/*:refs/users/*",
-                "  fetch = +refs/groups/*:refs/groups/*",
-                "  fetch = +refs/meta/external-ids:refs/meta/external-ids",
-                "  fetch = +refs/meta/group-names:refs/meta/group-names",
-                # Per-user state refs (All-Users); harmless no-ops
-                # against All-Projects because they don't exist there.
-                "  fetch = +refs/draft-comments/*:refs/draft-comments/*",
-                "  fetch = +refs/starred-changes/*:refs/starred-changes/*",
-                # Change-number sequence (All-Projects); also a no-op
-                # against All-Users.  Without this the local container
-                # would start handing out change numbers from 1, which
-                # would collide with the replicated refs/changes/*
-                # numbers on the very first locally-uploaded change.
-                # The test Gerrit is read-only by policy, so this is
-                # belt-and-braces, but cheap to mirror.
-                "  fetch = +refs/sequences/*:refs/sequences/*",
-                # NoteDb schema-version pin (both projects).  Cheap to
-                # mirror and helps some consistency-check paths in the
-                # secondary index.
-                "  fetch = +refs/meta/version:refs/meta/version",
-                # Magic-project filter.  Both names are listed even
-                # though some refspecs only apply to one of them —
-                # the pull-replication plugin silently skips refs
-                # that don't exist for a given project.
-                "  projects = All-Users",
-                "  projects = All-Projects",
-            ]
-        )
-        logger.info(
-            "  Meta-ref replication enabled: "
-            "All-Users / All-Projects NoteDb refs will be mirrored "
-            "(refs/meta/config excluded to preserve local ACL)"
-        )
-
-    config_file.parent.mkdir(parents=True, exist_ok=True)
-    config_file.write_text("\n".join(lines) + "\n", encoding="utf-8")
-
-
-def generate_secure_config(
-    config_file: Path,
-    slug: str,
-    config: ActionConfig,
-) -> None:
-    """Generate ``secure.config`` with authentication credentials.
-
-    Emits a per-remote section for every remote that
-    ``generate_replication_config`` writes into the matching
-    ``replication.config``.  When ``replicate_meta_refs`` is enabled
-    that includes the magic-repo remote (``<slug>-meta``) targeting
-    ``All-Users`` and ``All-Projects`` — without explicit credentials
-    here the plugin falls back to anonymous auth, which the source
-    Gerrit refuses with ``TransportException: not authorized``.
-    """
-    auth_type = config.auth_type.lower()
-
-    if auth_type == "http_basic":
-        sections = [
-            f'[remote "{slug}"]\n'
-            f"  username = {config.http_username}\n"
-            f"  password = {config.http_password}\n"
-        ]
-        if config.replicate_meta_refs:
-            # Mirror the credentials onto the magic-repo remote so
-            # the matching ``[remote "<slug>-meta"]`` section emitted
-            # by generate_replication_config can authenticate against
-            # the source Gerrit when fetching All-Users / All-Projects.
-            sections.append(
-                f'[remote "{slug}-meta"]\n'
-                f"  username = {config.http_username}\n"
-                f"  password = {config.http_password}\n"
-            )
-        content = "".join(sections)
-    elif auth_type == "bearer_token":
-        # Bearer-token auth applies globally to all remotes via the
-        # ``[auth]`` section, so no per-remote duplication is needed
-        # for the magic-repo remote.
-        content = f"[auth]\n  bearerToken = {config.bearer_token}\n"
-    else:
-        # SSH auth needs no credentials in secure.config, so the body
-        # is empty.  The file itself is still created (empty, 0600)
-        # below — only its credential contents are unnecessary here.
-        content = ""
-
-    config_file.parent.mkdir(parents=True, exist_ok=True)
-    # Create (or truncate) secure.config with 0600 *before* writing
-    # any credentials into it, so there is no transient window where
-    # the file exists with a more permissive umask-derived mode
-    # (e.g. 0644) while it already holds the HTTP password / bearer
-    # token.  touch() creates an empty file; the explicit chmod also
-    # tightens a pre-existing file (O_CREAT does not relax/alter the
-    # mode of an existing file), and write_text() preserves the mode
-    # of the now-existing file.
-    config_file.touch(mode=0o600, exist_ok=True)
-    config_file.chmod(0o600)
-    config_file.write_text(content, encoding="utf-8")
-
-
-# =====================================================================
-# Plugin download
-# =====================================================================
-
-
-def download_plugin(
-    plugin_dir: Path,
-    plugin_version: str,
-    skip_plugin_install: bool,
-) -> bool:
-    """Download the pull-replication plugin JAR.
-
-    Uses a local cache at ``/tmp/gerrit-plugins`` and tries a fallback
-    URL if the primary CI build is unavailable.
-
-    Returns *True* on success, *False* on failure.
-    """
-    if skip_plugin_install:
-        logger.info("Skipping plugin download (skip_plugin_install=true)")
-        return True
-
-    _PLUGIN_CACHE_DIR.mkdir(parents=True, exist_ok=True)
-    cached_jar = _PLUGIN_CACHE_DIR / f"pull-replication-{plugin_version}.jar"
-    target_jar = plugin_dir / "pull-replication.jar"
-    plugin_dir.mkdir(parents=True, exist_ok=True)
-
-    if cached_jar.exists():
-        logger.info("Using cached plugin: %s", cached_jar)
-        shutil.copy2(cached_jar, target_jar)
-        return True
-
-    logger.info("Downloading pull-replication plugin…")
-
-    # Primary URL
-    primary_url = _PLUGIN_URL_TEMPLATE.format(version=plugin_version)
-    if _download_file(primary_url, cached_jar):
-        logger.info("Plugin downloaded ✅")
-        shutil.copy2(cached_jar, target_jar)
-        return True
-
-    # Fallback URL
-    logger.warning("Primary download failed, attempting alternate source…")
-    alt_url = _PLUGIN_ALT_URL_TEMPLATE.format(version=plugin_version)
-    if _download_file(alt_url, cached_jar):
-        logger.info("Plugin downloaded from alternate source ✅")
-        shutil.copy2(cached_jar, target_jar)
-        return True
-
-    logger.error("Failed to download pull-replication plugin ❌")
-    return False
-
-
-def download_additional_plugins(
-    plugin_dir: Path,
-    additional_plugins: str,
-) -> None:
-    """Download additional plugins from comma-separated URLs."""
-    if not additional_plugins:
-        return
-
-    logger.info("Downloading additional plugins…")
-    plugin_dir.mkdir(parents=True, exist_ok=True)
-
-    for url in additional_plugins.split(","):
-        url = url.strip()
-        if not url:
-            continue
-        name = url.rsplit("/", 1)[-1]
-        dest = plugin_dir / name
-        logger.info("Downloading: %s", name)
-        if _download_file(url, dest):
-            logger.info("  ✅ %s", name)
-        else:
-            logger.warning("  Failed to download %s", name)
-
-
-def _download_file(url: str, dest: Path) -> bool:
-    """Download *url* to *dest*.  Returns *True* on success."""
-    try:
-        resp = requests.get(url, timeout=120, stream=True)
-        resp.raise_for_status()
-        dest.parent.mkdir(parents=True, exist_ok=True)
-        with open(dest, "wb") as fh:
-            for chunk in resp.iter_content(chunk_size=8192):
-                fh.write(chunk)
-        return True
-    except requests.RequestException as exc:
-        logger.debug("Download failed for %s: %s", url, exc)
-        # Clean up partial download
-        if dest.exists():
-            dest.unlink(missing_ok=True)
-        return False
-
-
-# =====================================================================
-# Gerrit site initialisation
-# =====================================================================
-
-
-def init_gerrit_site(
-    docker: DockerManager,
-    instance_dir: Path,
-    slug: str,
-    canonical_url: str,
-    image: str,
-    extra_init_args: str = "",
-) -> None:
-    """Initialise a Gerrit site directory using ``gerrit init``.
-
-    Runs the Gerrit image with ``init`` as the command, mounting only
-    the individual sub-directories (not the whole ``/var/gerrit``
-    directory) so that ``/var/gerrit/bin`` from the image is preserved.
-
-    Parameters
-    ----------
-    extra_init_args:
-        Optional shell-style argument string to pass to ``gerrit init``
-        (from the ``gerrit_init_args`` action input).  Parsed with
-        ``shlex.split`` so callers can use the familiar
-        whitespace-separated form (``--foo bar --baz=qux``) and quote
-        values that contain spaces.  Each resulting token becomes its
-        own argv element.  Empty strings are ignored.
-    """
-    logger.info("Initializing Gerrit site for %s…", slug)
-
-    # Create sub-directories with Gerrit-compatible ownership
-    for subdir in _GERRIT_SUBDIRS:
-        d = instance_dir / subdir
-        d.mkdir(parents=True, exist_ok=True)
-
-    _chown_tree(instance_dir)
-
-    # Build volumes: mount each sub-directory individually
-    volumes = {str(instance_dir / sub): f"/var/gerrit/{sub}" for sub in _GERRIT_SUBDIRS}
-
-    try:
-        # Pass --batch so init never prompts, and
-        # --install-all-plugins so the bundled plugins from the
-        # image (hooks, download-commands, delete-project,
-        # webhooks, singleusergroup, reviewnotes, etc.) get copied
-        # into the mounted plugins/ directory.  Without this the
-        # mount shadows the image's bundled plugins and Gerrit
-        # starts without the hooks plugin — which silently breaks
-        # G2P because Gerrit never invokes the wrapper scripts in
-        # /var/gerrit/hooks/.
-        command = ["init", "--batch", "--install-all-plugins"]
-        if extra_init_args.strip():
-            # Honour any user-supplied extras.  Parse with
-            # ``shlex.split`` so callers can use the familiar
-            # shell-style whitespace-separated form
-            # (``--foo bar --baz``) and still get quoting handled
-            # correctly for values that contain spaces.  Each
-            # token becomes its own argv element, matching the
-            # behaviour ``gerrit init`` expects.
-            #
-            # ``shlex.split`` raises ``ValueError`` on malformed
-            # input (e.g. an unbalanced quote).  Convert that to a
-            # ConfigError pointing at the offending action input so
-            # the user sees an actionable ``::error::`` line
-            # instead of an unhelpful stack trace from deep inside
-            # the container start path.
-            try:
-                extra_tokens = shlex.split(extra_init_args)
-            except ValueError as exc:
-                raise ConfigError(
-                    f"Invalid 'gerrit_init_args' input ({exc}): {extra_init_args!r}"
-                ) from exc
-            for extra in extra_tokens:
-                if extra:
-                    command.append(extra)
-
-        docker.run_ephemeral(
-            image,
-            volumes=volumes,
-            env={"CANONICAL_WEB_URL": canonical_url},
-            command=command,
-            timeout=180,
-        )
-    except DockerError as exc:
-        raise GerritActionError(
-            f"Failed to initialize Gerrit site for {slug}: {exc}"
-        ) from exc
-
-    logger.info("Gerrit site initialized ✅")
-
-
-# =====================================================================
-# Gerrit configuration
-# =====================================================================
-
-
-def configure_gerrit(
-    instance_dir: Path,
-    slug: str,
-    canonical_url: str,
-    listen_url: str,
-    api_path: str,
-    advertised_ssh_addr: str,
-    use_tunnel: bool,
-    tunnel_host: str = "",
-) -> None:
-    """Write ``gerrit.config`` settings via ``git config``.
-
-    This mirrors the ``configure_gerrit()`` function from the shell
-    script, setting auth to DEVELOPMENT_BECOME_ANY_ACCOUNT mode and
-    configuring pull-replication.
-    """
-    logger.info("Configuring Gerrit for %s…", slug)
-
-    config_file = str(instance_dir / "etc" / "gerrit.config")
-
-    def _gc(*args: str) -> None:
-        """Run ``git config -f <config_file> <args…>``."""
-        subprocess.run(
-            ["git", "config", "-f", config_file, *args],
-            check=True,
-            capture_output=True,
-            text=True,
-            timeout=10,
-        )
-
-    if api_path:
-        logger.info("  URL prefix: %s (mirroring production server)", api_path)
-    else:
-        logger.info("  URL prefix: (none)")
-
-    # Core settings
-    _gc("gerrit.instanceId", slug)
-    _gc("gerrit.canonicalWebUrl", canonical_url)
-    _gc("httpd.listenUrl", listen_url)
-    _gc("sshd.listenAddress", "*:29418")
-    _gc("sshd.advertisedAddress", advertised_ssh_addr)
-
-    # Download schemes
-    _gc("download.scheme", "ssh")
-    _gc("--add", "download.scheme", "http")
-    _gc("download.command", "checkout")
-    _gc("--add", "download.command", "cherry_pick")
-    _gc("--add", "download.command", "pull")
-
-    # Auth — development mode for testing
-    _gc("auth.type", "DEVELOPMENT_BECOME_ANY_ACCOUNT")
-
-    # OOTB filter for automatic account creation
-    _gc(
-        "httpd.filterClass",
-        "com.googlesource.gerrit.plugins.ootb.FirstTimeRedirect",
-    )
-    ootb_redirect_url = f"{api_path}/login/%23%2F?account_id=1000000"
-    _gc("httpd.firstTimeRedirectUrl", ootb_redirect_url)
-
-    # Remote plugin admin
-    if use_tunnel:
-        _gc("plugins.allowRemoteAdmin", "false")
-        if _is_private_tunnel(tunnel_host):
-            logger.info("Tunnel mode active (private network — remote admin disabled).")
-        else:
-            logger.warning(
-                "⚠️  Tunnel mode active with DEVELOPMENT_BECOME_ANY_ACCOUNT auth."
-            )
-            logger.warning(
-                "   Anyone with network access can authenticate as any user."
-            )
-            logger.warning(
-                "   Remote plugin admin has been disabled to limit exposure."
-            )
-    else:
-        _gc("plugins.allowRemoteAdmin", "true")
-
-    _gc("container.user", "gerrit")
-    _gc("plugin.pull-replication.enabled", "true")
-
-    logger.info("Gerrit configured ✅")
-    logger.info("  Mode: non-replica (web UI enabled)")
-    logger.info("  Replication: fetchEvery polling")
-
-
-# =====================================================================
-# Project pre-creation
-# =====================================================================
-
-
-def _resolve_project_list(
-    instance: InstanceConfig,
-    api_path: str,
-    config: ActionConfig,
-) -> list[str]:
-    """Resolve the list of projects to pre-create.
-
-    Handles three cases:
-    1. No project filter — fetch all from remote.
-    2. ``regex:`` prefix — fetch matching from remote.
-    3. Literal name(s) — comma-separated list.
-    """
-    project = instance.project
-    gerrit_host = instance.gerrit_host
-    max_projects = instance.max_projects or config.max_projects
-
-    if not project:
-        # No filter — fetch everything
-        logger.info("  No project filter, fetching full project list…")
-        logger.info(
-            "  (Max projects: %d — set MAX_PROJECTS env to override)",
-            max_projects,
-        )
-        return fetch_remote_projects(gerrit_host, api_path, "", max_projects, config)
-
-    if project.startswith("regex:"):
-        regex_pattern = project[len("regex:") :]
-        logger.info("  Project filter explicitly marked as regex: %s", regex_pattern)
-        logger.info("  Fetching matching projects from remote…")
-        return fetch_remote_projects(
-            gerrit_host, api_path, regex_pattern, max_projects, config
-        )
-
-    # Literal project name(s) — comma-separated
-    return [p.strip() for p in project.split(",") if p.strip()]
-
-
-def fetch_and_precreate_projects(
-    instance_dir: Path,
-    instance: InstanceConfig,
-    api_path: str,
-    config: ActionConfig,
-) -> int:
-    """Fetch expected projects and pre-create bare git repos.
-
-    Pre-creation is **required** because the ``fetchEvery`` mode only
-    polls repositories that already exist in Gerrit's ``projectCache``.
-    Without pre-creating the directories the plugin will not know about
-    them and will not fetch.
-
-    Returns the expected project count (excluding system repos).
-    """
-    logger.info("Fetching expected project count from remote…")
-
-    raw_projects = _resolve_project_list(instance, api_path, config)
-
-    # Filter out Gerrit internal/system projects
-    filtered = [p for p in raw_projects if p not in ("All-Projects", "All-Users")]
-
-    expected_count = len(filtered)
-    logger.info(
-        "  Found %d projects on remote server (excluding All-Projects/All-Users)",
-        expected_count,
-    )
-
-    # Store for later verification by check-services / verify-replication
-    count_file = instance_dir / "expected_project_count"
-    count_file.write_text(str(expected_count), encoding="utf-8")
-
-    # Pre-create bare repositories
-    logger.info("  Pre-creating project directories for replication…")
-    created = 0
-    git_dir = instance_dir / "git"
-    for proj in filtered:
-        project_dir = git_dir / f"{proj}.git"
-        if not project_dir.exists():
-            project_dir.mkdir(parents=True, exist_ok=True)
-            subprocess.run(
-                ["git", "init", "--bare", str(project_dir)],
-                capture_output=True,
-                timeout=30,
-                check=False,
-            )
-            _chown_tree(project_dir)
-            created += 1
-
-    logger.info("  Created %d project directories", created)
-    return expected_count
-
-
-# =====================================================================
-# SSH host key capture
-# =====================================================================
-
-
-def capture_ssh_host_keys(
-    docker: DockerManager,
-    cid: str,
-    work_dir: Path,
-    slug: str,
-) -> dict[str, str]:
-    """Capture SSH host *public* keys from a running Gerrit container.
-
-    Returns a mapping of key-file-name (without ``.pub``) to key
-    content, e.g.::
-
-        {"ssh_host_ed25519_key": "ssh-ed25519 AAAAC3…"}
-    """
-    logger.info("Capturing SSH host public keys…")
-
-    keys_dir = work_dir / "ssh_host_keys" / slug
-    keys_dir.mkdir(parents=True, exist_ok=True)
-
-    # List public key files inside the container
-    try:
-        pub_files_raw = docker.exec_cmd(
-            cid,
-            "ls /var/gerrit/etc/ssh_host_*_key.pub 2>/dev/null",
-            timeout=15,
-            check=False,
-        )
-    except DockerError:
-        pub_files_raw = ""
-
-    result: dict[str, str] = {}
-    for pub_key_path in pub_files_raw.strip().split():
-        if not pub_key_path:
-            continue
-        filename = pub_key_path.rsplit("/", 1)[-1]
-        try:
-            docker.cp(
-                f"{cid}:/var/gerrit/etc/{filename}",
-                str(keys_dir / filename),
-            )
-        except DockerError:
-            logger.debug("Could not copy %s from container", filename)
-            continue
-
-        local_file = keys_dir / filename
-        if local_file.exists():
-            key_name = filename.replace(".pub", "")
-            content = local_file.read_text(encoding="utf-8").strip()
-            result[key_name] = content
-
-    logger.info("  SSH host keys captured ✅")
-    return result
+    return build_or_reuse_image(docker, config, SCRIPT_DIR.parent)
 
 
 # =====================================================================
@@ -1165,170 +143,52 @@ def capture_ssh_host_keys(
 # =====================================================================
 
 
-def _is_private_tunnel(tunnel_host: str) -> bool:
-    """Check whether the tunnel host is a private or VPN address.
-
-    Returns ``True`` when *tunnel_host* is an IPv4 address inside one of
-    the RFC 1918 private ranges (``10.0.0.0/8``, ``172.16.0.0/12``,
-    ``192.168.0.0/16``) or the CGNAT range (``100.64.0.0/10``, which
-    includes Tailscale addresses).  Hostnames that cannot be parsed as
-    an IP address (e.g. ``bore.pub``) are treated as public and return
-    ``False``.
-    """
-    if not tunnel_host:
-        return False
-
-    try:
-        addr = ipaddress.ip_address(tunnel_host)
-    except ValueError:
-        return False
-
-    if not isinstance(addr, ipaddress.IPv4Address):
-        return False
-
-    private_networks = (
-        ipaddress.ip_network("10.0.0.0/8"),
-        ipaddress.ip_network("172.16.0.0/12"),
-        ipaddress.ip_network("192.168.0.0/16"),
-        ipaddress.ip_network("100.64.0.0/10"),
-    )
-    return any(addr in net for net in private_networks)
-
-
-def _resolve_tunnel(
-    slug: str,
-    config: ActionConfig,
-) -> tuple[bool, str, int, int]:
-    """Determine tunnel configuration for an instance.
-
-    Returns ``(use_tunnel, url_host, url_http_port, url_ssh_port)``.
-    The ports returned are the *external* ports to advertise (either
-    tunnel ports or the local mapped ports — the caller decides local
-    ports separately).
-    """
-    tunnel_ports = config.tunnel_ports
-    tunnel_host = config.tunnel_host
-
-    if tunnel_host and slug in tunnel_ports:
-        tc = tunnel_ports[slug]
-        logger.info("  External tunnel configured: %s", tunnel_host)
-        logger.info("    HTTP port: %d", tc.http_port)
-        logger.info("    SSH port: %d", tc.ssh_port)
-        return True, tunnel_host, tc.http_port, tc.ssh_port
-
-    if tunnel_host:
-        logger.info("  TUNNEL_HOST set but no ports found for slug '%s'", slug)
-        logger.info("  Falling back to localhost URLs")
-
-    return False, "localhost", 0, 0  # 0 → caller fills in local ports
-
-
-def start_instance(
-    docker: DockerManager,
+def _provision_instance_site(
+    context: StartupRunContext,
     instance: InstanceConfig,
-    index: int,
-    config: ActionConfig,
-    api_path_store: ApiPathStore,
-    instance_store: InstanceStore,
-    image: str,
-) -> bool:
-    """Provision and start a single Gerrit container.
+    endpoints: InstanceEndpoints,
+    api_path: str,
+) -> int | None:
+    """Prepare an instance's site directory, ready for the container.
 
-    Returns *True* on success, *False* on failure.
+    Runs the on-disk provisioning steps in order: ``gerrit init``,
+    ``gerrit.config``, plugins, replication SSH auth, the replication
+    config pair, project pre-creation, and removal of the conflicting
+    bundled replication plugin.
+
+    Returns the expected project count, or *None* if the plugin download
+    failed and the instance should be abandoned.
     """
+    config = context.config
     slug = instance.slug
     gerrit_host = instance.gerrit_host
-    project = instance.project
 
     # Per-instance SSH settings
     remote_ssh_user = instance.ssh_user or config.remote_ssh_user
     remote_ssh_port = instance.ssh_port or config.remote_ssh_port
 
-    # Local ports
-    http_port = config.base_http_port + index
-    ssh_port = config.base_ssh_port + index
-
-    # API path from detection phase
-    api_path = api_path_store.get_api_path(slug)
-    api_url = api_path_store.get_api_url(slug)
-
-    # Effective API path (only used when USE_API_PATH=true)
-    effective_api_path = instance.effective_api_path
-
-    # Tunnel configuration
-    use_tunnel, url_host, tunnel_http, tunnel_ssh = _resolve_tunnel(slug, config)
-    if use_tunnel:
-        url_http_port = tunnel_http
-        url_ssh_port = tunnel_ssh
-    else:
-        url_host = "localhost"
-        url_http_port = http_port
-        url_ssh_port = ssh_port
-
-    advertised_ssh_addr = f"{url_host}:{url_ssh_port}"
-
-    # Build URLs
-    if effective_api_path:
-        canonical_url = f"http://{url_host}:{url_http_port}{effective_api_path}/"
-        listen_url = f"http://*:8080{effective_api_path}/"
-        logger.info("  Using API path: %s (USE_API_PATH=true)", effective_api_path)
-    else:
-        canonical_url = f"http://{url_host}:{url_http_port}/"
-        listen_url = "http://*:8080/"
-        if api_path:
-            logger.info("  API path detected (%s) but USE_API_PATH is false", api_path)
-            logger.info("  Serving at root instead")
-
-    # Write env.sh for downstream steps
-    _write_env_sh(
-        config.work_path, canonical_url, listen_url, advertised_ssh_addr, use_tunnel
-    )
-
-    # Banner
-    logger.info("")
-    logger.info("========================================")
-    logger.info("Instance %d: %s", index + 1, slug)
-    logger.info("  Project: %s", project or "(all)")
-    logger.info("  Source: %s", gerrit_host)
-    logger.info("  Local HTTP Port: %d", http_port)
-    logger.info("  Local SSH Port: %d", ssh_port)
-    if use_tunnel:
-        logger.info("  Tunnel Mode: ENABLED")
-        logger.info("  Public URL: %s", canonical_url)
-        logger.info("  Public SSH: %s", advertised_ssh_addr)
-    else:
-        logger.info("  Tunnel Mode: disabled (localhost)")
-    logger.info("========================================")
-
     instance_dir = config.work_path / "instances" / slug
 
     # Step 1: Init site
     init_gerrit_site(
-        docker,
+        context.docker,
         instance_dir,
         slug,
-        canonical_url,
-        image,
+        endpoints.canonical_url,
+        context.image,
         extra_init_args=config.gerrit_init_args,
     )
 
     # Step 2: Configure
     configure_gerrit(
-        instance_dir,
-        slug,
-        canonical_url,
-        listen_url,
-        api_path,
-        advertised_ssh_addr,
-        use_tunnel,
-        tunnel_host=config.tunnel_host,
+        instance_dir, slug, endpoints, api_path, tunnel_host=config.tunnel_host
     )
 
     # Step 3: Plugins
     if not download_plugin(
         instance_dir / "plugins", config.plugin_version, config.skip_plugin_install
     ):
-        return False
+        return None
     download_additional_plugins(instance_dir / "plugins", config.additional_plugins)
 
     # Step 4: SSH auth
@@ -1346,18 +206,16 @@ def start_instance(
     generate_replication_config(
         instance_dir / "etc" / "replication.config",
         slug,
-        gerrit_host,
-        project,
-        remote_ssh_user,
-        remote_ssh_port,
-        api_path,
+        ReplicationSource(
+            host=gerrit_host,
+            ssh_user=remote_ssh_user,
+            ssh_port=remote_ssh_port,
+            api_path=api_path,
+        ),
+        instance.project,
         config,
     )
-    generate_secure_config(
-        instance_dir / "etc" / "secure.config",
-        slug,
-        config,
-    )
+    generate_secure_config(instance_dir / "etc" / "secure.config", slug, config)
 
     # Step 6: Pre-create projects
     expected_count = fetch_and_precreate_projects(
@@ -1365,177 +223,78 @@ def start_instance(
     )
 
     # Step 7: Remove bundled replication plugin (conflicts with pull-replication)
-    bundled = instance_dir / "plugins" / "replication.jar"
-    if bundled.exists():
-        bundled.unlink()
+    remove_bundled_replication_plugin(instance_dir)
 
-    # Step 8: Start container
-    logger.info("Starting Gerrit container…")
+    return expected_count
 
-    container_name = f"gerrit-{slug}"
-    cidfile = str(config.work_path / f"{container_name}.cid")
 
-    # Volume mounts
-    volumes: dict[str, str] = {
-        str(instance_dir / sub): f"/var/gerrit/{sub}" for sub in _GERRIT_SUBDIRS
-    }
+def start_instance(
+    context: StartupRunContext,
+    instance: InstanceConfig,
+    index: int,
+) -> bool:
+    """Provision and start a single Gerrit container.
 
-    # Add SSH volume (read-only) when using SSH auth
-    if config.auth_type.lower() == "ssh":
-        volumes[f"{instance_dir / 'ssh'}:ro"] = "/var/gerrit/ssh"
+    Returns *True* on success, *False* on failure.
+    """
+    config = context.config
+    slug = instance.slug
 
-    # Environment variables
-    env: dict[str, str] = {
-        "CANONICAL_WEB_URL": canonical_url,
-        "HTTPD_LISTEN_URL": listen_url,
-    }
-    if config.debug:
-        env["DEBUG"] = "1"
+    # API path from detection phase
+    api_path = context.api_path_store.get_api_path(slug)
 
-    try:
-        cid = docker.run_container(
-            image=image,
-            name=container_name,
-            ports={http_port: 8080, ssh_port: 29418},
-            volumes=volumes,
-            env=env,
-            cidfile=cidfile,
-            detach=True,
-            timeout=60,
-        )
-    except DockerError as exc:
-        logger.error("Failed to start Gerrit container for %s: %s ❌", slug, exc)
+    endpoints = resolve_instance_endpoints(instance, index, config, api_path)
+
+    # Write env.sh for downstream steps
+    _write_env_sh(
+        config.work_path,
+        endpoints.canonical_url,
+        endpoints.listen_url,
+        endpoints.advertised_ssh_addr,
+        endpoints.use_tunnel,
+    )
+
+    log_instance_banner(index, instance, endpoints)
+
+    instance_dir = config.work_path / "instances" / slug
+
+    expected_count = _provision_instance_site(context, instance, endpoints, api_path)
+    if expected_count is None:
         return False
 
-    # Wait for container process to settle
-    time.sleep(2)
-
-    # Get container IP
-    try:
-        container_ip = docker.container_ip(cid)
-    except DockerError:
-        container_ip = ""
-
-    # Record container ID
-    cid_file = config.work_path / "container_ids.txt"
-    with open(cid_file, "a", encoding="utf-8") as fh:
-        fh.write(f"{cid}\n")
+    # Step 8: Start container
+    container = launch_gerrit_container(
+        context.docker, config, instance_dir, slug, endpoints, context.image
+    )
+    if container is None:
+        return False
 
     # Step 9: Capture SSH host keys
-    ssh_host_keys = capture_ssh_host_keys(docker, cid, config.work_path, slug)
+    ssh_host_keys = capture_ssh_host_keys(
+        context.docker, container.cid, config.work_path, slug
+    )
 
     # Step 10: Store instance metadata
-    metadata: dict[str, Any] = {
-        "cid": cid,
-        "ip": container_ip,
-        "http_port": http_port,
-        "ssh_port": ssh_port,
-        "url": f"http://{container_ip}:8080" if container_ip else "",
-        "gerrit_host": gerrit_host,
-        "project": project,
-        "api_path": api_path,
-        "api_url": api_url,
-        "expected_project_count": expected_count,
-        "ssh_host_keys": ssh_host_keys,
-    }
-    instance_store.set_instance(slug, metadata)
-    instance_store.save()
+    metadata = build_instance_metadata(
+        instance,
+        endpoints,
+        container,
+        context.api_path_store,
+        expected_count,
+        ssh_host_keys,
+    )
+    context.instance_store.set_instance(slug, metadata)
+    context.instance_store.save()
 
-    logger.info("✅ Gerrit instance started")
-    logger.info("   Container ID: %s", cid[:12] if cid else "(unknown)")
-    logger.info("   IP Address: %s", container_ip or "(unknown)")
-    if container_ip:
-        logger.info("   HTTP URL: http://%s:8080", container_ip)
-    logger.info("   SSH URL: ssh://localhost:%d", ssh_port)
-    logger.info("   Source API URL: %s", api_url)
-    logger.info("")
-
-    if config.debug:
-        try:
-            ps_output = docker.ps(filter_name=container_name)
-            logger.debug("Container status:\n%s", ps_output)
-        except DockerError as exc:
-            logger.debug("Could not query container status: %s", exc)
+    report_started_instance(
+        context.docker,
+        config,
+        container,
+        endpoints,
+        context.api_path_store.get_api_url(slug),
+    )
 
     return True
-
-
-# =====================================================================
-# Helpers
-# =====================================================================
-
-
-def _chown_tree(path: Path) -> None:
-    """Recursively ``chown`` *path* to the Gerrit UID:GID.
-
-    When ``chown`` succeeds the directory is set to 755 (owner-writable).
-    When ``chown`` fails (common on CI runners where the workspace is not
-    owned by the build user), the fallback uses ``a+rwX`` so the
-    container's gerrit user (UID 1000) can still write to mounted volumes.
-    """
-    try:
-        result = subprocess.run(
-            ["chown", "-R", f"{_GERRIT_UID}:{_GERRIT_GID}", str(path)],
-            capture_output=True,
-            timeout=30,
-            check=False,
-        )
-        if result.returncode == 0:
-            # Ownership set to Gerrit user; safe to use restrictive perms
-            subprocess.run(
-                ["chmod", "-R", "755", str(path)],
-                capture_output=True,
-                timeout=30,
-                check=False,
-            )
-        else:
-            # Could not change ownership; ensure writability for all users
-            # a+rwX keeps execute bits for directories and already-executable files
-            subprocess.run(
-                ["chmod", "-R", "a+rwX", str(path)],
-                capture_output=True,
-                timeout=30,
-                check=False,
-            )
-    except (FileNotFoundError, OSError):
-        pass
-
-
-def _write_env_sh(
-    work_dir: Path,
-    canonical_url: str,
-    listen_url: str,
-    ssh_addr: str,
-    use_tunnel: bool,
-) -> None:
-    """Append environment variables to ``env.sh`` for downstream steps."""
-    env_file = work_dir / "env.sh"
-    lines = [
-        f"GERRIT_CANONICAL_URL={canonical_url}",
-        f"GERRIT_LISTEN_URL={listen_url}",
-        f"GERRIT_SSH_ADDR={ssh_addr}",
-    ]
-    if use_tunnel:
-        lines.append("GERRIT_TUNNEL_MODE=true")
-    with open(env_file, "a", encoding="utf-8") as fh:
-        for line in lines:
-            fh.write(f"{line}\n")
-
-
-def _write_startup_summary(instance_store: InstanceStore) -> None:
-    """Write the step summary table for started instances."""
-    lines = [
-        "**Instances Started** 🚀",
-        "",
-        "| Slug | HTTP Port | SSH Port | Status |",
-        "|------|-----------|----------|--------|",
-    ]
-    for slug, meta in instance_store:
-        http_port = meta.get("http_port", "?")
-        ssh_port = meta.get("ssh_port", "?")
-        lines.append(f"| {slug} | {http_port} | {ssh_port} | ✅ Running |")
-    lines.append("")
-    write_summary("\n".join(lines))
 
 
 # =====================================================================
@@ -1590,20 +349,19 @@ def run() -> int:
     with log_group("Docker image"):
         image = ensure_custom_image(docker, config)
 
+    context = StartupRunContext(
+        docker=docker,
+        config=config,
+        api_path_store=api_path_store,
+        instance_store=instance_store,
+        image=image,
+    )
+
     # Start each instance
     failed = 0
     for index, inst in enumerate(config.instances):
         with log_group(f"Instance {index + 1}: {inst.slug}"):
-            ok = start_instance(
-                docker,
-                inst,
-                index,
-                config,
-                api_path_store,
-                instance_store,
-                image,
-            )
-            if not ok:
+            if not start_instance(context, inst, index):
                 logger.error("Failed to start instance %d ❌", index)
                 failed += 1
 

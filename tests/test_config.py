@@ -148,7 +148,7 @@ class TestInstanceConfig:
     def test_frozen(self) -> None:
         ic = InstanceConfig(slug="t", gerrit_host="g")
         with pytest.raises(AttributeError):
-            ic.slug = "other"  # pyright: ignore[reportAttributeAccessIssue]
+            ic.slug = "other"  # type: ignore[misc]  # pyright: ignore[reportAttributeAccessIssue]
 
 
 # ---------------------------------------------------------------------------
@@ -726,4 +726,4 @@ class TestTunnelConfig:
     def test_frozen(self) -> None:
         tc = TunnelConfig(http_port=8080, ssh_port=29418)
         with pytest.raises(AttributeError):
-            tc.http_port = 9090  # pyright: ignore[reportAttributeAccessIssue]
+            tc.http_port = 9090  # type: ignore[misc]  # pyright: ignore[reportAttributeAccessIssue]

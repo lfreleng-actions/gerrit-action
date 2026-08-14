@@ -385,15 +385,48 @@ class TestFetchGithubHostKeys:
 
     @patch("g2p_setup.subprocess.run")
     def test_successful_scan(self, mock_run: MagicMock) -> None:
+        """A scan whose Ed25519 line matches the pinned key is trusted."""
+        scanned = f"{GITHUB_HOST_KEY_ED25519}\ngithub.com ssh-rsa AAAAB3scanned\n"
         mock_run.return_value = subprocess.CompletedProcess(
             ["ssh-keyscan"],
             0,
-            stdout="github.com ssh-ed25519 AAAAC3scanresult\n",
+            stdout=scanned,
             stderr="",
         )
         result = fetch_github_host_keys()
         assert result.split()[0] == "github.com"
-        assert "AAAAC3scanresult" in result
+        # The whole scan is kept, including the RSA line it also found.
+        assert "AAAAB3scanned" in result
+        assert GITHUB_HOST_KEY_ED25519 in result
+
+    @patch("g2p_setup.subprocess.run")
+    def test_scan_with_wrong_ed25519_key_falls_back(self, mock_run: MagicMock) -> None:
+        """A forged Ed25519 key is rejected in favour of the pinned one.
+
+        ssh-keyscan is unauthenticated, so a compromised DNS or network
+        path could otherwise pin an attacker's key into known_hosts.
+        """
+        mock_run.return_value = subprocess.CompletedProcess(
+            ["ssh-keyscan"],
+            0,
+            stdout="github.com ssh-ed25519 AAAAC3attackerkey\n",
+            stderr="",
+        )
+        result = fetch_github_host_keys()
+        assert result == GITHUB_HOST_KEY_ED25519
+        assert "AAAAC3attackerkey" not in result
+
+    @patch("g2p_setup.subprocess.run")
+    def test_scan_without_ed25519_falls_back(self, mock_run: MagicMock) -> None:
+        """Without an Ed25519 line there is nothing to verify against."""
+        mock_run.return_value = subprocess.CompletedProcess(
+            ["ssh-keyscan"],
+            0,
+            stdout="github.com ssh-rsa AAAAB3scanned\n",
+            stderr="",
+        )
+        result = fetch_github_host_keys()
+        assert result == GITHUB_HOST_KEY_ED25519
 
     @patch("g2p_setup.subprocess.run")
     def test_scan_failure_falls_back(self, mock_run: MagicMock) -> None:

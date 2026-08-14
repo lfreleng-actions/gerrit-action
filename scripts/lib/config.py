@@ -6,6 +6,18 @@
 Replaces the ``jq`` pipelines and repeated environment variable reads
 scattered across the shell scripts with typed, validated dataclasses.
 
+This module owns the *action-wide* configuration: :class:`ActionConfig`,
+which aggregates every environment variable the action understands and
+validates them as a set.  Supporting pieces live alongside it and are
+re-exported here so that ``from config import ...`` keeps working:
+
+* :mod:`config_instances` — per-instance value objects
+  (:class:`InstanceConfig`, :class:`TunnelConfig`).
+* :mod:`config_stores` — the ``instances.json`` / ``api_paths.json``
+  stores (:class:`InstanceStore`, :class:`ApiPathStore`).
+* :mod:`config_values` — scalar parsing helpers
+  (:func:`parse_interval_to_seconds` and friends).
+
 Usage::
 
     from config import ActionConfig
@@ -21,104 +33,44 @@ import json
 import logging
 import os
 import re
-from collections.abc import Iterator
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from config_instances import InstanceConfig, TunnelConfig
+from config_stores import ApiPathStore, InstanceStore
+from config_values import (
+    _INTERVAL_RE,
+    _is_zero_interval,
+    _normalise_path,
+    _str_to_bool,
+    parse_interval_to_seconds,
+)
 from errors import ConfigError
 
 logger = logging.getLogger(__name__)
 
-# ---------------------------------------------------------------------------
-# Per-instance configuration
-# ---------------------------------------------------------------------------
+# Names re-exported for the many callers that import them from ``config``.
+# The underscore-prefixed entries are listed deliberately: they are
+# module-internal by convention but are part of this module's historical
+# import surface, so they must keep resolving as ``config.<name>``.
+__all__ = [
+    "DEFAULT_WORK_DIR",
+    "ActionConfig",
+    "ApiPathStore",
+    "ConfigError",
+    "InstanceConfig",
+    "InstanceStore",
+    "TunnelConfig",
+    "_INTERVAL_RE",
+    "_is_zero_interval",
+    "_normalise_path",
+    "_str_to_bool",
+    "parse_interval_to_seconds",
+]
 
 # Default work directory (matches the shell scripts' convention)
 DEFAULT_WORK_DIR = "/tmp/gerrit-action"
-
-
-@dataclass(frozen=True)
-class InstanceConfig:
-    """Configuration for a single Gerrit instance.
-
-    Typically parsed from one element of the ``gerrit_setup`` JSON array.
-    """
-
-    slug: str
-    gerrit_host: str
-    project: str = ""
-    api_path: str = ""
-    ssh_user: str = ""
-    ssh_port: int = 29418
-    max_projects: int = 500
-
-    @property
-    def effective_api_path(self) -> str:
-        """Resolve *api_path*, respecting the ``USE_API_PATH`` flag.
-
-        When ``USE_API_PATH`` is not ``"true"`` the API path is ignored
-        (returns ``""``).  Otherwise the stored path is normalised:
-
-        * A leading ``/`` is ensured.
-        * A trailing ``/`` is stripped.
-        * The bare ``"/"`` is collapsed to ``""``.
-        """
-        if os.environ.get("USE_API_PATH", "false").lower() != "true":
-            return ""
-        return _normalise_path(self.api_path)
-
-    # ------------------------------------------------------------------
-    # Factory
-    # ------------------------------------------------------------------
-
-    @classmethod
-    def from_dict(
-        cls,
-        data: dict[str, Any],
-        *,
-        default_ssh_user: str = "gerrit",
-        default_ssh_port: int = 29418,
-        default_max_projects: int = 500,
-    ) -> InstanceConfig:
-        """Create an :class:`InstanceConfig` from a JSON-decoded dict.
-
-        Missing keys fall back to sensible defaults so that callers do
-        not need to specify every field.
-        """
-        slug = data.get("slug", "")
-        if not slug:
-            raise ConfigError("Instance config missing required 'slug' field")
-
-        gerrit_host = data.get("gerrit", "")
-        if not gerrit_host:
-            raise ConfigError(f"Instance '{slug}' missing required 'gerrit' field")
-
-        ssh_user = data.get("ssh_user", "") or default_ssh_user
-        raw_ssh_port = data.get("ssh_port", "") or default_ssh_port
-
-        return cls(
-            slug=slug,
-            gerrit_host=gerrit_host,
-            project=data.get("project", ""),
-            api_path=data.get("api_path", ""),
-            ssh_user=ssh_user,
-            ssh_port=int(raw_ssh_port),
-            max_projects=int(data.get("max_projects", default_max_projects)),
-        )
-
-
-# ---------------------------------------------------------------------------
-# Tunnel configuration
-# ---------------------------------------------------------------------------
-
-
-@dataclass(frozen=True)
-class TunnelConfig:
-    """Tunnel port mapping for a single instance."""
-
-    http_port: int
-    ssh_port: int
 
 
 # ---------------------------------------------------------------------------
@@ -428,214 +380,3 @@ class ActionConfig:
                 errors.append("ssh_auth_username too long (max 64 characters)")
 
         return errors
-
-
-# ---------------------------------------------------------------------------
-# Instance store — reading / writing instances.json
-# ---------------------------------------------------------------------------
-
-
-class InstanceStore:
-    """Read and write the ``instances.json`` metadata file.
-
-    This replaces the ``jq`` iteration boilerplate duplicated in 6+
-    shell scripts.
-    """
-
-    def __init__(self, path: Path) -> None:
-        self.path = path
-        self._data: dict[str, dict[str, Any]] = {}
-
-    # ------------------------------------------------------------------
-    # I/O
-    # ------------------------------------------------------------------
-
-    def load(self) -> dict[str, dict[str, Any]]:
-        """Load instances from disk.
-
-        Raises :class:`ConfigError` if the file does not exist.
-        """
-        if not self.path.exists():
-            raise ConfigError(f"Instances file not found: {self.path}")
-        try:
-            self._data = json.loads(self.path.read_text(encoding="utf-8"))
-        except json.JSONDecodeError as exc:
-            raise ConfigError(f"Invalid JSON in {self.path}: {exc}") from exc
-        return self._data
-
-    def save(self) -> None:
-        """Persist the current data back to disk."""
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.path.write_text(
-            json.dumps(self._data, indent=2) + "\n",
-            encoding="utf-8",
-        )
-
-    # ------------------------------------------------------------------
-    # Accessors
-    # ------------------------------------------------------------------
-
-    @property
-    def data(self) -> dict[str, dict[str, Any]]:
-        """Return the raw instance data dict."""
-        return self._data
-
-    def slugs(self) -> list[str]:
-        """Return sorted list of instance slugs."""
-        return sorted(self._data.keys())
-
-    def get(self, slug: str) -> dict[str, Any]:
-        """Return metadata for *slug*, raising :class:`ConfigError` if missing."""
-        if slug not in self._data:
-            raise ConfigError(f"Instance '{slug}' not found in {self.path}")
-        return self._data[slug]
-
-    def __iter__(self) -> Iterator[tuple[str, dict[str, Any]]]:
-        """Iterate over ``(slug, metadata)`` pairs, sorted by slug."""
-        for slug in self.slugs():
-            yield slug, self._data[slug]
-
-    def __len__(self) -> int:
-        return len(self._data)
-
-    # ------------------------------------------------------------------
-    # Mutation
-    # ------------------------------------------------------------------
-
-    def set_instance(self, slug: str, metadata: dict[str, Any]) -> None:
-        """Add or update the metadata for *slug*."""
-        self._data[slug] = metadata
-
-    def update_field(self, slug: str, key: str, value: Any) -> None:
-        """Update a single field for *slug*."""
-        if slug not in self._data:
-            self._data[slug] = {}
-        self._data[slug][key] = value
-
-
-# ---------------------------------------------------------------------------
-# API paths store
-# ---------------------------------------------------------------------------
-
-
-class ApiPathStore:
-    """Read and write the ``api_paths.json`` file."""
-
-    def __init__(self, path: Path) -> None:
-        self.path = path
-        self._data: dict[str, dict[str, str]] = {}
-
-    def load(self) -> dict[str, dict[str, str]]:
-        """Load API paths from disk; returns empty dict if file missing."""
-        if not self.path.exists():
-            self._data = {}
-            return self._data
-        try:
-            self._data = json.loads(self.path.read_text(encoding="utf-8"))
-        except json.JSONDecodeError as exc:
-            logger.warning("Invalid JSON in %s: %s", self.path, exc)
-            self._data = {}
-        return self._data
-
-    def save(self) -> None:
-        """Persist the current data back to disk."""
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.path.write_text(
-            json.dumps(self._data, indent=2) + "\n",
-            encoding="utf-8",
-        )
-
-    @property
-    def data(self) -> dict[str, dict[str, str]]:
-        return self._data
-
-    def set_path(
-        self,
-        slug: str,
-        *,
-        gerrit_host: str,
-        api_path: str,
-        api_url: str,
-    ) -> None:
-        """Record the detected API path for *slug*."""
-        self._data[slug] = {
-            "gerrit_host": gerrit_host,
-            "api_path": api_path,
-            "api_url": api_url,
-        }
-
-    def get_api_path(self, slug: str) -> str:
-        """Return the API path for *slug*, defaulting to ``""``."""
-        entry = self._data.get(slug, {})
-        return entry.get("api_path", "")
-
-    def get_api_url(self, slug: str) -> str:
-        """Return the full API URL for *slug*, defaulting to ``""``."""
-        entry = self._data.get(slug, {})
-        return entry.get("api_url", "")
-
-
-# ---------------------------------------------------------------------------
-# Interval parsing
-# ---------------------------------------------------------------------------
-
-_INTERVAL_RE = re.compile(r"^(\d+)([smhSMH]?)$")
-
-
-def parse_interval_to_seconds(interval: str) -> int:
-    """Parse a time interval string (e.g. ``"60s"``, ``"5m"``, ``"1h"``) to seconds.
-
-    Plain integers (e.g. ``"60"``) are treated as seconds.
-
-    Raises :class:`ConfigError` for invalid formats.
-    """
-    m = _INTERVAL_RE.match(interval.strip())
-    if not m:
-        raise ConfigError(
-            f"Invalid interval '{interval}'. "
-            "Expected format: <integer>[s|m|h], e.g. 60s, 5m, 1h"
-        )
-    value = int(m.group(1))
-    unit = m.group(2).lower()
-    if unit == "m":
-        return value * 60
-    if unit == "h":
-        return value * 3600
-    return value  # seconds (or no unit)
-
-
-# ---------------------------------------------------------------------------
-# Internal helpers
-# ---------------------------------------------------------------------------
-
-
-def _str_to_bool(value: str) -> bool:
-    """Convert a string to bool (``"true"`` → True, anything else → False)."""
-    return value.strip().lower() == "true"
-
-
-def _is_zero_interval(interval: str) -> bool:
-    """Return True if *interval* represents zero (``"0"``, ``"0s"``, etc.)."""
-    m = _INTERVAL_RE.match(interval.strip())
-    if not m:
-        return False
-    return int(m.group(1)) == 0
-
-
-def _normalise_path(path: str) -> str:
-    """Normalise an API path prefix.
-
-    * Ensures a leading ``/``.
-    * Strips a trailing ``/``.
-    * Collapses bare ``"/"`` to ``""``.
-    * Returns ``""`` for empty input.
-    """
-    path = path.strip()
-    if not path:
-        return ""
-    if not path.startswith("/"):
-        path = f"/{path}"
-    path = path.rstrip("/")
-    if path == "/":
-        return ""
-    return path

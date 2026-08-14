@@ -57,7 +57,7 @@ class TestRetryConfig:
 
         rc = RetryConfig()
         with pytest.raises(AttributeError):
-            rc.max_retries = 5  # pyright: ignore[reportAttributeAccessIssue]
+            rc.max_retries = 5  # type: ignore[misc]  # pyright: ignore[reportAttributeAccessIssue]
 
 
 # =========================================================================

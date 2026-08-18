@@ -45,6 +45,22 @@ sys.path.insert(0, str(LIB_DIR))
 from config import ActionConfig, ApiPathStore, InstanceConfig, InstanceStore  # noqa: E402  # isort: skip
 from errors import DockerError, GerritActionError  # noqa: E402  # isort: skip
 
+# The provisioning steps live in sibling ``scripts/lib`` modules and are
+# re-exported by ``start-instances.py``.  Behaviour is exercised through
+# the re-exports, but collaborators internal to a step (its ``subprocess``
+# / ``requests`` usage, the plugin cache directory, ``chown_tree``, …)
+# must be patched on the module that actually owns them.  Modules only
+# ever named in a ``patch("…")`` target string are resolved by that
+# string and so are not imported here.
+import startup_plugins  # noqa: E402  # isort: skip
+import startup_precreate  # noqa: E402  # isort: skip
+import startup_site_init  # noqa: E402  # isort: skip
+import startup_source_projects  # noqa: E402  # isort: skip
+import startup_summary  # noqa: E402  # isort: skip
+from startup_endpoints import InstanceEndpoints  # noqa: E402  # isort: skip
+from startup_replication_config import ReplicationSource  # noqa: E402  # isort: skip
+from startup_run_context import StartupRunContext  # noqa: E402  # isort: skip
+
 # Import the hyphenated module via importlib
 _spec = importlib.util.spec_from_file_location(
     "start_instances", SCRIPTS_DIR / "start-instances.py"
@@ -142,6 +158,52 @@ def _make_instance(**overrides: Any) -> InstanceConfig:
     }
     defaults.update(overrides)
     return InstanceConfig(**defaults)
+
+
+def _make_source(**overrides: Any) -> ReplicationSource:
+    """Build a ReplicationSource describing the upstream Gerrit."""
+    defaults: dict[str, Any] = {
+        "host": "gerrit.example.org",
+        "ssh_user": "gerrit",
+        "ssh_port": 29418,
+        "api_path": "",
+    }
+    defaults.update(overrides)
+    return ReplicationSource(**defaults)
+
+
+def _make_endpoints(**overrides: Any) -> InstanceEndpoints:
+    """Build an InstanceEndpoints with localhost defaults."""
+    defaults: dict[str, Any] = {
+        "local_http_port": 18080,
+        "local_ssh_port": 29418,
+        "use_tunnel": False,
+        "advertised_host": "localhost",
+        "advertised_http_port": 18080,
+        "advertised_ssh_port": 29418,
+        "canonical_url": "http://localhost:18080/",
+        "listen_url": "http://*:8080/",
+        "advertised_ssh_addr": "localhost:29418",
+    }
+    defaults.update(overrides)
+    return InstanceEndpoints(**defaults)
+
+
+def _make_context(
+    docker: MagicMock,
+    config: ActionConfig,
+    api_store: ApiPathStore,
+    inst_store: InstanceStore,
+    image: str,
+) -> StartupRunContext:
+    """Bundle the run-wide collaborators start_instance() needs."""
+    return StartupRunContext(
+        docker=docker,
+        config=config,
+        api_path_store=api_store,
+        instance_store=inst_store,
+        image=image,
+    )
 
 
 # =====================================================================
@@ -291,7 +353,7 @@ class TestSetupSshAuth:
     def test_auto_keyscan_when_no_known_hosts(self, tmp_path: Path) -> None:
         instance_dir = tmp_path / "instance"
 
-        with patch("start_instances.subprocess.run") as mock_run:
+        with patch("startup_ssh.subprocess.run") as mock_run:
             mock_run.return_value = _cp(stdout="scanned-key-data\n")
             start_instances.setup_ssh_auth(
                 instance_dir=instance_dir,
@@ -309,7 +371,7 @@ class TestSetupSshAuth:
         instance_dir = tmp_path / "instance"
 
         with patch(
-            "start_instances.subprocess.run",
+            "startup_ssh.subprocess.run",
             side_effect=subprocess.TimeoutExpired(cmd="ssh-keyscan", timeout=30),
         ):
             start_instances.setup_ssh_auth(
@@ -374,8 +436,8 @@ class TestFetchRemoteProjects:
         mock_resp.text = response_body
         mock_resp.raise_for_status.return_value = None
 
-        with patch("start_instances.requests.get", return_value=mock_resp):
-            result = start_instances.fetch_remote_projects(
+        with patch("startup_source_projects.requests.get", return_value=mock_resp):
+            result = startup_source_projects.fetch_remote_projects(
                 "gerrit.example.org", "/r", "", 100, config
             )
 
@@ -387,8 +449,10 @@ class TestFetchRemoteProjects:
         mock_resp.text = ')]}\'\n{"p1": {}}'
         mock_resp.raise_for_status.return_value = None
 
-        with patch("start_instances.requests.get", return_value=mock_resp) as mock_get:
-            start_instances.fetch_remote_projects(
+        with patch(
+            "startup_source_projects.requests.get", return_value=mock_resp
+        ) as mock_get:
+            startup_source_projects.fetch_remote_projects(
                 "gerrit.example.org", "/r", "", 50, config
             )
 
@@ -401,8 +465,10 @@ class TestFetchRemoteProjects:
         mock_resp.text = ')]}\'\n{"p1": {}}'
         mock_resp.raise_for_status.return_value = None
 
-        with patch("start_instances.requests.get", return_value=mock_resp) as mock_get:
-            start_instances.fetch_remote_projects(
+        with patch(
+            "startup_source_projects.requests.get", return_value=mock_resp
+        ) as mock_get:
+            startup_source_projects.fetch_remote_projects(
                 "gerrit.example.org", "", "", 50, config
             )
 
@@ -415,8 +481,10 @@ class TestFetchRemoteProjects:
         mock_resp.text = ')]}\'\n{"match": {}}'
         mock_resp.raise_for_status.return_value = None
 
-        with patch("start_instances.requests.get", return_value=mock_resp) as mock_get:
-            start_instances.fetch_remote_projects(
+        with patch(
+            "startup_source_projects.requests.get", return_value=mock_resp
+        ) as mock_get:
+            startup_source_projects.fetch_remote_projects(
                 "gerrit.example.org", "", "myproject.*", 100, config
             )
 
@@ -433,8 +501,10 @@ class TestFetchRemoteProjects:
         mock_resp.text = ")]}'\n{}"
         mock_resp.raise_for_status.return_value = None
 
-        with patch("start_instances.requests.get", return_value=mock_resp) as mock_get:
-            start_instances.fetch_remote_projects(
+        with patch(
+            "startup_source_projects.requests.get", return_value=mock_resp
+        ) as mock_get:
+            startup_source_projects.fetch_remote_projects(
                 "gerrit.example.org", "", "", 100, config
             )
 
@@ -450,8 +520,10 @@ class TestFetchRemoteProjects:
         mock_resp.text = ")]}'\n{}"
         mock_resp.raise_for_status.return_value = None
 
-        with patch("start_instances.requests.get", return_value=mock_resp) as mock_get:
-            start_instances.fetch_remote_projects(
+        with patch(
+            "startup_source_projects.requests.get", return_value=mock_resp
+        ) as mock_get:
+            startup_source_projects.fetch_remote_projects(
                 "gerrit.example.org", "", "", 100, config
             )
 
@@ -465,8 +537,10 @@ class TestFetchRemoteProjects:
         mock_resp.text = ")]}'\n{}"
         mock_resp.raise_for_status.return_value = None
 
-        with patch("start_instances.requests.get", return_value=mock_resp) as mock_get:
-            start_instances.fetch_remote_projects(
+        with patch(
+            "startup_source_projects.requests.get", return_value=mock_resp
+        ) as mock_get:
+            startup_source_projects.fetch_remote_projects(
                 "gerrit.example.org", "", "", 100, config
             )
 
@@ -478,10 +552,10 @@ class TestFetchRemoteProjects:
         config = _make_config()
 
         with patch(
-            "start_instances.requests.get",
+            "startup_source_projects.requests.get",
             side_effect=requests.RequestException("connection refused"),
         ):
-            result = start_instances.fetch_remote_projects(
+            result = startup_source_projects.fetch_remote_projects(
                 "gerrit.example.org", "", "", 100, config
             )
 
@@ -493,8 +567,8 @@ class TestFetchRemoteProjects:
         mock_resp.text = "not json"
         mock_resp.raise_for_status.return_value = None
 
-        with patch("start_instances.requests.get", return_value=mock_resp):
-            result = start_instances.fetch_remote_projects(
+        with patch("startup_source_projects.requests.get", return_value=mock_resp):
+            result = startup_source_projects.fetch_remote_projects(
                 "gerrit.example.org", "", "", 100, config
             )
 
@@ -507,8 +581,8 @@ class TestFetchRemoteProjects:
         mock_resp.text = ')]}\'  \n{"a": {}}'
         mock_resp.raise_for_status.return_value = None
 
-        with patch("start_instances.requests.get", return_value=mock_resp):
-            result = start_instances.fetch_remote_projects(
+        with patch("startup_source_projects.requests.get", return_value=mock_resp):
+            result = startup_source_projects.fetch_remote_projects(
                 "gerrit.example.org", "", "", 100, config
             )
 
@@ -520,8 +594,10 @@ class TestFetchRemoteProjects:
         mock_resp.text = ")]}'\n{}"
         mock_resp.raise_for_status.return_value = None
 
-        with patch("start_instances.requests.get", return_value=mock_resp) as mock_get:
-            start_instances.fetch_remote_projects(
+        with patch(
+            "startup_source_projects.requests.get", return_value=mock_resp
+        ) as mock_get:
+            startup_source_projects.fetch_remote_projects(
                 "gerrit.example.org", "", "", 42, config
             )
 
@@ -536,8 +612,10 @@ class TestFetchRemoteProjects:
         mock_resp.text = ")]}'\n{}"
         mock_resp.raise_for_status.return_value = None
 
-        with patch("start_instances.requests.get", return_value=mock_resp) as mock_get:
-            start_instances.fetch_remote_projects(
+        with patch(
+            "startup_source_projects.requests.get", return_value=mock_resp
+        ) as mock_get:
+            startup_source_projects.fetch_remote_projects(
                 "gerrit.example.org", "", "", 100, config
             )
 
@@ -551,8 +629,10 @@ class TestFetchRemoteProjects:
         mock_resp.text = ")]}'\n{}"
         mock_resp.raise_for_status.return_value = None
 
-        with patch("start_instances.requests.get", return_value=mock_resp) as mock_get:
-            start_instances.fetch_remote_projects(
+        with patch(
+            "startup_source_projects.requests.get", return_value=mock_resp
+        ) as mock_get:
+            startup_source_projects.fetch_remote_projects(
                 "gerrit.example.org", "", "", 100, config
             )
 
@@ -575,11 +655,8 @@ class TestGenerateReplicationConfig:
         start_instances.generate_replication_config(
             config_file,
             "test",
-            "gerrit.example.org",
+            _make_source(api_path="/r"),
             "",
-            "gerrit",
-            29418,
-            "/r",
             config,
         )
 
@@ -593,11 +670,8 @@ class TestGenerateReplicationConfig:
         start_instances.generate_replication_config(
             config_file,
             "test",
-            "gerrit.example.org",
+            _make_source(api_path="/r"),
             "",
-            "gerrit",
-            29418,
-            "/r",
             config,
         )
 
@@ -611,10 +685,7 @@ class TestGenerateReplicationConfig:
         start_instances.generate_replication_config(
             config_file,
             "test",
-            "gerrit.example.org",
-            "",
-            "gerrit",
-            29418,
+            _make_source(),
             "",
             config,
         )
@@ -629,10 +700,7 @@ class TestGenerateReplicationConfig:
         start_instances.generate_replication_config(
             config_file,
             "test",
-            "gerrit.example.org",
-            "",
-            "gerrit",
-            29418,
+            _make_source(),
             "",
             config,
         )
@@ -647,10 +715,7 @@ class TestGenerateReplicationConfig:
         start_instances.generate_replication_config(
             config_file,
             "test",
-            "gerrit.example.org",
-            "",
-            "gerrit",
-            29418,
+            _make_source(),
             "",
             config,
         )
@@ -673,10 +738,7 @@ class TestGenerateReplicationConfig:
         start_instances.generate_replication_config(
             config_file,
             "test",
-            "gerrit.example.org",
-            "",
-            "gerrit",
-            29418,
+            _make_source(),
             "",
             config,
         )
@@ -692,11 +754,8 @@ class TestGenerateReplicationConfig:
         start_instances.generate_replication_config(
             config_file,
             "test",
-            "gerrit.example.org",
+            _make_source(),
             "my-project",
-            "gerrit",
-            29418,
-            "",
             config,
         )
 
@@ -710,10 +769,7 @@ class TestGenerateReplicationConfig:
         start_instances.generate_replication_config(
             config_file,
             "my-slug",
-            "gerrit.example.org",
-            "",
-            "gerrit",
-            29418,
+            _make_source(),
             "",
             config,
         )
@@ -730,10 +786,7 @@ class TestGenerateReplicationConfig:
         start_instances.generate_replication_config(
             config_file,
             "test",
-            "gerrit.example.org",
-            "",
-            "gerrit",
-            29418,
+            _make_source(),
             "",
             config,
         )
@@ -752,10 +805,7 @@ class TestGenerateReplicationConfig:
         start_instances.generate_replication_config(
             config_file,
             "test",
-            "gerrit.example.org",
-            "",
-            "gerrit",
-            29418,
+            _make_source(),
             "",
             config,
         )
@@ -774,10 +824,7 @@ class TestGenerateReplicationConfig:
         start_instances.generate_replication_config(
             config_file,
             "onap",
-            "gerrit.example.org",
-            "",
-            "gerrit",
-            29418,
+            _make_source(),
             "",
             config,
         )
@@ -834,10 +881,7 @@ class TestGenerateReplicationConfig:
         start_instances.generate_replication_config(
             config_file,
             "onap",
-            "gerrit.example.org",
-            "",
-            "gerrit",
-            29418,
+            _make_source(),
             "",
             config,
         )
@@ -885,10 +929,7 @@ class TestGenerateReplicationConfig:
         start_instances.generate_replication_config(
             config_file,
             "onap",
-            "gerrit.example.org",
-            "",
-            "gerrit",
-            29418,
+            _make_source(),
             "",
             config,
         )
@@ -916,10 +957,7 @@ class TestGenerateReplicationConfig:
         start_instances.generate_replication_config(
             config_file,
             "onap",
-            "gerrit.example.org",
-            "",
-            "gerrit",
-            29418,
+            _make_source(),
             "",
             config,
         )
@@ -938,10 +976,7 @@ class TestGenerateReplicationConfig:
         start_instances.generate_replication_config(
             config_file,
             "test",
-            "gerrit.example.org",
-            "",
-            "gerrit",
-            29418,
+            _make_source(),
             "",
             config,
         )
@@ -970,10 +1005,7 @@ class TestGenerateReplicationConfig:
         start_instances.generate_replication_config(
             config_file,
             "test",
-            "gerrit.example.org",
-            "",
-            "gerrit",
-            29418,
+            _make_source(),
             "",
             config,
         )
@@ -990,10 +1022,7 @@ class TestGenerateReplicationConfig:
         start_instances.generate_replication_config(
             config_file,
             "test",
-            "gerrit.example.org",
-            "",
-            "gerrit",
-            29418,
+            _make_source(),
             "",
             config,
         )
@@ -1009,10 +1038,7 @@ class TestGenerateReplicationConfig:
         start_instances.generate_replication_config(
             config_file,
             "test",
-            "gerrit.example.org",
-            "",
-            "gerrit",
-            29418,
+            _make_source(),
             "",
             config,
         )
@@ -1027,10 +1053,7 @@ class TestGenerateReplicationConfig:
         start_instances.generate_replication_config(
             config_file,
             "test",
-            "gerrit.example.org",
-            "",
-            "gerrit",
-            29418,
+            _make_source(),
             "",
             config,
         )
@@ -1045,10 +1068,7 @@ class TestGenerateReplicationConfig:
         start_instances.generate_replication_config(
             config_file,
             "test",
-            "gerrit.example.org",
-            "",
-            "gerrit",
-            29418,
+            _make_source(),
             "",
             config,
         )
@@ -1063,10 +1083,7 @@ class TestGenerateReplicationConfig:
         start_instances.generate_replication_config(
             config_file,
             "test",
-            "gerrit.example.org",
-            "",
-            "gerrit",
-            29418,
+            _make_source(),
             "",
             config,
         )
@@ -1219,7 +1236,7 @@ class TestDownloadPlugin:
         cached = cache_dir / "pull-replication-stable-3.13.jar"
         cached.write_bytes(b"fake-jar-content")
 
-        with patch.object(start_instances, "_PLUGIN_CACHE_DIR", cache_dir):
+        with patch.object(startup_plugins, "PLUGIN_CACHE_DIR", cache_dir):
             result = start_instances.download_plugin(
                 plugin_dir, "stable-3.13", skip_plugin_install=False
             )
@@ -1238,8 +1255,8 @@ class TestDownloadPlugin:
             return True
 
         with (
-            patch.object(start_instances, "_PLUGIN_CACHE_DIR", cache_dir),
-            patch.object(start_instances, "_download_file", side_effect=fake_download),
+            patch.object(startup_plugins, "PLUGIN_CACHE_DIR", cache_dir),
+            patch.object(startup_plugins, "download_file", side_effect=fake_download),
         ):
             result = start_instances.download_plugin(
                 plugin_dir, "stable-3.13", skip_plugin_install=False
@@ -1263,8 +1280,8 @@ class TestDownloadPlugin:
             return True
 
         with (
-            patch.object(start_instances, "_PLUGIN_CACHE_DIR", cache_dir),
-            patch.object(start_instances, "_download_file", side_effect=fake_download),
+            patch.object(startup_plugins, "PLUGIN_CACHE_DIR", cache_dir),
+            patch.object(startup_plugins, "download_file", side_effect=fake_download),
         ):
             result = start_instances.download_plugin(
                 plugin_dir, "stable-3.13", skip_plugin_install=False
@@ -1278,8 +1295,8 @@ class TestDownloadPlugin:
         cache_dir = tmp_path / "cache"
 
         with (
-            patch.object(start_instances, "_PLUGIN_CACHE_DIR", cache_dir),
-            patch.object(start_instances, "_download_file", return_value=False),
+            patch.object(startup_plugins, "PLUGIN_CACHE_DIR", cache_dir),
+            patch.object(startup_plugins, "download_file", return_value=False),
         ):
             result = start_instances.download_plugin(
                 plugin_dir, "stable-3.13", skip_plugin_install=False
@@ -1292,7 +1309,7 @@ class TestDownloadAdditionalPlugins:
     """Tests for download_additional_plugins()."""
 
     def test_empty_string_no_op(self, tmp_path: Path) -> None:
-        with patch.object(start_instances, "_download_file") as mock_dl:
+        with patch.object(startup_plugins, "download_file") as mock_dl:
             start_instances.download_additional_plugins(tmp_path, "")
             mock_dl.assert_not_called()
 
@@ -1300,7 +1317,7 @@ class TestDownloadAdditionalPlugins:
         urls = "https://example.com/a.jar,https://example.com/b.jar"
 
         with patch.object(
-            start_instances, "_download_file", return_value=True
+            startup_plugins, "download_file", return_value=True
         ) as mock_dl:
             start_instances.download_additional_plugins(tmp_path, urls)
 
@@ -1316,7 +1333,7 @@ class TestDownloadFile:
         mock_resp.iter_content.return_value = [b"data1", b"data2"]
         mock_resp.raise_for_status.return_value = None
 
-        with patch("start_instances.requests.get", return_value=mock_resp):
+        with patch("startup_plugins.requests.get", return_value=mock_resp):
             result = start_instances._download_file("https://example.com/f", dest)
 
         assert result is True
@@ -1326,7 +1343,7 @@ class TestDownloadFile:
         dest = tmp_path / "output.jar"
 
         with patch(
-            "start_instances.requests.get",
+            "startup_plugins.requests.get",
             side_effect=requests.RequestException("network error"),
         ):
             result = start_instances._download_file("https://example.com/f", dest)
@@ -1348,7 +1365,7 @@ class TestInitGerritSite:
         docker.run_ephemeral.return_value = ""
         instance_dir = tmp_path / "instance"
 
-        with patch.object(start_instances, "_chown_tree"):
+        with patch.object(startup_site_init, "chown_tree"):
             start_instances.init_gerrit_site(
                 docker,
                 instance_dir,
@@ -1365,7 +1382,7 @@ class TestInitGerritSite:
         docker.run_ephemeral.return_value = ""
         instance_dir = tmp_path / "instance"
 
-        with patch.object(start_instances, "_chown_tree"):
+        with patch.object(startup_site_init, "chown_tree"):
             start_instances.init_gerrit_site(
                 docker,
                 instance_dir,
@@ -1396,7 +1413,7 @@ class TestInitGerritSite:
         docker.run_ephemeral.return_value = ""
         instance_dir = tmp_path / "instance"
 
-        with patch.object(start_instances, "_chown_tree"):
+        with patch.object(startup_site_init, "chown_tree"):
             start_instances.init_gerrit_site(
                 docker,
                 instance_dir,
@@ -1418,7 +1435,7 @@ class TestInitGerritSite:
         docker.run_ephemeral.return_value = ""
         instance_dir = tmp_path / "instance"
 
-        with patch.object(start_instances, "_chown_tree"):
+        with patch.object(startup_site_init, "chown_tree"):
             start_instances.init_gerrit_site(
                 docker,
                 instance_dir,
@@ -1442,7 +1459,7 @@ class TestInitGerritSite:
         docker.run_ephemeral.return_value = ""
         instance_dir = tmp_path / "instance"
 
-        with patch.object(start_instances, "_chown_tree"):
+        with patch.object(startup_site_init, "chown_tree"):
             start_instances.init_gerrit_site(
                 docker,
                 instance_dir,
@@ -1462,7 +1479,7 @@ class TestInitGerritSite:
         instance_dir = tmp_path / "instance"
 
         with (
-            patch.object(start_instances, "_chown_tree"),
+            patch.object(startup_site_init, "chown_tree"),
             pytest.raises(GerritActionError, match="Failed to initialize"),
         ):
             start_instances.init_gerrit_site(
@@ -1493,7 +1510,7 @@ class TestInitGerritSite:
         instance_dir = tmp_path / "instance"
 
         with (
-            patch.object(start_instances, "_chown_tree"),
+            patch.object(startup_site_init, "chown_tree"),
             pytest.raises(ConfigError, match="Invalid 'gerrit_init_args'"),
         ):
             start_instances.init_gerrit_site(
@@ -1524,16 +1541,13 @@ class TestConfigureGerrit:
         # Create a minimal git config file
         (instance_dir / "etc" / "gerrit.config").write_text("")
 
-        with patch("start_instances.subprocess.run") as mock_run:
+        with patch("startup_gerrit_config.subprocess.run") as mock_run:
             mock_run.return_value = _cp()
             start_instances.configure_gerrit(
                 instance_dir,
                 "test",
-                "http://localhost:18080/",
-                "http://*:8080/",
+                _make_endpoints(),
                 "",
-                "localhost:29418",
-                False,
             )
 
         # Should have been called many times for git config
@@ -1550,15 +1564,12 @@ class TestConfigureGerrit:
             calls_made.append(args[0])
             return _cp()
 
-        with patch("start_instances.subprocess.run", side_effect=record_call):
+        with patch("startup_gerrit_config.subprocess.run", side_effect=record_call):
             start_instances.configure_gerrit(
                 instance_dir,
                 "test",
-                "http://localhost:18080/",
-                "http://*:8080/",
+                _make_endpoints(),
                 "",
-                "localhost:29418",
-                False,
             )
 
         # Find the auth.type call
@@ -1581,15 +1592,16 @@ class TestConfigureGerrit:
             calls_made.append(args[0])
             return _cp()
 
-        with patch("start_instances.subprocess.run", side_effect=record_call):
+        with patch("startup_gerrit_config.subprocess.run", side_effect=record_call):
             start_instances.configure_gerrit(
                 instance_dir,
                 "test",
-                "http://tunnel.example.com:8080/",
-                "http://*:8080/",
+                _make_endpoints(
+                    canonical_url="http://tunnel.example.com:8080/",
+                    advertised_ssh_addr="tunnel.example.com:12345",
+                    use_tunnel=True,
+                ),
                 "",
-                "tunnel.example.com:12345",
-                True,
                 tunnel_host="bore.pub",
             )
 
@@ -1612,17 +1624,18 @@ class TestConfigureGerrit:
             return _cp()
 
         with (
-            caplog.at_level(logging.DEBUG, logger="start_instances"),
-            patch("start_instances.subprocess.run", side_effect=record_call),
+            caplog.at_level(logging.DEBUG, logger="startup_gerrit_config"),
+            patch("startup_gerrit_config.subprocess.run", side_effect=record_call),
         ):
             start_instances.configure_gerrit(
                 instance_dir,
                 "test",
-                "http://100.100.50.1:8080/",
-                "http://*:8080/",
+                _make_endpoints(
+                    canonical_url="http://100.100.50.1:8080/",
+                    advertised_ssh_addr="100.100.50.1:29418",
+                    use_tunnel=True,
+                ),
                 "",
-                "100.100.50.1:29418",
-                True,
                 tunnel_host="100.100.50.1",
             )
 
@@ -1655,17 +1668,18 @@ class TestConfigureGerrit:
             return _cp()
 
         with (
-            caplog.at_level(logging.DEBUG, logger="start_instances"),
-            patch("start_instances.subprocess.run", side_effect=record_call),
+            caplog.at_level(logging.DEBUG, logger="startup_gerrit_config"),
+            patch("startup_gerrit_config.subprocess.run", side_effect=record_call),
         ):
             start_instances.configure_gerrit(
                 instance_dir,
                 "test",
-                "http://bore.pub:8080/",
-                "http://*:8080/",
+                _make_endpoints(
+                    canonical_url="http://bore.pub:8080/",
+                    advertised_ssh_addr="bore.pub:12345",
+                    use_tunnel=True,
+                ),
                 "",
-                "bore.pub:12345",
-                True,
                 tunnel_host="bore.pub",
             )
 
@@ -1693,15 +1707,12 @@ class TestConfigureGerrit:
             calls_made.append(args[0])
             return _cp()
 
-        with patch("start_instances.subprocess.run", side_effect=record_call):
+        with patch("startup_gerrit_config.subprocess.run", side_effect=record_call):
             start_instances.configure_gerrit(
                 instance_dir,
                 "test",
-                "http://localhost:18080/",
-                "http://*:8080/",
+                _make_endpoints(),
                 "",
-                "localhost:29418",
-                False,
             )
 
         admin_calls = [c for c in calls_made if "plugins.allowRemoteAdmin" in c]
@@ -1718,15 +1729,15 @@ class TestConfigureGerrit:
             calls_made.append(args[0])
             return _cp()
 
-        with patch("start_instances.subprocess.run", side_effect=record_call):
+        with patch("startup_gerrit_config.subprocess.run", side_effect=record_call):
             start_instances.configure_gerrit(
                 instance_dir,
                 "test",
-                "http://localhost:18080/r/",
-                "http://*:8080/r/",
+                _make_endpoints(
+                    canonical_url="http://localhost:18080/r/",
+                    listen_url="http://*:8080/r/",
+                ),
                 "/r",
-                "localhost:29418",
-                False,
             )
 
         # Each call is a list like ['git', 'config', '-f', '...', 'httpd.firstTimeRedirectUrl', '/r/login/...']
@@ -1790,7 +1801,7 @@ class TestResolveProjectList:
         config = _make_config()
 
         with patch.object(
-            start_instances, "fetch_remote_projects", return_value=["p1", "p2"]
+            startup_precreate, "fetch_remote_projects", return_value=["p1", "p2"]
         ) as mock_fetch:
             result = start_instances._resolve_project_list(instance, "/r", config)
 
@@ -1802,7 +1813,7 @@ class TestResolveProjectList:
         config = _make_config()
 
         with patch.object(
-            start_instances, "fetch_remote_projects", return_value=["foo-bar"]
+            startup_precreate, "fetch_remote_projects", return_value=["foo-bar"]
         ) as mock_fetch:
             result = start_instances._resolve_project_list(instance, "", config)
 
@@ -1837,8 +1848,8 @@ class TestFetchAndPrecreateProjects:
         config = _make_config()
 
         with (
-            patch.object(start_instances, "_chown_tree"),
-            patch("start_instances.subprocess.run", return_value=_cp()),
+            patch.object(startup_precreate, "chown_tree"),
+            patch("startup_precreate.subprocess.run", return_value=_cp()),
         ):
             count = start_instances.fetch_and_precreate_projects(
                 instance_dir, instance, "", config
@@ -1858,10 +1869,10 @@ class TestFetchAndPrecreateProjects:
 
         with (
             patch.object(
-                start_instances, "fetch_remote_projects", return_value=projects
+                startup_precreate, "fetch_remote_projects", return_value=projects
             ),
-            patch.object(start_instances, "_chown_tree"),
-            patch("start_instances.subprocess.run", return_value=_cp()),
+            patch.object(startup_precreate, "chown_tree"),
+            patch("startup_precreate.subprocess.run", return_value=_cp()),
         ):
             count = start_instances.fetch_and_precreate_projects(
                 instance_dir, instance, "", config
@@ -1878,8 +1889,8 @@ class TestFetchAndPrecreateProjects:
         config = _make_config()
 
         with (
-            patch.object(start_instances, "_chown_tree"),
-            patch("start_instances.subprocess.run", return_value=_cp()),
+            patch.object(startup_precreate, "chown_tree"),
+            patch("startup_precreate.subprocess.run", return_value=_cp()),
         ):
             start_instances.fetch_and_precreate_projects(
                 instance_dir, instance, "", config
@@ -1899,8 +1910,8 @@ class TestFetchAndPrecreateProjects:
         config = _make_config()
 
         with (
-            patch.object(start_instances, "_chown_tree"),
-            patch("start_instances.subprocess.run", return_value=_cp()),
+            patch.object(startup_precreate, "chown_tree"),
+            patch("startup_precreate.subprocess.run", return_value=_cp()),
         ):
             start_instances.fetch_and_precreate_projects(
                 instance_dir, instance, "", config
@@ -1915,7 +1926,7 @@ class TestFetchAndPrecreateProjects:
         instance = _make_instance(project="")
         config = _make_config()
 
-        with patch.object(start_instances, "fetch_remote_projects", return_value=[]):
+        with patch.object(startup_precreate, "fetch_remote_projects", return_value=[]):
             count = start_instances.fetch_and_precreate_projects(
                 instance_dir, instance, "", config
             )
@@ -2095,7 +2106,7 @@ class TestWriteStartupSummary:
             "beta": {"http_port": 18081, "ssh_port": 29419},
         }
 
-        with patch.object(start_instances, "write_summary") as mock_ws:
+        with patch.object(startup_summary, "write_summary") as mock_ws:
             start_instances._write_startup_summary(store)
 
         written = mock_ws.call_args[0][0]
@@ -2115,7 +2126,7 @@ class TestChownTree:
     """Tests for _chown_tree()."""
 
     def test_calls_chown_and_chmod(self, tmp_path: Path) -> None:
-        with patch("start_instances.subprocess.run") as mock_run:
+        with patch("startup_site_layout.subprocess.run") as mock_run:
             mock_run.return_value = _cp()
             start_instances._chown_tree(tmp_path)
 
@@ -2128,7 +2139,7 @@ class TestChownTree:
 
     def test_ignores_errors(self) -> None:
         with patch(
-            "start_instances.subprocess.run",
+            "startup_site_layout.subprocess.run",
             side_effect=FileNotFoundError("chown not found"),
         ):
             # Should not raise
@@ -2193,13 +2204,11 @@ class TestStartInstance:
             patch.object(start_instances, "_write_env_sh"),
         ):
             ok = start_instances.start_instance(
-                docker,
+                _make_context(
+                    docker, config, api_store, inst_store, "test-image:latest"
+                ),
                 instance,
                 0,
-                config,
-                api_store,
-                inst_store,
-                "test-image:latest",
             )
 
         assert ok is True
@@ -2218,13 +2227,11 @@ class TestStartInstance:
             patch.object(start_instances, "_write_env_sh"),
         ):
             ok = start_instances.start_instance(
-                docker,
+                _make_context(
+                    docker, config, api_store, inst_store, "test-image:latest"
+                ),
                 instance,
                 0,
-                config,
-                api_store,
-                inst_store,
-                "test-image:latest",
             )
 
         assert ok is False
@@ -2247,13 +2254,11 @@ class TestStartInstance:
             patch.object(start_instances, "_write_env_sh"),
         ):
             ok = start_instances.start_instance(
-                docker,
+                _make_context(
+                    docker, config, api_store, inst_store, "test-image:latest"
+                ),
                 instance,
                 0,
-                config,
-                api_store,
-                inst_store,
-                "test-image:latest",
             )
 
         assert ok is False
@@ -2277,13 +2282,11 @@ class TestStartInstance:
         ):
             # Instance at index 2
             start_instances.start_instance(
-                docker,
+                _make_context(
+                    docker, config, api_store, inst_store, "test-image:latest"
+                ),
                 instance,
                 2,
-                config,
-                api_store,
-                inst_store,
-                "test-image:latest",
             )
 
         ports = docker.run_container.call_args[1]["ports"]
@@ -2314,13 +2317,11 @@ class TestStartInstance:
             patch.object(start_instances, "_write_env_sh"),
         ):
             start_instances.start_instance(
-                docker,
+                _make_context(
+                    docker, config, api_store, inst_store, "test-image:latest"
+                ),
                 instance,
                 0,
-                config,
-                api_store,
-                inst_store,
-                "test-image:latest",
             )
 
         mock_ssh.assert_not_called()
@@ -2349,13 +2350,11 @@ class TestStartInstance:
             patch.object(start_instances, "_write_env_sh"),
         ):
             start_instances.start_instance(
-                docker,
+                _make_context(
+                    docker, config, api_store, inst_store, "test-image:latest"
+                ),
                 instance,
                 0,
-                config,
-                api_store,
-                inst_store,
-                "test-image:latest",
             )
 
         assert not bundled.exists()
@@ -2389,21 +2388,19 @@ class TestStartInstance:
             patch.object(start_instances, "_write_env_sh", side_effect=capture_env_sh),
         ):
             start_instances.start_instance(
-                docker,
+                _make_context(
+                    docker, config, api_store, inst_store, "test-image:latest"
+                ),
                 instance,
                 0,
-                config,
-                api_store,
-                inst_store,
-                "test-image:latest",
             )
 
         # Check canonical_url includes tunnel host and port. Parse the URL
         # and compare the host/port components exactly rather than matching
         # substrings, which would also accept lookalike hosts.
         cfg_args = mock_cfg.call_args
-        canonical_url = cfg_args[0][2]  # 3rd positional arg
-        parsed = urlparse(canonical_url)
+        endpoints = cfg_args[0][2]  # 3rd positional arg
+        parsed = urlparse(endpoints.canonical_url)
         assert parsed.hostname == "tunnel.example.com"
         assert parsed.port == 9080
 
@@ -2426,13 +2423,11 @@ class TestStartInstance:
             patch.object(start_instances, "_write_env_sh"),
         ):
             ok = start_instances.start_instance(
-                docker,
+                _make_context(
+                    docker, config, api_store, inst_store, "test-image:latest"
+                ),
                 instance,
                 0,
-                config,
-                api_store,
-                inst_store,
-                "test-image:latest",
             )
 
         assert ok is True
@@ -2634,20 +2629,15 @@ class TestEdgeCases:
             patch.object(start_instances, "_write_env_sh"),
         ):
             start_instances.start_instance(
-                docker,
+                _make_context(docker, config, api_store, inst_store, "img:latest"),
                 instance,
                 0,
-                config,
-                api_store,
-                inst_store,
-                "img:latest",
             )
 
-        # configure_gerrit is called with the canonical_url
-        canonical_url = mock_cfg.call_args[0][2]
-        listen_url = mock_cfg.call_args[0][3]
-        assert "/r/" in canonical_url
-        assert "/r/" in listen_url
+        # configure_gerrit is called with the endpoints carrying canonical_url
+        endpoints = mock_cfg.call_args[0][2]
+        assert "/r/" in endpoints.canonical_url
+        assert "/r/" in endpoints.listen_url
 
     def test_multiple_instances_get_different_ports(self, tmp_path: Path) -> None:
         """Each instance should be assigned incrementing port numbers."""
@@ -2691,13 +2681,9 @@ class TestEdgeCases:
                 patch.object(start_instances, "_write_env_sh"),
             ):
                 start_instances.start_instance(
-                    docker,
+                    _make_context(docker, config, api_store, inst_store, "img:latest"),
                     inst,
                     idx,
-                    config,
-                    api_store,
-                    inst_store,
-                    "img:latest",
                 )
             port_maps.append(docker.run_container.call_args[1]["ports"])
 
@@ -2728,13 +2714,9 @@ class TestEdgeCases:
             patch.object(start_instances, "_write_env_sh"),
         ):
             start_instances.start_instance(
-                docker,
+                _make_context(docker, config, api_store, inst_store, "img:latest"),
                 instance,
                 0,
-                config,
-                api_store,
-                inst_store,
-                "img:latest",
             )
 
         env = docker.run_container.call_args[1]["env"]
@@ -2760,13 +2742,9 @@ class TestEdgeCases:
             patch.object(start_instances, "_write_env_sh"),
         ):
             start_instances.start_instance(
-                docker,
+                _make_context(docker, config, api_store, inst_store, "img:latest"),
                 instance,
                 0,
-                config,
-                api_store,
-                inst_store,
-                "img:latest",
             )
 
         volumes = docker.run_container.call_args[1]["volumes"]
@@ -2800,13 +2778,9 @@ class TestEdgeCases:
             patch.object(start_instances, "_write_env_sh"),
         ):
             start_instances.start_instance(
-                docker,
+                _make_context(docker, config, api_store, inst_store, "img:latest"),
                 instance,
                 0,
-                config,
-                api_store,
-                inst_store,
-                "img:latest",
             )
 
         meta = inst_store.data["test"]

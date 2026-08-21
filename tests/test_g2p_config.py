@@ -252,7 +252,7 @@ class TestG2PConfigDefaults:
     def test_frozen(self) -> None:
         cfg = G2PConfig()
         with pytest.raises(AttributeError):
-            cfg.enabled = True  # pyright: ignore[reportAttributeAccessIssue]
+            cfg.enabled = True  # type: ignore[misc]  # pyright: ignore[reportAttributeAccessIssue]
 
     def test_default_comment_mappings_is_copy(self) -> None:
         """Each instance gets its own copy of the default dict."""

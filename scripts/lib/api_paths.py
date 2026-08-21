@@ -21,9 +21,13 @@ from __future__ import annotations
 
 import logging
 import re
+from typing import TYPE_CHECKING
 from urllib.parse import urlparse
 
 import requests
+
+if TYPE_CHECKING:
+    from collections.abc import Mapping, Sequence
 
 logger = logging.getLogger(__name__)
 
@@ -162,7 +166,7 @@ def get_gerrit_version(
 
 
 def detect_and_record_api_paths(
-    instances: list[dict[str, str]],
+    instances: Sequence[Mapping[str, str | None]],
 ) -> dict[str, dict[str, str]]:
     """Detect API paths for a list of instances.
 
@@ -172,8 +176,10 @@ def detect_and_record_api_paths(
     Parameters
     ----------
     instances:
-        List of dicts, each with at least ``slug``, ``gerrit`` (host),
-        and optionally ``api_path``.
+        Sequence of mappings, each with at least ``slug``, ``gerrit``
+        (host), and optionally ``api_path``. Read-only, so the
+        covariant ``Sequence``/``Mapping`` types let callers pass a
+        plain ``list[dict[str, str]]`` too.
 
     Returns
     -------

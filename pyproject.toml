@@ -119,6 +119,15 @@ known-first-party = ["gerrit_api"]
 
 [tool.mypy]
 python_version = "3.10"
+# The scripts import lib modules as flat top-level names (see the
+# pytest `pythonpath` setting), so mypy needs the same search path to
+# resolve them. Without it every cross-module base class degrades to
+# `Any` and `warn_return_any` fires on the inherited call sites.
+# `explicit_package_bases` makes mypy derive those same flat names for
+# files passed on the command line, which would otherwise resolve as
+# `lib.*` via the `__init__.py` the wheel build needs.
+mypy_path = "scripts/lib"
+explicit_package_bases = true
 warn_return_any = true
 warn_unused_configs = true
 disallow_untyped_defs = true

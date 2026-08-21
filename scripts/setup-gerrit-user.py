@@ -41,6 +41,20 @@ Environment Variables:
     WORK_DIR            - Working directory containing instances.json
     USE_API_PATH        - Whether to use API path prefix (optional)
     DEBUG               - Enable debug logging if "true"
+
+Implementation:
+    Each step lives in a focused module under scripts/lib and is
+    re-exported here, so this file stays the single entry point:
+    setup_user_model (username rules, retry policy, outcome record),
+    setup_user_cli (argument parser), setup_user_input (logging, key
+    collection, validation), setup_user_client (account setup against
+    one Gerrit URL), setup_user_instances (instances.json loading and
+    per-instance retries) and setup_user_summary (closing log banner
+    and GitHub step summaries).
+
+    The run sequences stay here so that main() and run_loop_instances()
+    resolve every step as an attribute of this module, which is how
+    callers substitute individual steps.
 """
 
 from __future__ import annotations
@@ -49,9 +63,7 @@ import argparse
 import json
 import logging
 import os
-import re
 import sys
-import time
 from pathlib import Path
 from typing import Any
 
@@ -60,264 +72,75 @@ SCRIPT_DIR = Path(__file__).parent.resolve()
 LIB_DIR = SCRIPT_DIR / "lib"
 sys.path.insert(0, str(LIB_DIR))
 
+# ``gerrit_api`` is imported first, and guarded, so a missing
+# ``requests`` reports the actionable message below rather than a
+# traceback from whichever setup_user_* module got there first.
 try:
     from gerrit_api import (
         GerritAPIError,
-        GerritDevClient,
-        parse_ssh_keys,
+        GerritDevClient,  # noqa: F401
+        parse_ssh_keys,  # noqa: F401
     )
 except ImportError as e:
     print(f"Error: Failed to import gerrit_api module: {e}", file=sys.stderr)
     print("Make sure 'requests' is installed: pip install requests", file=sys.stderr)
     sys.exit(1)
 
+from setup_user_cli import build_parser  # noqa: E402
+from setup_user_client import (  # noqa: E402
+    get_container_gerrit_url,
+    run_in_container,
+    run_local,
+)
+from setup_user_input import (  # noqa: E402
+    collect_ssh_keys,
+    read_ssh_keys,  # noqa: F401
+    setup_logging,
+    validate_username,
+)
+from setup_user_instances import (  # noqa: E402
+    build_instance_url,  # noqa: F401
+    configure_instance,
+    load_instances_file,
+)
+from setup_user_model import (  # noqa: E402
+    _USERNAME_MAX_LEN,  # noqa: F401
+    _USERNAME_RE,  # noqa: F401
+    InstanceOutcome,  # noqa: F401
+)
+from setup_user_summary import (  # noqa: E402
+    log_loop_completion,
+    output_github_summary,
+    output_multi_instance_summary,
+)
+
 # Configure logging
 logger = logging.getLogger(__name__)
 
-# Username validation: only safe characters to prevent command injection
-_USERNAME_RE = re.compile(r"^[A-Za-z0-9._-]+$")
-_USERNAME_MAX_LEN = 64
-
-
-def setup_logging(verbose: bool = False, debug: bool = False) -> None:
-    """Configure logging based on verbosity settings."""
-    if debug:
-        level = logging.DEBUG
-    elif verbose:
-        level = logging.INFO
-    else:
-        level = logging.WARNING
-
-    logging.basicConfig(
-        level=level,
-        format="%(asctime)s [%(levelname)s] %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S",
-    )
-
-
-def read_ssh_keys(
-    key_string: str | None = None,
-    key_file: str | None = None,
-    env_var: str = "SSH_AUTH_KEYS",
-) -> list[str]:
-    """
-    Read SSH keys from various sources.
-
-    Args:
-        key_string: SSH key(s) as a string
-        key_file: Path to file containing SSH key(s)
-        env_var: Environment variable name containing SSH keys
-
-    Returns:
-        List of SSH public key strings
-    """
-    keys = []
-
-    # Read from file
-    if key_file:
-        try:
-            with open(key_file) as f:
-                content = f.read()
-                keys.extend(parse_ssh_keys(content))
-                logger.debug(f"Read {len(keys)} keys from {key_file}")
-        except OSError as e:
-            logger.warning(f"Failed to read key file {key_file}: {e}")
-
-    # Read from string
-    if key_string:
-        keys.extend(parse_ssh_keys(key_string))
-
-    # Read from environment
-    env_keys = os.environ.get(env_var, "")
-    if env_keys:
-        keys.extend(parse_ssh_keys(env_keys))
-        logger.debug(f"Read keys from ${env_var}")
-
-    return keys
-
-
-def get_container_gerrit_url(_container: str, port: int = 8080) -> str:
-    """
-    Get the Gerrit URL for a container.
-
-    For containers, we use localhost with the mapped port.
-    The container name is accepted for API consistency but not used
-    since we connect via localhost with mapped ports.
-    """
-    return f"http://localhost:{port}"
-
-
-def run_in_container(
-    container: str,
-    url: str,
-    username: str,
-    ssh_keys: list[str],
-    name: str | None = None,
-    email: str | None = None,
-    add_to_admins: bool = True,
-) -> dict[str, Any]:
-    """
-    Run the user setup directly (container is accessible via localhost).
-
-    Args:
-        container: Container name (for logging)
-        url: Gerrit URL
-        username: Username to create
-        ssh_keys: List of SSH public keys
-        name: Full name for the account
-        email: Email address for the account
-        add_to_admins: Whether to add to Administrators group
-
-    Returns:
-        Account info dict
-    """
-    logger.info(f"Setting up user in container: {container}")
-    logger.info(f"Gerrit URL: {url}")
-
-    client = GerritDevClient(url)
-    admin_id = client.become_admin()
-    logger.info(f"Authenticated as admin account {admin_id}")
-
-    result: dict[str, Any] = client.setup_user_with_ssh_keys(
-        username=username,
-        ssh_keys=ssh_keys,
-        name=name,
-        email=email,
-        add_to_admins=add_to_admins,
-    )
-    return result
-
-
-def run_local(
-    url: str,
-    username: str,
-    ssh_keys: list[str],
-    name: str | None = None,
-    email: str | None = None,
-    add_to_admins: bool = True,
-) -> dict[str, Any]:
-    """
-    Run the user setup against a local Gerrit instance.
-
-    Args:
-        url: Gerrit URL
-        username: Username to create
-        ssh_keys: List of SSH public keys
-        name: Full name for the account
-        email: Email address for the account
-        add_to_admins: Whether to add to Administrators group
-
-    Returns:
-        Account info dict
-    """
-    logger.info(f"Setting up user on: {url}")
-
-    client = GerritDevClient(url)
-    admin_id = client.become_admin()
-    logger.info(f"Authenticated as admin account {admin_id}")
-
-    result: dict[str, Any] = client.setup_user_with_ssh_keys(
-        username=username,
-        ssh_keys=ssh_keys,
-        name=name,
-        email=email,
-        add_to_admins=add_to_admins,
-    )
-    return result
-
-
-def validate_username(username: str) -> str | None:
-    """Validate a username, returning an error message or None if valid."""
-    if not _USERNAME_RE.match(username):
-        return (
-            f"Invalid username: '{username}' – "
-            "must contain only letters, numbers, dots, underscores, and hyphens"
-        )
-    if len(username) > _USERNAME_MAX_LEN:
-        return f"Username too long (max {_USERNAME_MAX_LEN} characters)"
-    return None
-
-
-def output_github_summary(account: dict, username: str) -> None:
-    """Write summary to GitHub Actions step summary if available."""
-    summary_file = os.environ.get("GITHUB_STEP_SUMMARY")
-    if not summary_file:
-        return
-
-    try:
-        with open(summary_file, "a") as f:
-            f.write("### Gerrit User Setup ✅\n\n")
-            f.write(f"**Username:** `{username}`\n")
-            f.write(f"**Account ID:** `{account.get('_account_id', 'unknown')}`\n")
-            if account.get("email"):
-                f.write(f"**Email:** `{account['email']}`\n")
-            f.write("\n**Permissions:** Administrator (full create/merge access)\n")
-    except OSError as e:
-        logger.warning(f"Failed to write GitHub summary: {e}")
-
-
-def output_multi_instance_summary(
-    username: str,
-    rows: list[tuple[str, str]],
-    failure_count: int,
-) -> None:
-    """Write a multi-instance summary to GitHub Actions step summary."""
-    summary_file = os.environ.get("GITHUB_STEP_SUMMARY")
-    if not summary_file:
-        return
-
-    try:
-        with open(summary_file, "a") as f:
-            if failure_count == 0:
-                f.write("### SSH Access Configured 🔑\n")
-            else:
-                f.write("### SSH Access Configuration ⚠️\n")
-            f.write("\n")
-            f.write(
-                "SSH public keys have been processed for the Gerrit container(s).\n"
-            )
-            f.write("\n")
-            f.write("| Instance | Status |\n")
-            f.write("|----------|--------|\n")
-            for slug, status in rows:
-                f.write(f"| {slug} | {status} |\n")
-            f.write("\n")
-            f.write(f"**Username:** `{username}`\n")
-            if username != "admin":
-                f.write("\n")
-                f.write("**Permissions:** Administrator (full create/merge access)\n")
-            f.write("\n")
-            f.write("**SSH Command:**\n")
-            f.write("```bash\n")
-            f.write(f"ssh -p 29418 {username}@<gerrit-host>\n")
-            f.write("```\n")
-    except OSError as e:
-        logger.warning(f"Failed to write GitHub summary: {e}")
-
-
-def load_instances_file(path: str) -> dict[str, Any]:
-    """Load instances metadata from a JSON file.
-
-    Returns:
-        Dictionary mapping slug to instance metadata.
-
-    Raises:
-        SystemExit: If the file does not exist or contains invalid JSON.
-    """
-    instances_path = Path(path)
-    if not instances_path.exists():
-        logger.error(f"Instances file not found: {path}")
-        sys.exit(1)
-
-    try:
-        data = json.loads(instances_path.read_text(encoding="utf-8"))
-        if not isinstance(data, dict):
-            logger.error(f"Instances file must contain a JSON object: {path}")
-            sys.exit(1)
-        return data
-    except json.JSONDecodeError as e:
-        logger.error(f"Invalid JSON in instances file {path}: {e}")
-        sys.exit(1)
+__all__ = [
+    "InstanceOutcome",
+    # The underscore-prefixed entries are long-standing internals that
+    # callers import from this module by name; they are listed so the
+    # re-export stays explicit.
+    "_USERNAME_MAX_LEN",
+    "_USERNAME_RE",
+    "build_instance_url",
+    "build_parser",
+    "collect_ssh_keys",
+    "configure_instance",
+    "get_container_gerrit_url",
+    "load_instances_file",
+    "log_loop_completion",
+    "main",
+    "output_github_summary",
+    "output_multi_instance_summary",
+    "read_ssh_keys",
+    "run_in_container",
+    "run_local",
+    "run_loop_instances",
+    "setup_logging",
+    "validate_username",
+]
 
 
 def run_loop_instances(
@@ -360,131 +183,25 @@ def run_loop_instances(
     summary_rows: list[tuple[str, str]] = []
 
     for slug in sorted(instances.keys()):
-        instance = instances[slug]
-        logger.info("")
-        logger.info(f"Processing instance: {slug}")
-        logger.info("========================================")
-
-        # Get container ID
-        cid = instance.get("cid")
-        if not cid or cid == "null":
-            logger.warning(f"No container ID found for {slug}, skipping...")
-            summary_rows.append((slug, "⚠️ Skipped (no container)"))
-            continue
-
-        logger.info(f"  Container ID: {cid[:12]}")
-
-        # Get HTTP port
-        http_port = instance.get("http_port", 8080)
-        logger.info(f"  HTTP Port: {http_port}")
-
-        # Compute effective API path (must match logic in other scripts)
-        api_path = instance.get("api_path", "")
-        effective_api_path = ""
-        if use_api_path and api_path:
-            effective_api_path = api_path
-
-        # Build Gerrit URL
-        gerrit_url = f"http://localhost:{http_port}{effective_api_path}"
-        logger.info(f"  Gerrit URL: {gerrit_url}")
-
-        # Run the setup with retries — the Gerrit container may still be
-        # initialising its auth subsystem even though the health-check
-        # (which hits a public endpoint) already passed.
-        max_attempts = 3
-        retry_delay = 3  # seconds
-        last_error: Exception | None = None
-
-        for attempt in range(1, max_attempts + 1):
-            try:
-                account = run_local(
-                    url=gerrit_url,
-                    username=username,
-                    ssh_keys=ssh_keys,
-                    name=name,
-                    email=email,
-                    add_to_admins=add_to_admins,
-                )
-
-                if output_json:
-                    print(json.dumps(account, indent=2))
-                else:
-                    logger.info(f"  SSH keys configured for {username} ✅")
-
-                success_count += 1
-                summary_rows.append((slug, "✅ Configured"))
-                last_error = None
-                break
-
-            except GerritAPIError as e:
-                last_error = e
-                # Only retry on transient failures: network errors
-                # (no status code) or specific HTTP codes.
-                # 401/403 are included because the Gerrit auth subsystem
-                # may not be fully ready immediately after the container
-                # passes its health check (which hits a public endpoint).
-                _transient = {401, 403, 429, 500, 502, 503, 504}
-                is_transient = e.status_code is None or e.status_code in _transient
-                if is_transient and attempt < max_attempts:
-                    logger.warning(
-                        "Attempt %d/%d failed for %s on %s: %s (retrying in %ds…)",
-                        attempt,
-                        max_attempts,
-                        username,
-                        slug,
-                        e,
-                        retry_delay,
-                    )
-                    time.sleep(retry_delay)
-                    # Increase delay for next attempt
-                    retry_delay *= 2
-                else:
-                    logger.warning(
-                        "Failed to configure SSH keys for %s on %s "
-                        "after %d attempt(s): %s",
-                        username,
-                        slug,
-                        attempt,
-                        e,
-                    )
-                    if e.status_code is not None:
-                        logger.warning("  HTTP status: %s", e.status_code)
-                    if e.response_text:
-                        logger.debug("  Response body: %s", e.response_text)
-                    logger.warning("  Gerrit URL was: %s", gerrit_url)
-                    break
-
-            except Exception as e:
-                last_error = e
-                logger.warning(
-                    "Unexpected error configuring SSH keys for %s on %s: %s",
-                    username,
-                    slug,
-                    e,
-                )
-                break
-
-        if last_error is not None:
+        outcome = configure_instance(
+            slug,
+            instances[slug],
+            username,
+            ssh_keys,
+            name=name,
+            email=email,
+            add_to_admins=add_to_admins,
+            use_api_path=use_api_path,
+            output_json=output_json,
+            setup_fn=run_local,
+        )
+        summary_rows.append((slug, outcome.status))
+        if outcome.kind == "configured":
+            success_count += 1
+        elif outcome.kind == "failed":
             failure_count += 1
-            summary_rows.append((slug, "❌ Failed"))
 
-    # Final summary
-    logger.info("")
-    logger.info("========================================")
-    if failure_count == 0:
-        logger.info("SSH authentication keys configured ✅")
-    else:
-        logger.info(f"SSH authentication completed with {failure_count} failure(s)")
-    logger.info("========================================")
-    logger.info("")
-    logger.info(f"Configured {success_count} instance(s) successfully")
-    logger.info(f"You can now SSH to the Gerrit container(s) as '{username}'")
-    logger.info(f"Example: ssh -p 29418 {username}@<host>")
-
-    if username != "admin":
-        logger.info("")
-        logger.info(f"User '{username}' has been added to the Administrators group.")
-        logger.info("This grants full permissions to create and merge changes.")
+    log_loop_completion(username, success_count, failure_count)
 
     # Write multi-instance GitHub summary
     output_multi_instance_summary(username, summary_rows, failure_count)
@@ -492,174 +209,37 @@ def run_loop_instances(
     return 1 if failure_count > 0 else 0
 
 
-def main() -> int:
-    """Main entry point."""
-    parser = argparse.ArgumentParser(
-        description="Set up Gerrit users with SSH keys",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog=__doc__,
+def _run_multi_instance(args: argparse.Namespace, ssh_keys: list[str]) -> int:
+    """Configure every instance in the instances file.
+
+    This is the mode that replaces add-ssh-auth-keys.sh.
+    """
+    # Determine the instances file path
+    instances_file = args.instances_file
+    if not instances_file:
+        # Fall back to $WORK_DIR/instances.json
+        work_dir = os.environ.get("WORK_DIR", "/tmp")
+        instances_file = os.path.join(work_dir, "instances.json")
+
+    if not ssh_keys:
+        logger.info("No SSH auth keys provided, skipping...")
+        return 0
+
+    instances = load_instances_file(instances_file)
+    return run_loop_instances(
+        instances,
+        args.username,
+        ssh_keys,
+        name=args.name,
+        email=args.email,
+        add_to_admins=not args.no_admin,
+        use_api_path=args.use_api_path,
+        output_json=args.json,
     )
 
-    # Connection options
-    conn_group = parser.add_argument_group("Connection")
-    conn_group.add_argument(
-        "--url",
-        default=os.environ.get("GERRIT_URL", "http://localhost:8080"),
-        help="Gerrit base URL (default: $GERRIT_URL or http://localhost:8080)",
-    )
-    conn_group.add_argument(
-        "--container",
-        help="Docker container name (uses container's mapped port)",
-    )
-    conn_group.add_argument(
-        "--port",
-        type=int,
-        default=8080,
-        help="HTTP port for container (default: 8080)",
-    )
 
-    # Multi-instance mode (replaces add-ssh-auth-keys.sh)
-    multi_group = parser.add_argument_group("Multi-instance mode")
-    multi_group.add_argument(
-        "--instances-file",
-        help=(
-            "Path to instances.json file. When combined with "
-            "--loop-instances, iterates over all instances and "
-            "configures SSH keys for each one."
-        ),
-    )
-    multi_group.add_argument(
-        "--loop-instances",
-        action="store_true",
-        help=(
-            "Loop over all instances in the instances file "
-            "(requires --instances-file). Replaces add-ssh-auth-keys.sh."
-        ),
-    )
-    multi_group.add_argument(
-        "--use-api-path",
-        action="store_true",
-        default=os.environ.get("USE_API_PATH", "false").lower() == "true",
-        help=(
-            "Use the api_path from instance metadata when building "
-            "Gerrit URLs (default: $USE_API_PATH or false)"
-        ),
-    )
-
-    # User options
-    user_group = parser.add_argument_group("User")
-    user_group.add_argument(
-        "--username",
-        "-u",
-        default=os.environ.get("SSH_AUTH_USERNAME", "admin"),
-        help="Username to create/update (default: $SSH_AUTH_USERNAME or 'admin')",
-    )
-    user_group.add_argument(
-        "--name",
-        "-n",
-        help="Full name for the account (default: same as username)",
-    )
-    user_group.add_argument(
-        "--email",
-        "-e",
-        help="Email address (default: username@example.com)",
-    )
-    user_group.add_argument(
-        "--no-admin",
-        action="store_true",
-        help="Don't add user to Administrators group",
-    )
-
-    # SSH key options
-    ssh_group = parser.add_argument_group("SSH Keys")
-    ssh_group.add_argument(
-        "--ssh-key",
-        "-k",
-        action="append",
-        dest="ssh_keys",
-        help="SSH public key (can be specified multiple times)",
-    )
-    ssh_group.add_argument(
-        "--ssh-key-file",
-        "-f",
-        action="append",
-        dest="ssh_key_files",
-        help="File containing SSH public key(s) (can be specified multiple times)",
-    )
-
-    # Output options
-    output_group = parser.add_argument_group("Output")
-    output_group.add_argument(
-        "-v",
-        "--verbose",
-        action="store_true",
-        help="Enable verbose output",
-    )
-    output_group.add_argument(
-        "--debug",
-        action="store_true",
-        help="Enable debug output",
-    )
-    output_group.add_argument(
-        "--json",
-        action="store_true",
-        help="Output account info as JSON",
-    )
-
-    args = parser.parse_args()
-
-    # Check for DEBUG environment variable
-    if os.environ.get("DEBUG", "").lower() == "true":
-        args.debug = True
-
-    setup_logging(verbose=args.verbose, debug=args.debug)
-
-    # Validate username
-    username_error = validate_username(args.username)
-    if username_error:
-        logger.error(username_error)
-        print(f"::error::{username_error}", file=sys.stderr)
-        return 1
-
-    # Collect SSH keys
-    ssh_keys = []
-    for key in args.ssh_keys or []:
-        ssh_keys.extend(parse_ssh_keys(key))
-    for key_file in args.ssh_key_files or []:
-        ssh_keys.extend(read_ssh_keys(key_file=key_file))
-    # Also check environment
-    ssh_keys.extend(read_ssh_keys())
-
-    # -------------------------------------------------------------------
-    # Multi-instance mode (replaces add-ssh-auth-keys.sh)
-    # -------------------------------------------------------------------
-    if args.loop_instances:
-        # Determine the instances file path
-        instances_file = args.instances_file
-        if not instances_file:
-            # Fall back to $WORK_DIR/instances.json
-            work_dir = os.environ.get("WORK_DIR", "/tmp")
-            instances_file = os.path.join(work_dir, "instances.json")
-
-        if not ssh_keys:
-            logger.info("No SSH auth keys provided, skipping...")
-            return 0
-
-        instances = load_instances_file(instances_file)
-        return run_loop_instances(
-            instances,
-            args.username,
-            ssh_keys,
-            name=args.name,
-            email=args.email,
-            add_to_admins=not args.no_admin,
-            use_api_path=args.use_api_path,
-            output_json=args.json,
-        )
-
-    # -------------------------------------------------------------------
-    # Single-instance mode (original behaviour)
-    # -------------------------------------------------------------------
+def _run_single_instance(args: argparse.Namespace, ssh_keys: list[str]) -> int:
+    """Configure one Gerrit endpoint (the original behaviour)."""
     if not ssh_keys:
         logger.warning("No SSH keys provided")
 
@@ -712,6 +292,33 @@ def main() -> int:
     except Exception as e:
         logger.exception(f"Unexpected error: {e}")
         return 1
+
+
+def main() -> int:
+    """Main entry point."""
+    parser = build_parser(epilog=__doc__)
+    args = parser.parse_args()
+
+    # Check for DEBUG environment variable
+    if os.environ.get("DEBUG", "").lower() == "true":
+        args.debug = True
+
+    setup_logging(verbose=args.verbose, debug=args.debug)
+
+    # Validate username
+    username_error = validate_username(args.username)
+    if username_error:
+        logger.error(username_error)
+        print(f"::error::{username_error}", file=sys.stderr)
+        return 1
+
+    # Collect SSH keys
+    ssh_keys = collect_ssh_keys(args.ssh_keys, args.ssh_key_files)
+
+    if args.loop_instances:
+        return _run_multi_instance(args, ssh_keys)
+
+    return _run_single_instance(args, ssh_keys)
 
 
 if __name__ == "__main__":

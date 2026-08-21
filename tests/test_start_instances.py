@@ -44,6 +44,7 @@ sys.path.insert(0, str(LIB_DIR))
 
 from config import ActionConfig, ApiPathStore, InstanceConfig, InstanceStore  # noqa: E402  # isort: skip
 from errors import DockerError, GerritActionError  # noqa: E402  # isort: skip
+from start_model import GerritConfigOptions, InstanceStartOptions, ReplicationOptions  # noqa: E402  # isort: skip
 
 # Import the hyphenated module via importlib
 _spec = importlib.util.spec_from_file_location(
@@ -574,13 +575,15 @@ class TestGenerateReplicationConfig:
 
         start_instances.generate_replication_config(
             config_file,
-            "test",
-            "gerrit.example.org",
-            "",
-            "gerrit",
-            29418,
-            "/r",
-            config,
+            ReplicationOptions(
+                slug="test",
+                gerrit_host="gerrit.example.org",
+                project="",
+                remote_ssh_user="gerrit",
+                remote_ssh_port=29418,
+                api_path="/r",
+                config=config,
+            ),
         )
 
         content = config_file.read_text()
@@ -592,13 +595,15 @@ class TestGenerateReplicationConfig:
 
         start_instances.generate_replication_config(
             config_file,
-            "test",
-            "gerrit.example.org",
-            "",
-            "gerrit",
-            29418,
-            "/r",
-            config,
+            ReplicationOptions(
+                slug="test",
+                gerrit_host="gerrit.example.org",
+                project="",
+                remote_ssh_user="gerrit",
+                remote_ssh_port=29418,
+                api_path="/r",
+                config=config,
+            ),
         )
 
         content = config_file.read_text()
@@ -610,13 +615,15 @@ class TestGenerateReplicationConfig:
 
         start_instances.generate_replication_config(
             config_file,
-            "test",
-            "gerrit.example.org",
-            "",
-            "gerrit",
-            29418,
-            "",
-            config,
+            ReplicationOptions(
+                slug="test",
+                gerrit_host="gerrit.example.org",
+                project="",
+                remote_ssh_user="gerrit",
+                remote_ssh_port=29418,
+                api_path="",
+                config=config,
+            ),
         )
 
         content = config_file.read_text()
@@ -628,13 +635,15 @@ class TestGenerateReplicationConfig:
 
         start_instances.generate_replication_config(
             config_file,
-            "test",
-            "gerrit.example.org",
-            "",
-            "gerrit",
-            29418,
-            "",
-            config,
+            ReplicationOptions(
+                slug="test",
+                gerrit_host="gerrit.example.org",
+                project="",
+                remote_ssh_user="gerrit",
+                remote_ssh_port=29418,
+                api_path="",
+                config=config,
+            ),
         )
 
         content = config_file.read_text()
@@ -646,13 +655,15 @@ class TestGenerateReplicationConfig:
 
         start_instances.generate_replication_config(
             config_file,
-            "test",
-            "gerrit.example.org",
-            "",
-            "gerrit",
-            29418,
-            "",
-            config,
+            ReplicationOptions(
+                slug="test",
+                gerrit_host="gerrit.example.org",
+                project="",
+                remote_ssh_user="gerrit",
+                remote_ssh_port=29418,
+                api_path="",
+                config=config,
+            ),
         )
 
         content = config_file.read_text()
@@ -672,13 +683,15 @@ class TestGenerateReplicationConfig:
 
         start_instances.generate_replication_config(
             config_file,
-            "test",
-            "gerrit.example.org",
-            "",
-            "gerrit",
-            29418,
-            "",
-            config,
+            ReplicationOptions(
+                slug="test",
+                gerrit_host="gerrit.example.org",
+                project="",
+                remote_ssh_user="gerrit",
+                remote_ssh_port=29418,
+                api_path="",
+                config=config,
+            ),
         )
 
         content = config_file.read_text()
@@ -691,13 +704,15 @@ class TestGenerateReplicationConfig:
 
         start_instances.generate_replication_config(
             config_file,
-            "test",
-            "gerrit.example.org",
-            "my-project",
-            "gerrit",
-            29418,
-            "",
-            config,
+            ReplicationOptions(
+                slug="test",
+                gerrit_host="gerrit.example.org",
+                project="my-project",
+                remote_ssh_user="gerrit",
+                remote_ssh_port=29418,
+                api_path="",
+                config=config,
+            ),
         )
 
         content = config_file.read_text()
@@ -709,13 +724,15 @@ class TestGenerateReplicationConfig:
 
         start_instances.generate_replication_config(
             config_file,
-            "my-slug",
-            "gerrit.example.org",
-            "",
-            "gerrit",
-            29418,
-            "",
-            config,
+            ReplicationOptions(
+                slug="my-slug",
+                gerrit_host="gerrit.example.org",
+                project="",
+                remote_ssh_user="gerrit",
+                remote_ssh_port=29418,
+                api_path="",
+                config=config,
+            ),
         )
 
         content = config_file.read_text()
@@ -729,13 +746,15 @@ class TestGenerateReplicationConfig:
 
         start_instances.generate_replication_config(
             config_file,
-            "test",
-            "gerrit.example.org",
-            "",
-            "gerrit",
-            29418,
-            "",
-            config,
+            ReplicationOptions(
+                slug="test",
+                gerrit_host="gerrit.example.org",
+                project="",
+                remote_ssh_user="gerrit",
+                remote_ssh_port=29418,
+                api_path="",
+                config=config,
+            ),
         )
 
         content = config_file.read_text()
@@ -751,13 +770,15 @@ class TestGenerateReplicationConfig:
 
         start_instances.generate_replication_config(
             config_file,
-            "test",
-            "gerrit.example.org",
-            "",
-            "gerrit",
-            29418,
-            "",
-            config,
+            ReplicationOptions(
+                slug="test",
+                gerrit_host="gerrit.example.org",
+                project="",
+                remote_ssh_user="gerrit",
+                remote_ssh_port=29418,
+                api_path="",
+                config=config,
+            ),
         )
 
         content = config_file.read_text()
@@ -773,13 +794,15 @@ class TestGenerateReplicationConfig:
 
         start_instances.generate_replication_config(
             config_file,
-            "onap",
-            "gerrit.example.org",
-            "",
-            "gerrit",
-            29418,
-            "",
-            config,
+            ReplicationOptions(
+                slug="onap",
+                gerrit_host="gerrit.example.org",
+                project="",
+                remote_ssh_user="gerrit",
+                remote_ssh_port=29418,
+                api_path="",
+                config=config,
+            ),
         )
 
         content = config_file.read_text()
@@ -833,13 +856,15 @@ class TestGenerateReplicationConfig:
 
         start_instances.generate_replication_config(
             config_file,
-            "onap",
-            "gerrit.example.org",
-            "",
-            "gerrit",
-            29418,
-            "",
-            config,
+            ReplicationOptions(
+                slug="onap",
+                gerrit_host="gerrit.example.org",
+                project="",
+                remote_ssh_user="gerrit",
+                remote_ssh_port=29418,
+                api_path="",
+                config=config,
+            ),
         )
 
         content = config_file.read_text()
@@ -884,13 +909,15 @@ class TestGenerateReplicationConfig:
 
         start_instances.generate_replication_config(
             config_file,
-            "onap",
-            "gerrit.example.org",
-            "",
-            "gerrit",
-            29418,
-            "",
-            config,
+            ReplicationOptions(
+                slug="onap",
+                gerrit_host="gerrit.example.org",
+                project="",
+                remote_ssh_user="gerrit",
+                remote_ssh_port=29418,
+                api_path="",
+                config=config,
+            ),
         )
 
         content = config_file.read_text()
@@ -915,13 +942,15 @@ class TestGenerateReplicationConfig:
 
         start_instances.generate_replication_config(
             config_file,
-            "onap",
-            "gerrit.example.org",
-            "",
-            "gerrit",
-            29418,
-            "",
-            config,
+            ReplicationOptions(
+                slug="onap",
+                gerrit_host="gerrit.example.org",
+                project="",
+                remote_ssh_user="gerrit",
+                remote_ssh_port=29418,
+                api_path="",
+                config=config,
+            ),
         )
 
         content = config_file.read_text()
@@ -937,13 +966,15 @@ class TestGenerateReplicationConfig:
 
         start_instances.generate_replication_config(
             config_file,
-            "test",
-            "gerrit.example.org",
-            "",
-            "gerrit",
-            29418,
-            "",
-            config,
+            ReplicationOptions(
+                slug="test",
+                gerrit_host="gerrit.example.org",
+                project="",
+                remote_ssh_user="gerrit",
+                remote_ssh_port=29418,
+                api_path="",
+                config=config,
+            ),
         )
 
         content = config_file.read_text()
@@ -969,13 +1000,15 @@ class TestGenerateReplicationConfig:
 
         start_instances.generate_replication_config(
             config_file,
-            "test",
-            "gerrit.example.org",
-            "",
-            "gerrit",
-            29418,
-            "",
-            config,
+            ReplicationOptions(
+                slug="test",
+                gerrit_host="gerrit.example.org",
+                project="",
+                remote_ssh_user="gerrit",
+                remote_ssh_port=29418,
+                api_path="",
+                config=config,
+            ),
         )
 
         content = config_file.read_text()
@@ -989,13 +1022,15 @@ class TestGenerateReplicationConfig:
 
         start_instances.generate_replication_config(
             config_file,
-            "test",
-            "gerrit.example.org",
-            "",
-            "gerrit",
-            29418,
-            "",
-            config,
+            ReplicationOptions(
+                slug="test",
+                gerrit_host="gerrit.example.org",
+                project="",
+                remote_ssh_user="gerrit",
+                remote_ssh_port=29418,
+                api_path="",
+                config=config,
+            ),
         )
 
         content = config_file.read_text()
@@ -1008,13 +1043,15 @@ class TestGenerateReplicationConfig:
 
         start_instances.generate_replication_config(
             config_file,
-            "test",
-            "gerrit.example.org",
-            "",
-            "gerrit",
-            29418,
-            "",
-            config,
+            ReplicationOptions(
+                slug="test",
+                gerrit_host="gerrit.example.org",
+                project="",
+                remote_ssh_user="gerrit",
+                remote_ssh_port=29418,
+                api_path="",
+                config=config,
+            ),
         )
 
         content = config_file.read_text()
@@ -1026,13 +1063,15 @@ class TestGenerateReplicationConfig:
 
         start_instances.generate_replication_config(
             config_file,
-            "test",
-            "gerrit.example.org",
-            "",
-            "gerrit",
-            29418,
-            "",
-            config,
+            ReplicationOptions(
+                slug="test",
+                gerrit_host="gerrit.example.org",
+                project="",
+                remote_ssh_user="gerrit",
+                remote_ssh_port=29418,
+                api_path="",
+                config=config,
+            ),
         )
 
         content = config_file.read_text()
@@ -1044,13 +1083,15 @@ class TestGenerateReplicationConfig:
 
         start_instances.generate_replication_config(
             config_file,
-            "test",
-            "gerrit.example.org",
-            "",
-            "gerrit",
-            29418,
-            "",
-            config,
+            ReplicationOptions(
+                slug="test",
+                gerrit_host="gerrit.example.org",
+                project="",
+                remote_ssh_user="gerrit",
+                remote_ssh_port=29418,
+                api_path="",
+                config=config,
+            ),
         )
 
         content = config_file.read_text()
@@ -1062,13 +1103,15 @@ class TestGenerateReplicationConfig:
 
         start_instances.generate_replication_config(
             config_file,
-            "test",
-            "gerrit.example.org",
-            "",
-            "gerrit",
-            29418,
-            "",
-            config,
+            ReplicationOptions(
+                slug="test",
+                gerrit_host="gerrit.example.org",
+                project="",
+                remote_ssh_user="gerrit",
+                remote_ssh_port=29418,
+                api_path="",
+                config=config,
+            ),
         )
 
         assert config_file.exists()
@@ -1528,12 +1571,14 @@ class TestConfigureGerrit:
             mock_run.return_value = _cp()
             start_instances.configure_gerrit(
                 instance_dir,
-                "test",
-                "http://localhost:18080/",
-                "http://*:8080/",
-                "",
-                "localhost:29418",
-                False,
+                GerritConfigOptions(
+                    slug="test",
+                    canonical_url="http://localhost:18080/",
+                    listen_url="http://*:8080/",
+                    api_path="",
+                    advertised_ssh_addr="localhost:29418",
+                    use_tunnel=False,
+                ),
             )
 
         # Should have been called many times for git config
@@ -1553,12 +1598,14 @@ class TestConfigureGerrit:
         with patch("start_instances.subprocess.run", side_effect=record_call):
             start_instances.configure_gerrit(
                 instance_dir,
-                "test",
-                "http://localhost:18080/",
-                "http://*:8080/",
-                "",
-                "localhost:29418",
-                False,
+                GerritConfigOptions(
+                    slug="test",
+                    canonical_url="http://localhost:18080/",
+                    listen_url="http://*:8080/",
+                    api_path="",
+                    advertised_ssh_addr="localhost:29418",
+                    use_tunnel=False,
+                ),
             )
 
         # Find the auth.type call
@@ -1584,13 +1631,15 @@ class TestConfigureGerrit:
         with patch("start_instances.subprocess.run", side_effect=record_call):
             start_instances.configure_gerrit(
                 instance_dir,
-                "test",
-                "http://tunnel.example.com:8080/",
-                "http://*:8080/",
-                "",
-                "tunnel.example.com:12345",
-                True,
-                tunnel_host="bore.pub",
+                GerritConfigOptions(
+                    slug="test",
+                    canonical_url="http://tunnel.example.com:8080/",
+                    listen_url="http://*:8080/",
+                    api_path="",
+                    advertised_ssh_addr="tunnel.example.com:12345",
+                    use_tunnel=True,
+                    tunnel_host="bore.pub",
+                ),
             )
 
         admin_calls = [c for c in calls_made if "plugins.allowRemoteAdmin" in c]
@@ -1612,18 +1661,20 @@ class TestConfigureGerrit:
             return _cp()
 
         with (
-            caplog.at_level(logging.DEBUG, logger="start_instances"),
+            caplog.at_level(logging.DEBUG, logger="start_gerrit_config"),
             patch("start_instances.subprocess.run", side_effect=record_call),
         ):
             start_instances.configure_gerrit(
                 instance_dir,
-                "test",
-                "http://100.100.50.1:8080/",
-                "http://*:8080/",
-                "",
-                "100.100.50.1:29418",
-                True,
-                tunnel_host="100.100.50.1",
+                GerritConfigOptions(
+                    slug="test",
+                    canonical_url="http://100.100.50.1:8080/",
+                    listen_url="http://*:8080/",
+                    api_path="",
+                    advertised_ssh_addr="100.100.50.1:29418",
+                    use_tunnel=True,
+                    tunnel_host="100.100.50.1",
+                ),
             )
 
         admin_calls = [c for c in calls_made if "plugins.allowRemoteAdmin" in c]
@@ -1655,18 +1706,20 @@ class TestConfigureGerrit:
             return _cp()
 
         with (
-            caplog.at_level(logging.DEBUG, logger="start_instances"),
+            caplog.at_level(logging.DEBUG, logger="start_gerrit_config"),
             patch("start_instances.subprocess.run", side_effect=record_call),
         ):
             start_instances.configure_gerrit(
                 instance_dir,
-                "test",
-                "http://bore.pub:8080/",
-                "http://*:8080/",
-                "",
-                "bore.pub:12345",
-                True,
-                tunnel_host="bore.pub",
+                GerritConfigOptions(
+                    slug="test",
+                    canonical_url="http://bore.pub:8080/",
+                    listen_url="http://*:8080/",
+                    api_path="",
+                    advertised_ssh_addr="bore.pub:12345",
+                    use_tunnel=True,
+                    tunnel_host="bore.pub",
+                ),
             )
 
         admin_calls = [c for c in calls_made if "plugins.allowRemoteAdmin" in c]
@@ -1696,12 +1749,14 @@ class TestConfigureGerrit:
         with patch("start_instances.subprocess.run", side_effect=record_call):
             start_instances.configure_gerrit(
                 instance_dir,
-                "test",
-                "http://localhost:18080/",
-                "http://*:8080/",
-                "",
-                "localhost:29418",
-                False,
+                GerritConfigOptions(
+                    slug="test",
+                    canonical_url="http://localhost:18080/",
+                    listen_url="http://*:8080/",
+                    api_path="",
+                    advertised_ssh_addr="localhost:29418",
+                    use_tunnel=False,
+                ),
             )
 
         admin_calls = [c for c in calls_made if "plugins.allowRemoteAdmin" in c]
@@ -1721,12 +1776,14 @@ class TestConfigureGerrit:
         with patch("start_instances.subprocess.run", side_effect=record_call):
             start_instances.configure_gerrit(
                 instance_dir,
-                "test",
-                "http://localhost:18080/r/",
-                "http://*:8080/r/",
-                "/r",
-                "localhost:29418",
-                False,
+                GerritConfigOptions(
+                    slug="test",
+                    canonical_url="http://localhost:18080/r/",
+                    listen_url="http://*:8080/r/",
+                    api_path="/r",
+                    advertised_ssh_addr="localhost:29418",
+                    use_tunnel=False,
+                ),
             )
 
         # Each call is a list like ['git', 'config', '-f', '...', 'httpd.firstTimeRedirectUrl', '/r/login/...']
@@ -2195,11 +2252,13 @@ class TestStartInstance:
             ok = start_instances.start_instance(
                 docker,
                 instance,
-                0,
-                config,
-                api_store,
-                inst_store,
-                "test-image:latest",
+                InstanceStartOptions(
+                    index=0,
+                    config=config,
+                    api_path_store=api_store,
+                    instance_store=inst_store,
+                    image="test-image:latest",
+                ),
             )
 
         assert ok is True
@@ -2220,11 +2279,13 @@ class TestStartInstance:
             ok = start_instances.start_instance(
                 docker,
                 instance,
-                0,
-                config,
-                api_store,
-                inst_store,
-                "test-image:latest",
+                InstanceStartOptions(
+                    index=0,
+                    config=config,
+                    api_path_store=api_store,
+                    instance_store=inst_store,
+                    image="test-image:latest",
+                ),
             )
 
         assert ok is False
@@ -2249,11 +2310,13 @@ class TestStartInstance:
             ok = start_instances.start_instance(
                 docker,
                 instance,
-                0,
-                config,
-                api_store,
-                inst_store,
-                "test-image:latest",
+                InstanceStartOptions(
+                    index=0,
+                    config=config,
+                    api_path_store=api_store,
+                    instance_store=inst_store,
+                    image="test-image:latest",
+                ),
             )
 
         assert ok is False
@@ -2279,11 +2342,13 @@ class TestStartInstance:
             start_instances.start_instance(
                 docker,
                 instance,
-                2,
-                config,
-                api_store,
-                inst_store,
-                "test-image:latest",
+                InstanceStartOptions(
+                    index=2,
+                    config=config,
+                    api_path_store=api_store,
+                    instance_store=inst_store,
+                    image="test-image:latest",
+                ),
             )
 
         ports = docker.run_container.call_args[1]["ports"]
@@ -2316,11 +2381,13 @@ class TestStartInstance:
             start_instances.start_instance(
                 docker,
                 instance,
-                0,
-                config,
-                api_store,
-                inst_store,
-                "test-image:latest",
+                InstanceStartOptions(
+                    index=0,
+                    config=config,
+                    api_path_store=api_store,
+                    instance_store=inst_store,
+                    image="test-image:latest",
+                ),
             )
 
         mock_ssh.assert_not_called()
@@ -2351,11 +2418,13 @@ class TestStartInstance:
             start_instances.start_instance(
                 docker,
                 instance,
-                0,
-                config,
-                api_store,
-                inst_store,
-                "test-image:latest",
+                InstanceStartOptions(
+                    index=0,
+                    config=config,
+                    api_path_store=api_store,
+                    instance_store=inst_store,
+                    image="test-image:latest",
+                ),
             )
 
         assert not bundled.exists()
@@ -2391,18 +2460,20 @@ class TestStartInstance:
             start_instances.start_instance(
                 docker,
                 instance,
-                0,
-                config,
-                api_store,
-                inst_store,
-                "test-image:latest",
+                InstanceStartOptions(
+                    index=0,
+                    config=config,
+                    api_path_store=api_store,
+                    instance_store=inst_store,
+                    image="test-image:latest",
+                ),
             )
 
         # Check canonical_url includes tunnel host and port. Parse the URL
         # and compare the host/port components exactly rather than matching
         # substrings, which would also accept lookalike hosts.
         cfg_args = mock_cfg.call_args
-        canonical_url = cfg_args[0][2]  # 3rd positional arg
+        canonical_url = cfg_args[0][1].canonical_url
         parsed = urlparse(canonical_url)
         assert parsed.hostname == "tunnel.example.com"
         assert parsed.port == 9080
@@ -2428,11 +2499,13 @@ class TestStartInstance:
             ok = start_instances.start_instance(
                 docker,
                 instance,
-                0,
-                config,
-                api_store,
-                inst_store,
-                "test-image:latest",
+                InstanceStartOptions(
+                    index=0,
+                    config=config,
+                    api_path_store=api_store,
+                    instance_store=inst_store,
+                    image="test-image:latest",
+                ),
             )
 
         assert ok is True
@@ -2636,16 +2709,18 @@ class TestEdgeCases:
             start_instances.start_instance(
                 docker,
                 instance,
-                0,
-                config,
-                api_store,
-                inst_store,
-                "img:latest",
+                InstanceStartOptions(
+                    index=0,
+                    config=config,
+                    api_path_store=api_store,
+                    instance_store=inst_store,
+                    image="img:latest",
+                ),
             )
 
         # configure_gerrit is called with the canonical_url
-        canonical_url = mock_cfg.call_args[0][2]
-        listen_url = mock_cfg.call_args[0][3]
+        canonical_url = mock_cfg.call_args[0][1].canonical_url
+        listen_url = mock_cfg.call_args[0][1].listen_url
         assert "/r/" in canonical_url
         assert "/r/" in listen_url
 
@@ -2693,11 +2768,13 @@ class TestEdgeCases:
                 start_instances.start_instance(
                     docker,
                     inst,
-                    idx,
-                    config,
-                    api_store,
-                    inst_store,
-                    "img:latest",
+                    InstanceStartOptions(
+                        index=idx,
+                        config=config,
+                        api_path_store=api_store,
+                        instance_store=inst_store,
+                        image="img:latest",
+                    ),
                 )
             port_maps.append(docker.run_container.call_args[1]["ports"])
 
@@ -2730,11 +2807,13 @@ class TestEdgeCases:
             start_instances.start_instance(
                 docker,
                 instance,
-                0,
-                config,
-                api_store,
-                inst_store,
-                "img:latest",
+                InstanceStartOptions(
+                    index=0,
+                    config=config,
+                    api_path_store=api_store,
+                    instance_store=inst_store,
+                    image="img:latest",
+                ),
             )
 
         env = docker.run_container.call_args[1]["env"]
@@ -2762,11 +2841,13 @@ class TestEdgeCases:
             start_instances.start_instance(
                 docker,
                 instance,
-                0,
-                config,
-                api_store,
-                inst_store,
-                "img:latest",
+                InstanceStartOptions(
+                    index=0,
+                    config=config,
+                    api_path_store=api_store,
+                    instance_store=inst_store,
+                    image="img:latest",
+                ),
             )
 
         volumes = docker.run_container.call_args[1]["volumes"]
@@ -2802,11 +2883,13 @@ class TestEdgeCases:
             start_instances.start_instance(
                 docker,
                 instance,
-                0,
-                config,
-                api_store,
-                inst_store,
-                "img:latest",
+                InstanceStartOptions(
+                    index=0,
+                    config=config,
+                    api_path_store=api_store,
+                    instance_store=inst_store,
+                    image="img:latest",
+                ),
             )
 
         meta = inst_store.data["test"]

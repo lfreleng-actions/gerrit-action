@@ -26,12 +26,13 @@ from tunnel_model import TunnelCheckResult
 def parse_gerrit_version(body: str) -> str:
     """Extract the Gerrit version from a version endpoint response body.
 
-    Gerrit wraps JSON responses in a ``)]}'`` prefix.
+    Gerrit may wrap JSON responses in its ``)]}'`` XSSI prefix.  The
+    prefix is removed exactly rather than with :meth:`str.lstrip`,
+    which takes a *character set* and would eat any leading run of
+    ``)``, ``]``, ``}`` or ``'`` from the version string itself.
     """
-    version = body
-    for prefix in (")]}'", ")]}'\n", '"'):
-        version = version.lstrip(prefix)
-    return version.strip().strip('"')
+    version = body.strip().removeprefix(")]}'").strip()
+    return version.strip('"')
 
 
 def format_attempt_detail(result: TunnelCheckResult) -> str:

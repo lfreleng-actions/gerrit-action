@@ -25,6 +25,8 @@ import sys
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 SCRIPTS_DIR = Path(__file__).resolve().parent.parent / "scripts"
 _spec = importlib.util.spec_from_file_location(
     "verify_tunnel", SCRIPTS_DIR / "verify-tunnel.py"
@@ -453,6 +455,31 @@ class TestRun:
 
 class TestVersionParsing:
     """Verify the Gerrit version is extracted correctly from common formats."""
+
+    @pytest.mark.parametrize(
+        ("body", "expected"),
+        [
+            # The XSSI prefix Gerrit actually emits.
+            (')]}\'\n"3.9.1"', "3.9.1"),
+            # Quoted and bare bodies, with and without surrounding space.
+            ('"3.9.1"', "3.9.1"),
+            ("3.9.1", "3.9.1"),
+            ("  3.9.1  ", "3.9.1"),
+            # A version string whose first character belongs to the
+            # XSSI prefix's character set must survive intact: the old
+            # ``lstrip`` implementation took a character set rather
+            # than a prefix and would have eaten these.
+            (")preview", ")preview"),
+            ("]preview", "]preview"),
+            ("}preview", "}preview"),
+            ("'preview", "'preview"),
+        ],
+    )
+    def test_parse_gerrit_version(self, body: str, expected: str) -> None:
+        """The XSSI prefix is removed exactly, leaving the version alone."""
+        from tunnel_report import parse_gerrit_version
+
+        assert parse_gerrit_version(body) == expected
 
     @patch("verify_tunnel.probe_url")
     def test_gerrit_json_prefix_stripped(self, mock_probe, monkeypatch):

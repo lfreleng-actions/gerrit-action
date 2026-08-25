@@ -1319,6 +1319,74 @@ class TestCheckPullReplicationLog:
 
         assert check_pull_replication_log(docker, "abc123") is False
 
+    def test_magic_repo_errors_do_not_block_completion(self, mock_docker):
+        """Expected magic-repository failures must not stall the wait.
+
+        ``fetchEvery`` retries a missing ``All-Users.git`` ref on every
+        cycle.  Treating those as fatal here kept this check returning
+        False while the repeated log writes also denied the steady-
+        state tracker its own completion signal, so a healthy run only
+        ended at the timeout.
+        """
+        from replication import check_pull_replication_log
+
+        docker, mock_run = mock_docker
+        mock_run.side_effect = [
+            # exec_test: file exists
+            make_completed_process(returncode=0),
+            # grep for errors: magic-repo headline plus its frames
+            make_completed_process(
+                stdout=(
+                    "[2026-05-22 18:00:00,000] [aaa] Cannot replicate from "
+                    "https://gerrit.onap.org/r/a/All-Users.git\n"
+                    "\tat org.eclipse.jgit.transport.TransportHttp.connect("
+                    "TransportHttp.java:696)\n"
+                )
+            ),
+            # get_completed_repo_count: 10 unique repos
+            make_completed_process(stdout="10\n"),
+        ]
+
+        assert check_pull_replication_log(docker, "abc123", expected_count=10) is True
+
+    def test_soft_failure_does_not_block_completion(self, mock_docker):
+        """Known-benign soft failures must not stall the wait either."""
+        from replication import check_pull_replication_log
+
+        docker, mock_run = mock_docker
+        mock_run.side_effect = [
+            make_completed_process(returncode=0),
+            make_completed_process(
+                stdout=(
+                    "com.gerritforge.gerrit.plugins.replication.pull.fetch."
+                    "InexistentRefTransportException: Ref "
+                    "refs/meta/external-ids does not exist on remote\n"
+                )
+            ),
+            make_completed_process(stdout="10\n"),
+        ]
+
+        assert check_pull_replication_log(docker, "abc123", expected_count=10) is True
+
+    def test_user_project_error_still_blocks_completion(self, mock_docker):
+        """A genuine user-project failure keeps blocking completion."""
+        from replication import check_pull_replication_log
+
+        docker, mock_run = mock_docker
+        mock_run.side_effect = [
+            make_completed_process(returncode=0),
+            make_completed_process(
+                stdout=(
+                    "[2026-05-22 18:00:00,000] [aaa] Cannot replicate from "
+                    "https://gerrit.onap.org/r/a/All-Users.git\n"
+                    "[2026-05-22 18:00:01,000] [bbb] Cannot replicate from "
+                    "https://gerrit.onap.org/r/a/aai/resources.git\n"
+                )
+            ),
+        ]
+
+        assert check_pull_replication_log(docker, "abc123", expected_count=10) is False
+
     def test_expected_count_met(self, mock_docker):
         from replication import check_pull_replication_log
 

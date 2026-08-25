@@ -88,12 +88,18 @@ class ReplicationOptions:
 
 @dataclass(frozen=True)
 class GerritConfigOptions:
-    """Per-instance inputs for ``gerrit.config`` generation."""
+    """Per-instance inputs for ``gerrit.config`` generation.
+
+    Deliberately carries no API path of its own.  The path prefix the
+    instance serves at is a property of *canonical_url*, which
+    ``_build_urls`` has already resolved against ``USE_API_PATH``;
+    ``configure_gerrit`` derives it from there so the two cannot
+    disagree.
+    """
 
     slug: str
     canonical_url: str
     listen_url: str
-    api_path: str
     advertised_ssh_addr: str
     use_tunnel: bool
     tunnel_host: str = ""
@@ -105,7 +111,6 @@ class GerritConfigOptions:
             slug=plan.slug,
             canonical_url=plan.canonical_url,
             listen_url=plan.listen_url,
-            api_path=plan.api_path,
             advertised_ssh_addr=plan.advertised_ssh_addr,
             use_tunnel=plan.use_tunnel,
             tunnel_host=config.tunnel_host,

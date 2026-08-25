@@ -16,6 +16,7 @@ import logging
 import subprocess
 from collections.abc import Callable
 from pathlib import Path
+from urllib.parse import urlsplit
 
 from config import ActionConfig
 from start_model import GerritConfigOptions
@@ -24,6 +25,18 @@ logger = logging.getLogger(__name__)
 
 # A single ``git config -f <gerrit.config> <args…>`` invocation.
 GitConfig = Callable[..., None]
+
+
+def _served_path_prefix(canonical_url: str) -> str:
+    """Return the path prefix *canonical_url* serves the instance at.
+
+    ``"http://host:8080/r/"`` yields ``"/r"`` and ``"http://host:8080/"``
+    yields ``""``.  Deriving the prefix from the URL the instance is
+    actually configured with is what keeps it from drifting: an API path
+    is only served when ``USE_API_PATH`` is true, and ``_build_urls``
+    has already applied that decision here.
+    """
+    return urlsplit(canonical_url).path.rstrip("/")
 
 
 def configure_gerrit(instance_dir: Path, options: GerritConfigOptions) -> None:
@@ -47,8 +60,9 @@ def configure_gerrit(instance_dir: Path, options: GerritConfigOptions) -> None:
             timeout=10,
         )
 
-    if options.api_path:
-        logger.info("  URL prefix: %s (mirroring production server)", options.api_path)
+    served_prefix = _served_path_prefix(options.canonical_url)
+    if served_prefix:
+        logger.info("  URL prefix: %s (mirroring production server)", served_prefix)
     else:
         logger.info("  URL prefix: (none)")
 
@@ -74,7 +88,11 @@ def configure_gerrit(instance_dir: Path, options: GerritConfigOptions) -> None:
         "httpd.filterClass",
         "com.googlesource.gerrit.plugins.ootb.FirstTimeRedirect",
     )
-    ootb_redirect_url = f"{options.api_path}/login/%23%2F?account_id=1000000"
+    # The redirect must point at a path this instance actually serves.
+    # Deriving it from the canonical URL rather than the detected API
+    # path keeps the two in step when a path was detected but
+    # USE_API_PATH is false, in which case the instance serves at root.
+    ootb_redirect_url = f"{served_prefix}/login/%23%2F?account_id=1000000"
     _gc("httpd.firstTimeRedirectUrl", ootb_redirect_url)
 
     _configure_remote_admin(_gc, options)

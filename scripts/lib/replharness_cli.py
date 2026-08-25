@@ -169,8 +169,14 @@ def install_cleanup_handler(docker: DockerManager) -> list[_ContainerContext]:
                 "\nInterrupted — removing %d container(s)…",
                 len(shutdown_contexts),
             )
-            for ctx in shutdown_contexts:
-                _cleanup_container(docker, ctx)
+            # Drain as we go.  The interrupt unwinds the scenario loop
+            # through ``run_scenario``'s finally block, which consults
+            # this registry before releasing anything; popping each
+            # context as it is cleaned stops that path removing the
+            # same container twice, or reporting a container as kept
+            # by --keep after this handler has already removed it.
+            while shutdown_contexts:
+                _cleanup_container(docker, shutdown_contexts.pop())
         else:
             logger.info("\nInterrupted — no containers to clean up")
         sys.exit(130)

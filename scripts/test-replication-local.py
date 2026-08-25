@@ -191,18 +191,22 @@ def run_scenario(
 ) -> ScenarioResult:
     """Execute all tests for a single scenario.
 
-    *tracked* is the registry the interrupt handler drains.  The
-    container is registered as soon as it starts and deregistered once
-    the normal path has released it, so Ctrl-C part-way through a
-    scenario removes the container that is actually running and never
-    tries to remove one that has already gone.
+    *tracked* is the registry the interrupt handler drains.  It is
+    passed down into :func:`_start_container`, which registers the
+    container from before ``docker run`` so an interrupt during
+    start-up cannot leak one, and the entry is removed once the normal
+    path has released it — so Ctrl-C part-way through a scenario
+    removes the container that is actually running and never tries to
+    remove one that has already gone.
     """
     result = ScenarioResult(scenario=scenario)
     log_scenario_banner(scenario, options)
 
     ctx: _ContainerContext | None = None
     try:
-        # Start container
+        # Start container.  The registry is handed down so the
+        # container is covered from before ``docker run`` rather than
+        # only once its ID comes back.
         ctx = _start_container(
             docker,
             scenario,
@@ -210,10 +214,9 @@ def run_scenario(
             index,
             options.creds,
             fetch_every=options.fetch_every,
+            tracked=tracked,
         )
         result.container_started = True
-        if tracked is not None:
-            tracked.append(ctx)
 
         # Wait for Gerrit to be ready
         result.error = await_gerrit_ready(docker, ctx.cid)
@@ -231,7 +234,15 @@ def run_scenario(
         logger.exception("  %s", result.error)
 
     finally:
-        release_container(docker, ctx, keep=options.keep)
+        # An interrupt handler may already have removed this container
+        # and dropped it from the registry while unwinding through
+        # here.  Releasing it again would either repeat the teardown
+        # or, under --keep, announce that a container it just removed
+        # is still running.  Ownership follows the registry: release
+        # only what is still registered.
+        owned = tracked is None or ctx is None or ctx in tracked
+        if owned:
+            release_container(docker, ctx, keep=options.keep)
         # Deregister whichever way release_container went: the
         # container has either been removed, or deliberately kept by
         # --keep, and in both cases a later interrupt must leave it

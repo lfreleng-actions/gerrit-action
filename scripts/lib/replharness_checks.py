@@ -133,7 +133,19 @@ def _test_steady_state_detection(
     start = time.time()
     tracker = _StabilityTracker(window=stability_window)
 
-    interval = max(stability_window // 3, 5)
+    # Sample roughly three times per window, but no more often than
+    # every five seconds for windows that can afford it.  The floor
+    # scales down for very short windows: a flat five-second interval
+    # made ``STABILITY_WINDOW=1`` unsatisfiable, because one interval
+    # already exceeded the whole three-second budget and the
+    # within-budget gate then rejected the first repeated observation.
+    #
+    # The trailing ``1`` keeps the interval positive.  The environment
+    # value is parsed as an unrestricted integer, so a window of ``0``
+    # (or a negative one) reaches here and would otherwise divide by
+    # zero below, crashing the harness before it could print its
+    # summary.  Such a window simply fails the check instead.
+    interval = max(min(5, stability_window), stability_window // 3, 1)
     budget = stability_window * _STEADY_STATE_BUDGET_FACTOR
     # Bound the loop by sample count as well as wall clock so it
     # always terminates, even if the clock misbehaves.
@@ -142,10 +154,39 @@ def _test_steady_state_detection(
     previous = take_snapshot(docker, cid)
     tracker.update(previous)
     latest = previous
+    # Observation times are recorded *after* each snapshot returns.
+    # ``ReplicationSnapshot.timestamp`` is set before its four Docker
+    # queries run, so it says when collection started rather than when
+    # the state was actually seen; crediting a stability window from it
+    # can report far more quiet time than was observed.
+    previous_observed_at = time.time()
+    unchanged_since: float | None = None
 
     for sample in range(max_samples + 1):
-        elapsed = time.time() - start
-        if tracker.is_stable(time.time()):
+        now = time.time()
+        elapsed = now - start
+        # Three conditions must hold before stability is credited.
+        #
+        # ``unchanged_since`` — the state has repeated, and this is the
+        # post-collection moment it was first observed in its current
+        # form.  Requiring a full window to have passed since then
+        # means the quiet period was genuinely watched, rather than
+        # inferred from a snapshot that was already stale on arrival.
+        #
+        # ``elapsed < budget`` — a pass reported after the advertised
+        # budget has run out would contradict the budget the failure
+        # message quotes.
+        #
+        # ``tracker.is_stable`` — the verdict actually under test.  The
+        # observation bookkeeping above is deliberately independent of
+        # it, so a regression in the tracker cannot be masked by this
+        # check agreeing with it.
+        if (
+            unchanged_since is not None
+            and now - unchanged_since >= stability_window
+            and elapsed < budget
+            and tracker.is_stable(now)
+        ):
             return TestResult(
                 name="steady_state_detection",
                 passed=True,
@@ -155,12 +196,26 @@ def _test_steady_state_detection(
                 ),
                 elapsed_s=elapsed,
             )
-        if sample == max_samples:
+        if sample == max_samples or elapsed >= budget:
+            # Stop scheduling further intervals once the advertised
+            # wall-clock budget is spent.  ``max_samples`` remains as
+            # the guard against a misbehaving clock, but on its own it
+            # would let a slow ``take_snapshot`` — four Docker calls
+            # per sample — overrun the budget several times over.
             break
         time.sleep(interval)
         previous = latest
         latest = take_snapshot(docker, cid)
+        observed_at = time.time()
         tracker.update(latest)
+        if latest.is_same_as(previous):
+            # Date the quiet period from when this state was *first*
+            # observed, not from now.
+            if unchanged_since is None:
+                unchanged_since = previous_observed_at
+        else:
+            unchanged_since = None
+        previous_observed_at = observed_at
 
     elapsed = time.time() - start
     return TestResult(

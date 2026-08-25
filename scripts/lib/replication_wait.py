@@ -247,17 +247,27 @@ def wait_for_replication(
         snap = replication.take_snapshot(docker, cid)
         tracker.update(snap)
 
-        if _completion_reached(docker, cid, settings, snap):
-            return True
+        # Never declare success in a poll whose authoritative scan
+        # found user-project errors.  Those need two consecutive polls
+        # to fail the wait, and without this gate the very same poll
+        # could complete on the other signals and return success with
+        # the error unresolved — the streak never getting its second
+        # observation.  A transient error costs one extra interval; a
+        # persistent one aborts on the next poll as before.  Magic-repo
+        # and soft failures do not set the streak, so they still do not
+        # hold completion up.
+        if consecutive_errors == 0:
+            if _completion_reached(docker, cid, settings, snap):
+                return True
 
-        now = time.time()
-        if _steady_state_reached(settings, snap, tracker, now):
-            return True
+            now = time.time()
+            if _steady_state_reached(settings, snap, tracker, now):
+                return True
 
         if elapsed % 15 == 0:
             _log_progress(docker, cid, settings, snap, tracker, elapsed)
             # Log the reason we're still waiting (helps debugging)
             if debug and expected_count > 0:
-                _log_pending_reasons(docker, cid, settings, snap, tracker, now)
+                _log_pending_reasons(docker, cid, settings, snap, tracker, time.time())
 
     _raise_timeout(docker, cid, settings, tracker)

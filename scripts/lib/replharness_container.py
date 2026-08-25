@@ -18,9 +18,12 @@ import logging
 import netrc
 import os
 import shutil
+import signal
 import sys
 import textwrap
 import time
+import uuid
+from collections.abc import Iterator
 from pathlib import Path
 
 from config import parse_interval_to_seconds
@@ -35,6 +38,34 @@ from replharness_model import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+@contextlib.contextmanager
+def _deferred_interrupts() -> Iterator[None]:
+    """Hold SIGINT/SIGTERM until the block finishes.
+
+    Used around ``docker run`` so the interrupt handler cannot observe
+    the registry mid-update: the signal is delivered once the real
+    container context has replaced its placeholder, at which point the
+    handler has something it can actually remove.  The delay is bounded
+    by ``docker run -d``, which returns as soon as the container is
+    created rather than waiting for Gerrit to start.
+
+    Falls back to doing nothing where ``pthread_sigmask`` is
+    unavailable, since this harness only ever runs on developer
+    machines.
+    """
+    mask = getattr(signal, "pthread_sigmask", None)
+    if mask is None:
+        yield
+        return
+
+    blocked = {signal.SIGINT, signal.SIGTERM}
+    mask(signal.SIG_BLOCK, blocked)
+    try:
+        yield
+    finally:
+        mask(signal.SIG_UNBLOCK, blocked)
 
 
 # ---------------------------------------------------------------------------
@@ -117,31 +148,13 @@ def _build_image(docker: DockerManager, gerrit_version: str) -> str:
     return tag
 
 
-def _start_container(
-    docker: DockerManager,
+def _write_instance_config(
+    etc_dir: Path,
     scenario: Scenario,
-    image: str,
-    index: int,
     creds: tuple[str, str],
-    *,
-    fetch_every: str = "15s",
-) -> _ContainerContext:
-    """Start a Gerrit container configured for *scenario*.
-
-    Creates the work directory, writes ``replication.config`` and
-    ``secure.config``, and starts the container with proper port
-    mappings and volume mounts.
-    """
-    http_port = _BASE_HTTP_PORT + index
-    ssh_port = _BASE_SSH_PORT + index
-    container_name = f"gerrit-test-{scenario.slug}-{int(time.time()) % 100000}"
-
-    work_dir = Path(f"/tmp/gerrit-test-{scenario.slug}")
-    work_dir.mkdir(parents=True, exist_ok=True)
-
-    etc_dir = work_dir / "etc"
-    etc_dir.mkdir(exist_ok=True)
-
+    fetch_every: str,
+) -> None:
+    """Write ``replication.config`` and ``secure.config`` for a scenario."""
     # --- replication.config ---
     url_template = f"https://{scenario.gerrit_host}{scenario.api_path}/a/${{name}}.git"
     repl_config = textwrap.dedent(f"""\
@@ -184,48 +197,145 @@ def _start_container(
     secure_path.chmod(0o600)
     secure_path.write_text(secure_config)
 
-    # Ensure the git directory exists
-    git_dir = work_dir / "git"
-    git_dir.mkdir(exist_ok=True)
 
-    # --- Start container ---
-    logger.info(
-        "Starting container %s  http=%d ssh=%d …",
-        container_name,
-        http_port,
-        ssh_port,
-    )
+def _start_container(
+    docker: DockerManager,
+    scenario: Scenario,
+    image: str,
+    index: int,
+    creds: tuple[str, str],
+    *,
+    fetch_every: str = "15s",
+    tracked: list[_ContainerContext] | None = None,
+) -> _ContainerContext:
+    """Start a Gerrit container configured for *scenario*.
 
-    cid_raw = docker.run_cmd(
-        [
-            "run",
-            "-d",
-            "--name",
-            container_name,
-            "-p",
-            f"{http_port}:8080",
-            "-p",
-            f"{ssh_port}:29418",
-            "-v",
-            f"{etc_dir}:/var/gerrit/etc",
-            "-v",
-            f"{git_dir}:/var/gerrit/git",
-            "-e",
-            "CANONICAL_WEB_URL=http://localhost:8080/",
-            image,
-        ],
-        timeout=30,
-    )
-    cid = cid_raw.stdout.strip()
-    logger.info("  Container ID: %s", cid[:12])
+    Creates the work directory, writes ``replication.config`` and
+    ``secure.config``, and starts the container with proper port
+    mappings and volume mounts.
 
-    return _ContainerContext(
-        cid=cid,
+    *tracked* is the interrupt handler's registry.  A provisional entry
+    keyed by container **name** is registered before ``docker run``,
+    because that is the window in which an interrupt is most likely to
+    leak a container: Docker may have created it while the command has
+    not yet returned its ID.  ``docker rm -f`` accepts a name just as
+    well as an ID, so the provisional entry is actionable.  Interrupts
+    are held for the duration of the run so the handler never sees the
+    registry mid-update, and a run that fails or is interrupted is
+    cleaned up by name before the placeholder is dropped.
+    """
+    http_port = _BASE_HTTP_PORT + index
+    ssh_port = _BASE_SSH_PORT + index
+    # One token identifies this run, and both the container and its
+    # work directory carry it.  The previous scheme gave the container
+    # a one-second-resolution suffix (wrapping modulo 100000) and gave
+    # every run of a scenario the *same* work directory, so two
+    # concurrent runs of one scenario shared their generated configs
+    # and could collide on the container name.  That matters now the
+    # start-up failure path cleans up by name: without a unique token
+    # it could tear down a container, and delete the configs, of a run
+    # it does not own.  The pid keeps the name legible to a human
+    # inspecting ``docker ps``; the random suffix makes collisions
+    # improbable even within one process.
+    run_token = f"{os.getpid()}-{uuid.uuid4().hex[:8]}"
+    container_name = f"gerrit-test-{scenario.slug}-{run_token}"
+
+    work_dir = Path(f"/tmp/gerrit-test-{scenario.slug}-{run_token}")
+
+    # Register before touching the filesystem, not merely before
+    # ``docker run``.  The preparation below writes credentials into
+    # ``secure.config``, and an interrupt part-way through would
+    # otherwise leave that password in ``/tmp`` with nothing tracking
+    # it — and, because the run token makes the path unique, no later
+    # run would ever reuse or clean it.  The context is actionable
+    # from this point: ``_cleanup_container`` removes the directory,
+    # and ``docker rm -f`` on a container that does not exist yet is a
+    # harmless no-op.
+    provisional = _ContainerContext(
+        cid=container_name,
         name=container_name,
         http_port=http_port,
         ssh_port=ssh_port,
         work_dir=work_dir,
     )
+    if tracked is not None:
+        tracked.append(provisional)
+
+    try:
+        work_dir.mkdir(parents=True, exist_ok=True)
+        etc_dir = work_dir / "etc"
+        etc_dir.mkdir(exist_ok=True)
+        _write_instance_config(etc_dir, scenario, creds, fetch_every)
+
+        # Ensure the git directory exists
+        git_dir = work_dir / "git"
+        git_dir.mkdir(exist_ok=True)
+
+        # --- Start container ---
+        logger.info(
+            "Starting container %s  http=%d ssh=%d …",
+            container_name,
+            http_port,
+            ssh_port,
+        )
+
+        with _deferred_interrupts():
+            cid_raw = docker.run_cmd(
+                [
+                    "run",
+                    "-d",
+                    "--name",
+                    container_name,
+                    "-p",
+                    f"{http_port}:8080",
+                    "-p",
+                    f"{ssh_port}:29418",
+                    "-v",
+                    f"{etc_dir}:/var/gerrit/etc",
+                    "-v",
+                    f"{git_dir}:/var/gerrit/git",
+                    "-e",
+                    "CANONICAL_WEB_URL=http://localhost:8080/",
+                    image,
+                ],
+                timeout=30,
+            )
+            cid = cid_raw.stdout.strip()
+            ctx = _ContainerContext(
+                cid=cid,
+                name=container_name,
+                http_port=http_port,
+                ssh_port=ssh_port,
+                work_dir=work_dir,
+            )
+            if tracked is not None:
+                # Register the real entry *before* dropping the
+                # placeholder, so the container is covered at every
+                # instant.
+                tracked.append(ctx)
+                tracked.remove(provisional)
+    except BaseException:
+        # The preparation or the run failed, or either was interrupted.
+        # A terminal Ctrl-C reaches the docker CLI child directly, so
+        # the client can die while the daemon still goes on to create
+        # the container.  Clean up by name — which also removes the
+        # work directory and the credentials written into it — rather
+        # than leaving the registry with nothing to act on.
+        #
+        # The removal happens *before* deregistering, and not after:
+        # signals are unblocked again by this point, and an interrupt
+        # arriving in the gap would otherwise find an empty registry,
+        # exit, and skip the removal below — losing the only
+        # actionable handle on the container.  Leaving the entry in
+        # place until the removal completes risks nothing worse than a
+        # concurrent handler repeating an idempotent ``docker rm -f``.
+        _cleanup_container(docker, provisional)
+        if tracked is not None and provisional in tracked:
+            tracked.remove(provisional)
+        raise
+
+    logger.info("  Container ID: %s", cid[:12])
+    return ctx
 
 
 def _wait_for_gerrit_ready(docker: DockerManager, cid: str, timeout: int = 120) -> bool:

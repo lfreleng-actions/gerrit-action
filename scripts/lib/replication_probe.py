@@ -22,6 +22,7 @@ from replication_patterns import (
     _MAGIC_REPO_RE,
     _REPLICATION_ERROR_PATTERNS,
     _SOFT_FAILURE_PATTERNS,
+    _THROWABLE_LINE_RE,
 )
 from replication_report import ErrorMatch, ReplicationErrorReport
 
@@ -105,8 +106,11 @@ def classify_log_matches(text: str) -> list[ErrorMatch]:
     returns every frame of a multi-line exception.  We walk them in
     order, tag the headline by its exception class and target
     repository, and propagate that classification onto the subsequent
-    stack frames / ``Caused by:`` lines until the next headline resets
-    the state.
+    throwable / stack frame / ``Caused by:`` lines until the next
+    event headline resets the state.  An event headline is a line that
+    is neither a frame nor a bare throwable: in this log every real
+    event carries a bracketed timestamp, while the lines of the trace
+    beneath it do not.
 
     Both flags are propagated for the same reason.  Without it the
     generic ``PermanentTransportException.wrapIfPermanent…`` wrapper
@@ -141,14 +145,14 @@ def classify_log_matches(text: str) -> list[ErrorMatch]:
         )
         line_matches_magic = bool(_MAGIC_REPO_RE.search(line))
 
-        if _CONTINUATION_LINE_RE.match(line):
-            # Stack frame or ``Caused by:`` line: inherit the most
-            # recent exception headline's classification unless the
-            # frame itself carries the evidence.  If no headline has
-            # been seen yet (the scan window started mid-trace), the
-            # inherited value is False and the operator sees the line
-            # under the user-project heading; that is the conservative
-            # default.
+        if _CONTINUATION_LINE_RE.match(line) or _THROWABLE_LINE_RE.match(line):
+            # Stack frame, ``Caused by:`` line, or the bare throwable
+            # line the plugin logs beneath an event: inherit the most
+            # recent headline's classification unless the line itself
+            # carries the evidence.  If no headline has been seen yet
+            # (the scan window started mid-trace), the inherited value
+            # is False and the operator sees the line under the
+            # user-project heading; that is the conservative default.
             is_soft = line_matches_soft or current_soft_state
             is_magic = line_matches_magic or current_magic_state
             current_soft_state = is_soft
@@ -174,6 +178,30 @@ def classify_log_matches(text: str) -> list[ErrorMatch]:
         )
 
     return matches
+
+
+def drop_leading_partial_trace(matches: list[ErrorMatch]) -> list[ErrorMatch]:
+    """Drop matches that precede the first event headline.
+
+    A bounded ``tail`` can begin part-way through a multi-line
+    exception, in which case the surviving frames arrive without the
+    headline that names the repository.  :func:`classify_log_matches`
+    starts from an unset state, so those frames look like ordinary
+    user-project failures whatever they really belonged to — and a
+    magic-repository trace clipped by the window would then read as a
+    blocking error purely because of where the window began.
+
+    Callers gating *completion* use this to ignore such a fragment.
+    Callers gating *failure* should not: for them the conservative
+    reading is the safe one, and they scan a wider window anyway.
+    """
+    for index, match in enumerate(matches):
+        if not (
+            _CONTINUATION_LINE_RE.match(match.line)
+            or _THROWABLE_LINE_RE.match(match.line)
+        ):
+            return matches[index:]
+    return []
 
 
 def check_replication_errors(

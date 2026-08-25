@@ -13,6 +13,8 @@ from typing import Any, cast
 from unittest.mock import patch
 
 import pytest
+import requests
+from requests.adapters import HTTPAdapter
 
 from gerrit_api import (
     GerritAPIError,
@@ -186,10 +188,14 @@ class MockSession:
         self.cookies = MockCookieJar()
         self._responses = {}
         self._request_history = []
+        # Mirrors ``requests.Session.adapters`` so code that swaps the
+        # mounted adapters (see ``GerritTransport.no_transport_retries``)
+        # behaves the same way against this double.
+        self.adapters: dict[str, Any] = {}
 
     def mount(self, prefix, adapter):
         """Mock mount method."""
-        pass
+        self.adapters[prefix] = adapter
 
     def set_cookies(self, cookies):
         """Set cookies on the mock session."""
@@ -1411,6 +1417,290 @@ class TestGerritDevClientSshKeyManagement:
 
         assert result["seq"] == 2
 
+    def test_transport_retries_suspended_for_key_post(
+        self, authenticated_session: MockSession
+    ) -> None:
+        """The POST must not ride the session's replaying retry policy.
+
+        urllib3 replays a 5xx POST inside the call, before any code
+        here can check whether the first attempt landed, so the read-
+        back alone cannot make the write safe. The policy is suspended
+        for the duration of the POST and restored afterwards.
+        """
+        seen: list[Any] = []
+
+        original_post = authenticated_session.post
+
+        def _recording_post(url: str, **kwargs: Any) -> MockResponse:
+            """Capture the mounted adapter at POST time."""
+            seen.append(authenticated_session.adapters.get("http://"))
+            return cast(MockResponse, original_post(url, **kwargs))
+
+        with patch("requests.Session", return_value=authenticated_session):
+            client = GerritDevClient("http://localhost:8080")
+            client._xsrf_token = "test-token"
+            before = dict(authenticated_session.adapters)
+
+            authenticated_session.add_response(
+                "POST",
+                "/a/accounts/1000000/sshkeys",
+                MockResponse(status_code=201, json_data=SAMPLE_SSH_KEY),
+            )
+            authenticated_session.post = _recording_post  # type: ignore[method-assign]
+
+            client.add_ssh_key(
+                1000000,
+                "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5... test@example.com",
+            )
+
+        # A non-retrying adapter was mounted for the POST…
+        assert seen and seen[0].max_retries.total == 0
+        # …and the original policy is back afterwards.
+        assert authenticated_session.adapters == before
+
+    def test_key_that_landed_despite_5xx_is_not_reposted(
+        self, authenticated_session: MockSession
+    ) -> None:
+        """A 5xx after Gerrit applied the change must not duplicate it.
+
+        This is the failure mode #143 describes: the write succeeds
+        server-side but the caller sees an error. The retry re-reads
+        the key list, finds the key, and stops.
+        """
+        key = str(SAMPLE_SSH_KEY["ssh_public_key"])
+        posts: list[str] = []
+
+        def _post_then_appear(url: str, **_kwargs: Any) -> MockResponse:
+            """Fail the POST, but behave as though it was applied."""
+            posts.append(url)
+            authenticated_session.add_response(
+                "GET",
+                "/a/accounts/1000000/sshkeys",
+                MockResponse(json_data=[SAMPLE_SSH_KEY]),
+            )
+            return MockResponse(status_code=503, text="Service Unavailable")
+
+        with patch("requests.Session", return_value=authenticated_session):
+            client = GerritDevClient("http://localhost:8080")
+            client._xsrf_token = "test-token"
+            authenticated_session.post = _post_then_appear  # type: ignore[method-assign]
+
+            result = client.add_ssh_key(1000000, key)
+
+        assert result["seq"] == 1
+        # Exactly one POST: the read-back stopped the retry.
+        assert len(posts) == 1
+
+    def test_key_absent_after_5xx_is_retried(
+        self, authenticated_session: MockSession
+    ) -> None:
+        """A 5xx that did not land is retried until it succeeds."""
+        posts: list[str] = []
+
+        def _fail_once(url: str, **_kwargs: Any) -> MockResponse:
+            """Return 503 first, then accept the key."""
+            posts.append(url)
+            if len(posts) == 1:
+                return MockResponse(status_code=503, text="Service Unavailable")
+            return MockResponse(status_code=201, json_data=SAMPLE_SSH_KEY)
+
+        with (
+            patch("requests.Session", return_value=authenticated_session),
+            patch("gerrit_api_ssh_keys.time.sleep"),
+        ):
+            client = GerritDevClient("http://localhost:8080")
+            client._xsrf_token = "test-token"
+            # A readable, empty key list: the read-back can confirm the
+            # key is genuinely absent, which is what licenses a repost.
+            authenticated_session.add_response(
+                "GET",
+                "/a/accounts/1000000/sshkeys",
+                MockResponse(json_data=[]),
+            )
+            authenticated_session.post = _fail_once  # type: ignore[method-assign]
+
+            result = client.add_ssh_key(
+                1000000,
+                "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5... test@example.com",
+            )
+
+        assert result["seq"] == 1
+        assert len(posts) == 2
+
+    def test_conflict_is_not_retried(self, authenticated_session: MockSession) -> None:
+        """409 is a real answer and must reach the caller unretried."""
+        posts: list[str] = []
+
+        def _conflict(url: str, **_kwargs: Any) -> MockResponse:
+            """Reject the key as already present."""
+            posts.append(url)
+            return MockResponse(status_code=409, text="key already exists")
+
+        with patch("requests.Session", return_value=authenticated_session):
+            client = GerritDevClient("http://localhost:8080")
+            client._xsrf_token = "test-token"
+            authenticated_session.post = _conflict  # type: ignore[method-assign]
+
+            with pytest.raises(GerritConflictError):
+                client.add_ssh_key(
+                    1000000,
+                    "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5... test@example.com",
+                )
+
+        assert len(posts) == 1
+
+    def test_key_post_attempt_budget_matches_transport(
+        self, authenticated_session: MockSession
+    ) -> None:
+        """The application-level budget must not shrink the old one.
+
+        ``Retry(total=3)`` allows three retries after the initial
+        request, i.e. four transport attempts. Retrying fewer times
+        here would quietly reduce resilience the surrounding code
+        relies on during container startup.
+        """
+        posts: list[str] = []
+
+        def _always_503(url: str, **_kwargs: Any) -> MockResponse:
+            """Never accept the key."""
+            posts.append(url)
+            return MockResponse(status_code=503, text="Service Unavailable")
+
+        with (
+            patch("requests.Session", return_value=authenticated_session),
+            patch("gerrit_api_ssh_keys.time.sleep"),
+        ):
+            client = GerritDevClient("http://localhost:8080")
+            client._xsrf_token = "test-token"
+            authenticated_session.add_response(
+                "GET",
+                "/a/accounts/1000000/sshkeys",
+                MockResponse(json_data=[]),
+            )
+            authenticated_session.post = _always_503  # type: ignore[method-assign]
+
+            with pytest.raises(GerritAPIError):
+                client.add_ssh_key(
+                    1000000,
+                    "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5... test@example.com",
+                )
+
+        assert len(posts) == 4
+
+    def test_temporary_adapter_is_closed(
+        self, authenticated_session: MockSession
+    ) -> None:
+        """The suspended-retry adapter must not leak its pool.
+
+        Removing the adapter from the mapping does not close its
+        connection pool, so adding several keys would otherwise leave
+        one open per call.
+        """
+        closed: list[bool] = []
+        real_adapter_cls = HTTPAdapter
+
+        class _TrackingAdapter(real_adapter_cls):  # type: ignore[valid-type,misc]
+            """HTTPAdapter that records when it is closed."""
+
+            def close(self) -> None:
+                """Record the close and delegate."""
+                closed.append(True)
+                super().close()
+
+        with (
+            patch("requests.Session", return_value=authenticated_session),
+            patch("gerrit_api_transport.HTTPAdapter", _TrackingAdapter),
+        ):
+            client = GerritDevClient("http://localhost:8080")
+            client._xsrf_token = "test-token"
+
+            authenticated_session.add_response(
+                "POST",
+                "/a/accounts/1000000/sshkeys",
+                MockResponse(status_code=201, json_data=SAMPLE_SSH_KEY),
+            )
+
+            client.add_ssh_key(
+                1000000,
+                "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5... test@example.com",
+            )
+
+        assert closed == [True]
+
+    def test_unreadable_key_list_does_not_repost(
+        self, authenticated_session: MockSession
+    ) -> None:
+        """An inspection failure must not be read as \"key absent\".
+
+        After an ambiguous POST failure the read-back decides whether
+        to repost. If it cannot reach Gerrit, reposting risks exactly
+        the duplicate this method exists to prevent, so the original
+        error is raised instead.
+        """
+        posts: list[str] = []
+        gets: list[str] = []
+
+        def _post_503(url: str, **_kwargs: Any) -> MockResponse:
+            """Fail the POST ambiguously."""
+            posts.append(url)
+            return MockResponse(status_code=503, text="Service Unavailable")
+
+        def _get_fails(url: str, **_kwargs: Any) -> MockResponse:
+            """Make every read-back unusable."""
+            gets.append(url)
+            raise requests.exceptions.ConnectionError("connection refused")
+
+        with (
+            patch("requests.Session", return_value=authenticated_session),
+            patch("gerrit_api_ssh_keys.time.sleep"),
+        ):
+            client = GerritDevClient("http://localhost:8080")
+            client._xsrf_token = "test-token"
+            authenticated_session.post = _post_503  # type: ignore[method-assign]
+            authenticated_session.get = _get_fails  # type: ignore[method-assign]
+
+            with pytest.raises(GerritAPIError):
+                client.add_ssh_key(
+                    1000000,
+                    "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5... test@example.com",
+                )
+
+        # One POST only: the unreadable list stopped the retry rather
+        # than licensing a second write.
+        assert len(posts) == 1
+
+    def test_read_back_survives_transport_failure(
+        self, authenticated_session: MockSession
+    ) -> None:
+        """A read-back that cannot reach Gerrit still allows the POST.
+
+        The documented contract is that a failed read-back falls
+        through to the write; a transport error must not escape and
+        suppress it.
+        """
+
+        def _get_raises(url: str, **_kwargs: Any) -> MockResponse:
+            """Fail every read-back at the transport layer."""
+            raise requests.exceptions.ConnectionError("connection refused")
+
+        with patch("requests.Session", return_value=authenticated_session):
+            client = GerritDevClient("http://localhost:8080")
+            client._xsrf_token = "test-token"
+
+            authenticated_session.add_response(
+                "POST",
+                "/a/accounts/1000000/sshkeys",
+                MockResponse(status_code=201, json_data=SAMPLE_SSH_KEY),
+            )
+            authenticated_session.get = _get_raises  # type: ignore[method-assign]
+
+            result = client.add_ssh_key(
+                1000000,
+                "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5... test@example.com",
+            )
+
+        assert result["seq"] == 1
+
     def test_add_ssh_key_posts_when_read_back_fails(
         self, authenticated_session: MockSession
     ) -> None:
@@ -1432,6 +1722,46 @@ class TestGerritDevClientSshKeyManagement:
             )
 
         assert result["seq"] == 1
+
+    def test_ambiguous_key_failure_does_not_escape_add_ssh_keys(
+        self, authenticated_session: MockSession
+    ) -> None:
+        """An unconfirmable key add is contained, not propagated.
+
+        `add_ssh_key` raises a transport error when it cannot tell
+        whether an ambiguous POST landed. If that escaped, the account
+        setup caller would retry the whole run and its best-effort
+        preflight could repost a key that had in fact landed —
+        undoing the idempotency this is all for.
+        """
+        posts: list[str] = []
+
+        def _post_503(url: str, **_kwargs: Any) -> MockResponse:
+            """Fail the POST ambiguously."""
+            posts.append(url)
+            return MockResponse(status_code=503, text="Service Unavailable")
+
+        def _get_fails(url: str, **_kwargs: Any) -> MockResponse:
+            """Make every read-back unusable."""
+            raise requests.exceptions.ConnectionError("connection refused")
+
+        with (
+            patch("requests.Session", return_value=authenticated_session),
+            patch("gerrit_api_ssh_keys.time.sleep"),
+        ):
+            client = GerritDevClient("http://localhost:8080")
+            client._xsrf_token = "test-token"
+            authenticated_session.post = _post_503  # type: ignore[method-assign]
+            authenticated_session.get = _get_fails  # type: ignore[method-assign]
+
+            # Must not raise.
+            result = client.add_ssh_keys(
+                1000000,
+                ["ssh-ed25519 AAAAC3NzaC1lZDI1NTE5... test@example.com"],
+            )
+
+        assert result == []
+        assert len(posts) == 1
 
 
 class TestGerritDevClientGroupManagement:

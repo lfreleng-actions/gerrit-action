@@ -24,7 +24,7 @@ from replication_patterns import (
     _MIN_KB_PER_REPO,
     _REPLICATION_ERROR_PATTERNS,
 )
-from replication_probe import classify_log_matches
+from replication_probe import classify_log_matches, drop_leading_partial_trace
 
 logger = logging.getLogger(__name__)
 
@@ -105,6 +105,13 @@ def check_pull_replication_log(
     # this check returning False and kept the log line count moving,
     # which in turn denied the steady-state tracker its second
     # completion signal.
+    #
+    # A trace clipped by the 200-line window is discarded rather than
+    # read pessimistically: without its headline the frames cannot be
+    # attributed to a repository, and blocking completion on where the
+    # tail happened to start is the same stall in a different guise.
+    # ``check_replication_errors`` remains the authority on failing the
+    # workflow, over a wider window.
     try:
         error_grep = "|".join(_REPLICATION_ERROR_PATTERNS)
         recent_errors = docker.exec_cmd(
@@ -113,7 +120,7 @@ def check_pull_replication_log(
             f"grep -iE '{error_grep}'",
             check=False,
         )
-        matches = classify_log_matches(recent_errors)
+        matches = drop_leading_partial_trace(classify_log_matches(recent_errors))
         blocking = [m for m in matches if not m.is_magic_repo and not m.is_soft_failure]
         if blocking:
             if debug:

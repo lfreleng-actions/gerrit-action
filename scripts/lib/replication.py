@@ -93,12 +93,14 @@ from replication_patterns import (
     _REPLICATION_ERROR_PATTERNS,
     _SOFT_FAILURE_PATTERNS,
     _STABILITY_WINDOW_SECONDS,
+    _THROWABLE_LINE_RE,
 )
 from replication_probe import (
     check_replication_config,
     check_replication_errors,
     check_secure_config,
     classify_log_matches,
+    drop_leading_partial_trace,
     show_replication_config,
 )
 from replication_report import ErrorMatch, ReplicationErrorReport
@@ -143,6 +145,7 @@ __all__ = [
     "_REPLICATION_ERROR_PATTERNS",
     "_SOFT_FAILURE_PATTERNS",
     "_STABILITY_WINDOW_SECONDS",
+    "_THROWABLE_LINE_RE",
     "_SeenMatches",
     "_StabilityTracker",
     "_WaitSettings",
@@ -154,6 +157,7 @@ __all__ = [
     "check_secure_config",
     "classify_log_matches",
     "count_repositories",
+    "drop_leading_partial_trace",
     "get_completed_repo_count",
     "get_disk_usage_kb",
     "get_git_disk_usage_human",

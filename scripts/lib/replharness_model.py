@@ -176,8 +176,19 @@ class ScenarioResult:
 
     @property
     def passed(self) -> bool:
-        """True when the container came up and every test passed."""
+        """True when the container came up and every test passed.
+
+        ``error`` is consulted as well as the test outcomes, because a
+        scenario can fail *after* Gerrit reports ready — an exception
+        from the initial-cycle wait or from a check part-way through
+        leaves the earlier results in place and records the reason
+        here.  Without this the run would keep its green icon and exit
+        zero on the strength of the checks that happened to complete
+        before the failure.
+        """
         if not self.container_started or not self.gerrit_ready:
+            return False
+        if self.error:
             return False
         return all(t.passed for t in self.tests)
 

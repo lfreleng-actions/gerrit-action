@@ -21,6 +21,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
+from requests.exceptions import RequestException
 from setup_user_client import run_local
 from setup_user_model import (
     _INITIAL_RETRY_DELAY,
@@ -164,6 +165,16 @@ def _setup_with_retries(
     even though the health-check (which hits a public endpoint) already
     passed.
 
+    Two kinds of failure are transient here.  Gerrit answering with a
+    retryable status raises :class:`GerritAPIError`, which is matched
+    against ``_TRANSIENT_STATUS``.  A container that is still starting
+    up instead refuses the connection, or answers 5xx until urllib3
+    exhausts the transport-level retry policy ``GerritTransport``
+    mounts — both surface as a ``requests`` transport exception with
+    no status code attached.  Treating those as transient is what puts
+    container startup, the case this backoff exists for, back inside
+    it.
+
     Returns:
         *True* if the account was configured, *False* otherwise.
     """
@@ -191,20 +202,31 @@ def _setup_with_retries(
         except GerritAPIError as e:
             is_transient = e.status_code is None or e.status_code in _TRANSIENT_STATUS
             if is_transient and attempt < _MAX_ATTEMPTS:
-                logger.warning(
-                    "Attempt %d/%d failed for %s on %s: %s (retrying in %ds…)",
-                    attempt,
-                    _MAX_ATTEMPTS,
-                    username,
-                    slug,
-                    e,
-                    retry_delay,
-                )
+                _log_retry(attempt, username, slug, e, retry_delay)
                 time.sleep(retry_delay)
                 # Increase delay for next attempt
                 retry_delay *= 2
             else:
                 _log_api_failure(username, slug, gerrit_url, attempt, e)
+                return False
+
+        except RequestException as e:
+            # Connection refused, DNS failure, or a 5xx the transport
+            # already retried and gave up on.  Always transient: none
+            # of them mean the request was understood and rejected.
+            if attempt < _MAX_ATTEMPTS:
+                _log_retry(attempt, username, slug, e, retry_delay)
+                time.sleep(retry_delay)
+                retry_delay *= 2
+            else:
+                logger.warning(
+                    "Failed to configure SSH keys for %s on %s after %d attempt(s): %s",
+                    username,
+                    slug,
+                    attempt,
+                    e,
+                )
+                logger.warning("  Gerrit URL was: %s", gerrit_url)
                 return False
 
         except Exception as e:
@@ -217,6 +239,25 @@ def _setup_with_retries(
             return False
 
     return False
+
+
+def _log_retry(
+    attempt: int,
+    username: str,
+    slug: str,
+    error: Exception,
+    retry_delay: int,
+) -> None:
+    """Report one failed attempt that will be retried."""
+    logger.warning(
+        "Attempt %d/%d failed for %s on %s: %s (retrying in %ds…)",
+        attempt,
+        _MAX_ATTEMPTS,
+        username,
+        slug,
+        error,
+        retry_delay,
+    )
 
 
 def _log_api_failure(

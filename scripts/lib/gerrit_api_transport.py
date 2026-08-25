@@ -15,8 +15,10 @@ and never talks to :mod:`requests` directly.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
+from collections.abc import Iterator
 from typing import Any
 from urllib.parse import urljoin
 
@@ -30,6 +32,11 @@ from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
 logger = logging.getLogger(__name__)
+
+# Statuses the mounted transport policy replays.  Callers that suspend
+# that policy for a non-idempotent write reuse this set to decide what
+# is worth retrying themselves.
+RETRYABLE_STATUSES = (500, 502, 503, 504)
 
 
 class GerritTransport:
@@ -58,12 +65,44 @@ class GerritTransport:
         retry_strategy = Retry(
             total=3,
             backoff_factor=0.5,
-            status_forcelist=[500, 502, 503, 504],
+            status_forcelist=list(RETRYABLE_STATUSES),
             allowed_methods=["HEAD", "GET", "OPTIONS", "POST", "PUT", "DELETE"],
         )
         adapter = HTTPAdapter(max_retries=retry_strategy)
         self.session.mount("http://", adapter)
         self.session.mount("https://", adapter)
+
+    @contextlib.contextmanager
+    def no_transport_retries(self) -> Iterator[None]:
+        """Suspend the session's urllib3 retry policy for the block.
+
+        The mounted policy includes ``POST`` and replays it on ``5xx``.
+        That is unsafe for a non-idempotent write: urllib3 replays the
+        request *inside* the call, so a request Gerrit applied but
+        whose response was lost is repeated before any application
+        code can check whether it landed.  A caller that owns such a
+        write suspends the policy here and retries the request itself,
+        re-reading server state between attempts.
+
+        Cookies and the XSRF token live on the ``Session`` rather than
+        on the adapter, so authentication is unaffected.  The original
+        adapters are restored on the way out, including when the body
+        raises.
+        """
+        saved = dict(self.session.adapters)
+        plain = HTTPAdapter(max_retries=0)
+        self.session.mount("http://", plain)
+        self.session.mount("https://", plain)
+        try:
+            yield
+        finally:
+            self.session.adapters.clear()
+            self.session.adapters.update(saved)
+            # The temporary adapter owns its own connection pool.
+            # Dropping it from the mapping does not close that pool,
+            # so a caller adding several keys in a row would leave one
+            # open per call for the lifetime of the process.
+            plain.close()
 
     def _make_url(self, endpoint: str, authenticated: bool = True) -> str:
         """Construct full URL for an endpoint."""

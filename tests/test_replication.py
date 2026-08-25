@@ -1179,6 +1179,115 @@ class TestCheckReplicationErrors:
         assert report.has_user_project_errors is True
         assert report.has_soft_failures is True
 
+    def test_magic_repo_propagates_across_stack_trace(self, mock_docker):
+        """Stack-trace frames inherit the headline's magic-repo flag.
+
+        ``_CONTINUATION_LINE_RE`` matches ``at …`` / ``Caused by: …``
+        frames, which carry a class and method but typically not the
+        repository URL.  Classifying each line independently therefore
+        scored the frames of an ``All-Users.git`` fetch failure as
+        user-project errors, failing the workflow on exactly the case
+        the magic-repo classification exists to suppress.
+        """
+        from replication import check_replication_errors
+
+        docker, mock_run = mock_docker
+        mock_run.side_effect = [
+            make_completed_process(returncode=0),
+            make_completed_process(
+                stdout=(
+                    # Headline names the magic repository.
+                    "[2026-05-22 18:00:00,000] [aaa] Cannot replicate from "
+                    "https://gerrit.onap.org/r/a/All-Users.git\n"
+                    # Frames carry no URL at all.
+                    "\tat org.eclipse.jgit.transport.TransportHttp.connect("
+                    "TransportHttp.java:696)\n"
+                    "Caused by: org.eclipse.jgit.errors.TransportException: "
+                    "not authorized\n"
+                )
+            ),
+            make_completed_process(stdout="INFO: ready"),
+        ]
+
+        report = check_replication_errors(docker, "abc123")
+        assert len(report.log_file_matches) == 3
+        assert all(m.is_magic_repo for m in report.log_file_matches), [
+            (m.is_magic_repo, m.line[:80]) for m in report.log_file_matches
+        ]
+        # Only the magic-repo signal fires; the workflow keeps going.
+        assert report.has_magic_repo_errors is True
+        assert report.has_user_project_errors is False
+
+    def test_magic_repo_survives_bare_throwable_line(self, mock_docker):
+        """The throwable line under an event is not a new headline.
+
+        The plugin logs the throwable's ``toString`` on its own line
+        beneath the event that produced it, with neither the ``at`` /
+        ``Caused by:`` prefix nor a timestamp.  Treating that as a
+        fresh headline reset the magic-repo flag and scored the rest
+        of an All-Users.git trace as user-project failures.
+        """
+        from replication import check_replication_errors
+
+        docker, mock_run = mock_docker
+        mock_run.side_effect = [
+            make_completed_process(returncode=0),
+            make_completed_process(
+                stdout=(
+                    # Event headline names the magic repository.
+                    "[2026-05-22 18:00:00,000] [aaa] Cannot replicate from "
+                    "https://gerrit.onap.org/r/a/All-Users.git\n"
+                    # Bare throwable line: no prefix, no timestamp.
+                    "com.gerritforge.gerrit.plugins.replication.pull.fetch."
+                    "PermanentTransportException: not authorized\n"
+                    # Frames below it.
+                    "\tat org.eclipse.jgit.transport.TransportHttp.connect("
+                    "TransportHttp.java:696)\n"
+                )
+            ),
+            make_completed_process(stdout="INFO: ready"),
+        ]
+
+        report = check_replication_errors(docker, "abc123")
+        assert len(report.log_file_matches) == 3
+        assert all(m.is_magic_repo for m in report.log_file_matches), [
+            (m.is_magic_repo, m.line[:80]) for m in report.log_file_matches
+        ]
+        assert report.has_user_project_errors is False
+
+    def test_user_project_headline_resets_magic_propagation(self, mock_docker):
+        """A user-project headline clears an earlier magic-repo flag.
+
+        The propagation must not leak across an exception boundary: a
+        frame following a user-project headline is a user-project
+        error even when the preceding trace targeted a magic repo.
+        """
+        from replication import check_replication_errors
+
+        docker, mock_run = mock_docker
+        mock_run.side_effect = [
+            make_completed_process(returncode=0),
+            make_completed_process(
+                stdout=(
+                    "[2026-05-22 18:00:00,000] [aaa] Cannot replicate from "
+                    "https://gerrit.onap.org/r/a/All-Users.git\n"
+                    "\tat org.eclipse.jgit.transport.TransportHttp.connect("
+                    "TransportHttp.java:696)\n"
+                    "[2026-05-22 18:00:01,000] [bbb] Cannot replicate from "
+                    "https://gerrit.onap.org/r/a/aai/resources.git\n"
+                    "\tat org.eclipse.jgit.transport.TransportHttp.connect("
+                    "TransportHttp.java:696)\n"
+                )
+            ),
+            make_completed_process(stdout="INFO: ready"),
+        ]
+
+        report = check_replication_errors(docker, "abc123")
+        magic_flags = [m.is_magic_repo for m in report.log_file_matches]
+        assert magic_flags == [True, True, False, False], magic_flags
+        assert report.has_magic_repo_errors is True
+        assert report.has_user_project_errors is True
+
 
 # =========================================================================
 # get_completed_repo_count
@@ -1246,6 +1355,121 @@ class TestCheckPullReplicationLog:
         ]
 
         assert check_pull_replication_log(docker, "abc123") is False
+
+    def test_magic_repo_errors_do_not_block_completion(self, mock_docker):
+        """Expected magic-repository failures must not stall the wait.
+
+        ``fetchEvery`` retries a missing ``All-Users.git`` ref on every
+        cycle.  Treating those as fatal here kept this check returning
+        False while the repeated log writes also denied the steady-
+        state tracker its own completion signal, so a healthy run only
+        ended at the timeout.
+        """
+        from replication import check_pull_replication_log
+
+        docker, mock_run = mock_docker
+        mock_run.side_effect = [
+            # exec_test: file exists
+            make_completed_process(returncode=0),
+            # grep for errors: magic-repo headline plus its frames
+            make_completed_process(
+                stdout=(
+                    "[2026-05-22 18:00:00,000] [aaa] Cannot replicate from "
+                    "https://gerrit.onap.org/r/a/All-Users.git\n"
+                    "\tat org.eclipse.jgit.transport.TransportHttp.connect("
+                    "TransportHttp.java:696)\n"
+                )
+            ),
+            # get_completed_repo_count: 10 unique repos
+            make_completed_process(stdout="10\n"),
+        ]
+
+        assert check_pull_replication_log(docker, "abc123", expected_count=10) is True
+
+    def test_soft_failure_does_not_block_completion(self, mock_docker):
+        """Known-benign soft failures must not stall the wait either."""
+        from replication import check_pull_replication_log
+
+        docker, mock_run = mock_docker
+        mock_run.side_effect = [
+            make_completed_process(returncode=0),
+            make_completed_process(
+                stdout=(
+                    "com.gerritforge.gerrit.plugins.replication.pull.fetch."
+                    "InexistentRefTransportException: Ref "
+                    "refs/meta/external-ids does not exist on remote\n"
+                )
+            ),
+            make_completed_process(stdout="10\n"),
+        ]
+
+        assert check_pull_replication_log(docker, "abc123", expected_count=10) is True
+
+    def test_clipped_leading_trace_does_not_block_completion(self, mock_docker):
+        """A trace clipped by the tail window must not stall the wait.
+
+        When the 200-line boundary lands inside an All-Users.git
+        exception, the surviving frames arrive without the headline
+        that names the repository, so they would otherwise be read as
+        ordinary user-project failures and block completion purely
+        because of where the window began.
+        """
+        from replication import check_pull_replication_log
+
+        docker, mock_run = mock_docker
+        mock_run.side_effect = [
+            make_completed_process(returncode=0),
+            make_completed_process(
+                stdout=(
+                    # Window opens mid-trace: frames only, no headline.
+                    "\tat org.eclipse.jgit.transport.TransportHttp.connect("
+                    "TransportHttp.java:696)\n"
+                    "Caused by: org.eclipse.jgit.errors.TransportException: "
+                    "not authorized\n"
+                )
+            ),
+            make_completed_process(stdout="10\n"),
+        ]
+
+        assert check_pull_replication_log(docker, "abc123", expected_count=10) is True
+
+    def test_clipped_trace_then_real_error_still_blocks(self, mock_docker):
+        """Only the fragment is dropped, not what follows it."""
+        from replication import check_pull_replication_log
+
+        docker, mock_run = mock_docker
+        mock_run.side_effect = [
+            make_completed_process(returncode=0),
+            make_completed_process(
+                stdout=(
+                    "\tat org.eclipse.jgit.transport.TransportHttp.connect("
+                    "TransportHttp.java:696)\n"
+                    "[2026-05-22 18:00:01,000] [bbb] Cannot replicate from "
+                    "https://gerrit.onap.org/r/a/aai/resources.git\n"
+                )
+            ),
+        ]
+
+        assert check_pull_replication_log(docker, "abc123", expected_count=10) is False
+
+    def test_user_project_error_still_blocks_completion(self, mock_docker):
+        """A genuine user-project failure keeps blocking completion."""
+        from replication import check_pull_replication_log
+
+        docker, mock_run = mock_docker
+        mock_run.side_effect = [
+            make_completed_process(returncode=0),
+            make_completed_process(
+                stdout=(
+                    "[2026-05-22 18:00:00,000] [aaa] Cannot replicate from "
+                    "https://gerrit.onap.org/r/a/All-Users.git\n"
+                    "[2026-05-22 18:00:01,000] [bbb] Cannot replicate from "
+                    "https://gerrit.onap.org/r/a/aai/resources.git\n"
+                )
+            ),
+        ]
+
+        assert check_pull_replication_log(docker, "abc123", expected_count=10) is False
 
     def test_expected_count_met(self, mock_docker):
         from replication import check_pull_replication_log
@@ -1587,6 +1811,76 @@ class TestTakeSnapshot:
         assert snap.repo_count == 36
         assert snap.timestamp > 0
 
+    @patch("replication.get_log_line_count", return_value=150)
+    @patch("replication.get_disk_usage_kb", return_value=88064)
+    @patch("replication.get_completed_repo_count", return_value=36)
+    @patch("replication.count_repositories", return_value=36)
+    def test_timestamp_taken_after_collection(
+        self, mock_count, mock_completed, mock_disk, mock_log
+    ):
+        """The timestamp records observation, not the start of collection.
+
+        Consumers measure quiet time from this field against the wall
+        clock, so timestamping first credited the collection time as
+        quiet time — letting one slow poll satisfy the stability
+        window and declare replication complete while it was running.
+        """
+        from replication import take_snapshot
+
+        # The last probe to run takes 40 seconds of wall clock.
+        def _slow_probe(*_args, **_kwargs):
+            """Stand in for a sluggish docker exec."""
+            fake_clock[0] += 40
+            return 36
+
+        fake_clock = [1000.0]
+        mock_count.side_effect = _slow_probe
+
+        with patch("replication.time.time", side_effect=lambda: fake_clock[0]):
+            snap = take_snapshot(MagicMock(), "abc123")
+
+        # 1040, not the 1000 that collection started at.
+        assert snap.timestamp == 1040.0
+
+    @patch("replication.get_log_line_count", return_value=150)
+    @patch("replication.get_disk_usage_kb", return_value=88064)
+    @patch("replication.get_completed_repo_count", return_value=36)
+    @patch("replication.count_repositories", return_value=36)
+    def test_slow_collection_does_not_satisfy_window(
+        self, mock_count, mock_completed, mock_disk, mock_log
+    ):
+        """A slow cycle cannot declare stability by itself.
+
+        Two identical snapshots collected back to back, each taking
+        longer than the stability window, must not report stable until
+        the window has passed between their observation times.
+        """
+        from replication import _StabilityTracker, take_snapshot
+
+        fake_clock = [1000.0]
+
+        def _slow_probe(*_args, **_kwargs):
+            """Consume 40 seconds per collection."""
+            fake_clock[0] += 40
+            return 36
+
+        mock_count.side_effect = _slow_probe
+        tracker = _StabilityTracker(window=30)
+
+        with patch("replication.time.time", side_effect=lambda: fake_clock[0]):
+            first = take_snapshot(MagicMock(), "abc123")
+            tracker.update(first)
+            # Immediately after the first snapshot lands, no quiet time
+            # has been observed at all.
+            assert tracker.is_stable(fake_clock[0]) is False
+
+            second = take_snapshot(MagicMock(), "abc123")
+            tracker.update(second)
+            # The state is unchanged and 40s of wall clock has passed
+            # since it was first observed, so now it is stable.
+            assert second.is_same_as(first)
+            assert tracker.is_stable(fake_clock[0]) is True
+
 
 # =========================================================================
 # list_repositories
@@ -1856,6 +2150,59 @@ class TestWaitForReplication:
             stability_window=60,
         )
         assert result is True
+
+    @patch("replication.check_replication_errors")
+    @patch("replication.check_pull_replication_log", return_value=True)
+    @patch("replication.check_replication_has_content", return_value=True)
+    @patch("replication.take_snapshot")
+    @patch("replication.count_repositories", return_value=10)
+    @patch("replication.time.sleep")
+    def test_no_completion_while_error_unresolved(
+        self,
+        mock_sleep,
+        mock_count,
+        mock_snap,
+        mock_has_content,
+        mock_log_ok,
+        mock_errors,
+    ):
+        """A poll that saw a user-project error must not declare success.
+
+        Failing the wait needs two consecutive error polls. If the same
+        poll could complete on the other signals, the streak would
+        never get its second observation and the run would report
+        success with the error unresolved.
+        """
+        from replication import ReplicationSnapshot, wait_for_replication
+
+        docker = MagicMock()
+        # Error on the first poll, clear on the second. Every other
+        # completion signal is satisfied throughout.
+        mock_errors.side_effect = [
+            _authoritative_error_report(),
+            _NO_ERRORS,
+        ]
+        ready = ReplicationSnapshot(
+            timestamp=100.0,
+            completed_count=10,
+            disk_usage_kb=500000,
+            log_line_count=100,
+            repo_count=10,
+        )
+        mock_snap.side_effect = [ready, ready]
+
+        result = wait_for_replication(
+            docker,
+            "abc123",
+            "onap",
+            timeout=30,
+            expected_count=10,
+            stability_window=60,
+        )
+
+        assert result is True
+        # Two polls: the first was held back by the outstanding error.
+        assert mock_errors.call_count == 2
 
     @patch("replication.check_replication_errors")
     @patch("replication.check_pull_replication_log", return_value=True)

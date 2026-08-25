@@ -114,6 +114,26 @@ _SOFT_FAILURE_PATTERNS = [
 # to the same logical soft failure as the headline.
 _CONTINUATION_LINE_RE = re.compile(r"^\s*(?:at\s|Caused by:)")
 
+# A bare Java throwable line, e.g.::
+#
+#     com.gerritforge.gerrit.plugins.replication.pull.fetch.
+#         PermanentTransportException: not authorized
+#
+# The pull-replication plugin logs the throwable's ``toString`` on its
+# own line beneath the event that produced it, without the ``at`` or
+# ``Caused by:`` prefix and without the bracketed timestamp every real
+# log event carries.  Such a line therefore belongs to the exception
+# above it, not to a new event, and must inherit its classification.
+#
+# This matters most for the magic-repository flag.  Only the event
+# headline names the repository (``Cannot replicate from
+# https://…/All-Users.git``); the throwable line and the frames below
+# it carry a class and method but no URL.  Treating the throwable line
+# as a fresh headline would reset the flag and score the rest of the
+# trace as a user-project failure — the very misclassification the
+# propagation exists to prevent.
+_THROWABLE_LINE_RE = re.compile(r"^\s*(?:[\w$]+\.)+[\w$]*(?:Exception|Error)\b")
+
 # Patterns for detecting replication errors in the **container** logs.
 #
 # These must be much more selective than the pull_replication_log patterns

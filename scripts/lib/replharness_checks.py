@@ -23,6 +23,7 @@ from replharness_model import (
     TestResult,
 )
 from replication import (
+    ReplicationSnapshot,
     _StabilityTracker,
     check_replication_errors,
     check_replication_has_content,
@@ -35,6 +36,33 @@ from replication import (
 )
 
 logger = logging.getLogger(__name__)
+
+# Ceiling on how long the steady-state check waits for quiescence,
+# expressed as a multiple of the stability window.  Replication that
+# is genuinely still active needs room to settle, but an unbounded
+# wait would only re-create the timeout the harness exists to catch.
+_STEADY_STATE_BUDGET_FACTOR = 3
+
+
+def _describe_change(before: ReplicationSnapshot, after: ReplicationSnapshot) -> str:
+    """Summarise what moved between two snapshots, for the report."""
+    if before.is_same_as(after):
+        return "state unchanged"
+
+    changed_fields: list[str] = []
+    if before.completed_count != after.completed_count:
+        changed_fields.append(
+            f"completed {before.completed_count}->{after.completed_count}"
+        )
+    if before.disk_usage_kb != after.disk_usage_kb:
+        changed_fields.append(f"disk {before.disk_usage_kb}->{after.disk_usage_kb}KB")
+    if before.log_line_count != after.log_line_count:
+        changed_fields.append(
+            f"log_lines {before.log_line_count}->{after.log_line_count}"
+        )
+    if before.repo_count != after.repo_count:
+        changed_fields.append(f"repos {before.repo_count}->{after.repo_count}")
+    return "changed: " + ", ".join(changed_fields)
 
 
 def _test_content_threshold(
@@ -87,61 +115,120 @@ def _test_steady_state_detection(
 ) -> TestResult:
     """Verify that the stability tracker detects quiescence.
 
-    Takes snapshots 3 × stability_window seconds apart and asserts the
-    tracker reports stable.
+    Samples until the tracker reports stable, or until a budget of
+    ``_STEADY_STATE_BUDGET_FACTOR × stability_window`` seconds is
+    exhausted.  Reaching stability passes; exhausting the budget
+    fails.
+
+    The check previously took a single sample and returned
+    ``passed=True`` on both branches, treating "replication is still
+    active" as a pass because one sample cannot tell that apart from
+    "steady-state detection is broken".  That made it unfalsifiable:
+    it contributed a green tick to the summary regardless of outcome,
+    while being named and counted as a regression test for exactly
+    the behaviour ``_StabilityTracker`` exists to provide.  Sampling
+    over a bounded budget resolves the ambiguity instead of
+    swallowing it.
     """
     start = time.time()
     tracker = _StabilityTracker(window=stability_window)
 
-    snap1 = take_snapshot(docker, cid)
-    tracker.update(snap1)
+    # Sample roughly three times per window, but no more often than
+    # every five seconds for windows that can afford it.  The floor
+    # scales down for very short windows: a flat five-second interval
+    # made ``STABILITY_WINDOW=1`` unsatisfiable, because one interval
+    # already exceeded the whole three-second budget and the
+    # within-budget gate then rejected the first repeated observation.
+    #
+    # The trailing ``1`` keeps the interval positive.  The environment
+    # value is parsed as an unrestricted integer, so a window of ``0``
+    # (or a negative one) reaches here and would otherwise divide by
+    # zero below, crashing the harness before it could print its
+    # summary.  Such a window simply fails the check instead.
+    interval = max(min(5, stability_window), stability_window // 3, 1)
+    budget = stability_window * _STEADY_STATE_BUDGET_FACTOR
+    # Bound the loop by sample count as well as wall clock so it
+    # always terminates, even if the clock misbehaves.
+    max_samples = max(budget // interval, 1)
 
-    # Wait for one stability window and re-check
-    time.sleep(stability_window + 5)
+    previous = take_snapshot(docker, cid)
+    tracker.update(previous)
+    latest = previous
+    # Observation times are recorded *after* each snapshot returns.
+    # ``ReplicationSnapshot.timestamp`` is set before its four Docker
+    # queries run, so it says when collection started rather than when
+    # the state was actually seen; crediting a stability window from it
+    # can report far more quiet time than was observed.
+    previous_observed_at = time.time()
+    unchanged_since: float | None = None
 
-    snap2 = take_snapshot(docker, cid)
-    tracker.update(snap2)
+    for sample in range(max_samples + 1):
+        now = time.time()
+        elapsed = now - start
+        # Three conditions must hold before stability is credited.
+        #
+        # ``unchanged_since`` — the state has repeated, and this is the
+        # post-collection moment it was first observed in its current
+        # form.  Requiring a full window to have passed since then
+        # means the quiet period was genuinely watched, rather than
+        # inferred from a snapshot that was already stale on arrival.
+        #
+        # ``elapsed < budget`` — a pass reported after the advertised
+        # budget has run out would contradict the budget the failure
+        # message quotes.
+        #
+        # ``tracker.is_stable`` — the verdict actually under test.  The
+        # observation bookkeeping above is deliberately independent of
+        # it, so a regression in the tracker cannot be masked by this
+        # check agreeing with it.
+        if (
+            unchanged_since is not None
+            and now - unchanged_since >= stability_window
+            and elapsed < budget
+            and tracker.is_stable(now)
+        ):
+            return TestResult(
+                name="steady_state_detection",
+                passed=True,
+                message=(
+                    f"stable=True after {elapsed:.0f}s "
+                    f"({_describe_change(previous, latest)})"
+                ),
+                elapsed_s=elapsed,
+            )
+        if sample == max_samples or elapsed >= budget:
+            # Stop scheduling further intervals once the advertised
+            # wall-clock budget is spent.  ``max_samples`` remains as
+            # the guard against a misbehaving clock, but on its own it
+            # would let a slow ``take_snapshot`` — four Docker calls
+            # per sample — overrun the budget several times over.
+            break
+        time.sleep(interval)
+        previous = latest
+        latest = take_snapshot(docker, cid)
+        observed_at = time.time()
+        tracker.update(latest)
+        if latest.is_same_as(previous):
+            # Date the quiet period from when this state was *first*
+            # observed, not from now.
+            if unchanged_since is None:
+                unchanged_since = previous_observed_at
+        else:
+            unchanged_since = None
+        previous_observed_at = observed_at
 
     elapsed = time.time() - start
-    now = time.time()
-    stable = tracker.is_stable(now)
-
-    if snap1.is_same_as(snap2):
-        detail = f"state unchanged for {elapsed:.0f}s"
-    else:
-        changed_fields: list[str] = []
-        if snap1.completed_count != snap2.completed_count:
-            changed_fields.append(
-                f"completed {snap1.completed_count}->{snap2.completed_count}"
-            )
-        if snap1.disk_usage_kb != snap2.disk_usage_kb:
-            changed_fields.append(
-                f"disk {snap1.disk_usage_kb}->{snap2.disk_usage_kb}KB"
-            )
-        if snap1.log_line_count != snap2.log_line_count:
-            changed_fields.append(
-                f"log_lines {snap1.log_line_count}->{snap2.log_line_count}"
-            )
-        if snap1.repo_count != snap2.repo_count:
-            changed_fields.append(f"repos {snap1.repo_count}->{snap2.repo_count}")
-        detail = "changed: " + ", ".join(changed_fields)
-
-    if stable:
-        return TestResult(
-            name="steady_state_detection",
-            passed=True,
-            message=f"stable=True after {elapsed:.0f}s ({detail})",
-            elapsed_s=elapsed,
-        )
-    else:
-        # If state is still changing, that's fine — replication may
-        # still be running.  We only fail if we expected stability.
-        return TestResult(
-            name="steady_state_detection",
-            passed=True,  # Informational — state still changing is valid
-            message=f"stable=False — replication still active ({detail})",
-            elapsed_s=elapsed,
-        )
+    return TestResult(
+        name="steady_state_detection",
+        passed=False,
+        message=(
+            f"stable=False after {elapsed:.0f}s — replication still "
+            f"active past the {budget}s budget "
+            f"(window={stability_window}s, "
+            f"{_describe_change(previous, latest)})"
+        ),
+        elapsed_s=elapsed,
+    )
 
 
 def _test_wait_for_replication(

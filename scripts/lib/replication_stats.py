@@ -24,6 +24,7 @@ from replication_patterns import (
     _MIN_KB_PER_REPO,
     _REPLICATION_ERROR_PATTERNS,
 )
+from replication_probe import classify_log_matches, drop_leading_partial_trace
 
 logger = logging.getLogger(__name__)
 
@@ -82,8 +83,11 @@ def check_pull_replication_log(
 ) -> bool:
     """Check if replication has completed successfully.
 
-    Returns *True* ONLY if replication completed WITHOUT errors and
-    the completed count meets the threshold.
+    Returns *True* ONLY if replication completed without user-project
+    errors and the completed count meets the threshold.  Magic-
+    repository failures and known-benign soft failures are ignored
+    here, exactly as they are by the ``has_user_project_errors`` gate
+    the wait loop fails on.
     """
     # Check if log file exists
     if not docker.exec_test(cid, "-f /var/gerrit/logs/pull_replication_log"):
@@ -91,7 +95,23 @@ def check_pull_replication_log(
             logger.debug("    pull_replication_log not found")
         return False
 
-    # Check for errors in recent entries
+    # Check for errors in recent entries.  The grep is only a cheap
+    # pre-filter: the matched lines go through the same classifier
+    # ``check_replication_errors`` uses, so an expected magic-
+    # repository fetch failure or a known-benign soft failure does not
+    # block completion.  Treating every recent TransportException as
+    # fatal stalled otherwise-healthy runs until timeout, because the
+    # repeated ``fetchEvery`` retries of a missing magic ref both kept
+    # this check returning False and kept the log line count moving,
+    # which in turn denied the steady-state tracker its second
+    # completion signal.
+    #
+    # A trace clipped by the 200-line window is discarded rather than
+    # read pessimistically: without its headline the frames cannot be
+    # attributed to a repository, and blocking completion on where the
+    # tail happened to start is the same stall in a different guise.
+    # ``check_replication_errors`` remains the authority on failing the
+    # workflow, over a wider window.
     try:
         error_grep = "|".join(_REPLICATION_ERROR_PATTERNS)
         recent_errors = docker.exec_cmd(
@@ -100,10 +120,17 @@ def check_pull_replication_log(
             f"grep -iE '{error_grep}'",
             check=False,
         )
-        if recent_errors.strip():
+        matches = drop_leading_partial_trace(classify_log_matches(recent_errors))
+        blocking = [m for m in matches if not m.is_magic_repo and not m.is_soft_failure]
+        if blocking:
             if debug:
-                logger.debug("    Found replication errors in log")
+                logger.debug("    Found %d replication error(s) in log", len(blocking))
             return False
+        if matches and debug:
+            logger.debug(
+                "    Ignoring %d expected replication failure(s) in log",
+                len(matches),
+            )
     except DockerError as exc:
         logger.debug("Could not tail pull_replication_log: %s", exc)
 

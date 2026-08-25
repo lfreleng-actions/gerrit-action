@@ -20,6 +20,7 @@ import sys
 import textwrap
 from typing import Any
 
+from config import ConfigError, parse_interval_to_seconds
 from docker_manager import DockerManager
 from errors import DockerError
 from replharness_container import _build_image, _cleanup_container
@@ -32,6 +33,32 @@ from replharness_model import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _positive_int_env(name: str, default: str) -> int:
+    """Read *name* as a positive integer, or exit with a clear message.
+
+    A typo that silently reverted to the default would be worse than a
+    failure: the run would proceed under a configuration the developer
+    did not ask for and the results would be read as though it had.
+    Exiting matches :func:`_get_credentials`, which already ends the
+    run when it cannot resolve what it was given.
+    """
+    raw = os.environ.get(name, default).strip()
+    try:
+        value = int(raw)
+    except ValueError:
+        logger.error(
+            "%s must be a whole number of seconds; got %r",
+            name,
+            raw,
+        )
+        sys.exit(1)
+
+    if value <= 0:
+        logger.error("%s must be greater than zero; got %d", name, value)
+        sys.exit(1)
+    return value
 
 
 def parse_args() -> argparse.Namespace:
@@ -90,13 +117,33 @@ def list_scenarios() -> None:
 
 
 def resolve_harness_config() -> HarnessConfig:
-    """Read the harness tuning knobs from the environment."""
+    """Read the harness tuning knobs from the environment.
+
+    Every value that the harness later does arithmetic on is validated
+    here, so a bad one is reported by name before any image is built.
+    ``FETCH_EVERY`` in particular used to be parsed only inside
+    ``wait_initial_cycle``, which runs after a container has already
+    been started — so a typo cost a full start-up before surfacing.
+    """
+    fetch_every = os.environ.get("FETCH_EVERY", "15s").strip()
+    try:
+        fetch_seconds = parse_interval_to_seconds(fetch_every)
+    except ConfigError as exc:
+        logger.error("FETCH_EVERY is invalid: %s", exc)
+        sys.exit(1)
+    if fetch_seconds <= 0:
+        logger.error(
+            "FETCH_EVERY must be greater than zero; got %r",
+            fetch_every,
+        )
+        sys.exit(1)
+
     return HarnessConfig(
         gerrit_version=os.environ.get("GERRIT_VERSION", "3.13.1-ubuntu24"),
         plugin_version=os.environ.get("PLUGIN_VERSION", "stable-3.13"),
-        timeout=int(os.environ.get("REPLICATION_WAIT_TIMEOUT", "180")),
-        stability_window=int(os.environ.get("STABILITY_WINDOW", "30")),
-        fetch_every=os.environ.get("FETCH_EVERY", "15s"),
+        timeout=_positive_int_env("REPLICATION_WAIT_TIMEOUT", "180"),
+        stability_window=_positive_int_env("STABILITY_WINDOW", "30"),
+        fetch_every=fetch_every,
     )
 
 
@@ -157,14 +204,28 @@ def install_cleanup_handler(docker: DockerManager) -> list[_ContainerContext]:
     """Install SIGINT/SIGTERM handlers that tear down tracked containers.
 
     Returns the list the handler drains, so callers can register the
-    containers they want removed on interrupt.
+    containers they want removed on interrupt.  A caller that discards
+    the return value gets handlers that report an interrupt and exit
+    without removing anything.
     """
     shutdown_contexts: list[_ContainerContext] = []
 
     def _signal_handler(_signum: int, _frame: Any) -> None:
-        logger.info("\nInterrupted — cleaning up…")
-        for ctx in shutdown_contexts:
-            _cleanup_container(docker, ctx)
+        if shutdown_contexts:
+            logger.info(
+                "\nInterrupted — removing %d container(s)…",
+                len(shutdown_contexts),
+            )
+            # Drain as we go.  The interrupt unwinds the scenario loop
+            # through ``run_scenario``'s finally block, which consults
+            # this registry before releasing anything; popping each
+            # context as it is cleaned stops that path removing the
+            # same container twice, or reporting a container as kept
+            # by --keep after this handler has already removed it.
+            while shutdown_contexts:
+                _cleanup_container(docker, shutdown_contexts.pop())
+        else:
+            logger.info("\nInterrupted — no containers to clean up")
         sys.exit(130)
 
     signal.signal(signal.SIGINT, _signal_handler)

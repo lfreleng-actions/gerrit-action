@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import contextlib
 import logging
+import time
 from typing import Any, cast
 
 from gerrit_api_accounts import GerritAccountsClient
@@ -28,8 +29,44 @@ from gerrit_api_protocol import (
     GerritConflictError,
     _looks_like_method_mangle,
 )
+from gerrit_api_transport import RETRYABLE_STATUSES
+from requests.exceptions import RequestException
 
 logger = logging.getLogger(__name__)
+
+# The key POST is retried here rather than by the transport, so the
+# attempt budget and backoff live here too.  ``Retry(total=3)`` allows
+# three retries *after* the initial request, so four attempts matches
+# the transport policy this replaces for the endpoint rather than
+# quietly shrinking it.
+_KEY_POST_ATTEMPTS = 4
+_KEY_POST_BACKOFF = 0.5
+
+
+def _ssh_key_identity(key: str) -> tuple[str, ...]:
+    """Return the fields that identify an SSH public key.
+
+    An OpenSSH public key is ``<algorithm> <base64 material> [comment]``.
+    The comment is free-form and Gerrit echoes back whatever it stored,
+    so only the first two fields are compared when deciding whether a
+    key is already on an account.  Returns an empty tuple for input
+    that is not shaped like a key, which callers treat as "no match".
+    """
+    fields = tuple(key.split()[:2])
+    return fields if len(fields) == 2 else ()
+
+
+def _match_ssh_key(keys: list[dict[str, Any]], ssh_key: str) -> dict[str, Any] | None:
+    """Return the entry in *keys* holding the same material, or None."""
+    identity = _ssh_key_identity(ssh_key)
+    if not identity:
+        return None
+
+    for key in keys:
+        material = key.get("ssh_public_key", "")
+        if isinstance(material, str) and _ssh_key_identity(material) == identity:
+            return key
+    return None
 
 
 class GerritSshKeyClient(GerritAccountsClient):
@@ -51,24 +88,141 @@ class GerritSshKeyClient(GerritAccountsClient):
         """
         Add an SSH public key to an account.
 
+        This is the only non-idempotent write in the client, so it is
+        the only one that cannot ride the session's ``urllib3`` retry
+        policy.  That policy includes ``POST`` and replays it on
+        ``5xx`` *inside* the call, so a request Gerrit applied but
+        whose response was lost would be repeated before any code here
+        could check whether it landed — adding the key twice.
+
+        The retry therefore moves up a level: the POST is issued with
+        transport retries suspended, and each failed attempt is
+        followed by a read-back of the account's keys.  If the key is
+        there, the attempt succeeded despite the error and the existing
+        entry is returned; if not, the POST is retried.  Every attempt
+        is thus made idempotent by inspection, which keeps the
+        resilience the surrounding code relies on (see
+        :meth:`add_ssh_keys`) without the duplication risk.
+
         Args:
             account: Account identifier (ID, username, or "self")
             ssh_key: SSH public key in OpenSSH format
 
         Returns:
-            Added SSH key info
+            Added SSH key info, or the existing entry when the key was
+            already present on the account
 
         Raises:
             GerritAPIError: If the key is invalid
         """
-        return cast(
-            dict[str, Any],
-            self.post(
-                f"accounts/{account}/sshkeys",
-                data=ssh_key,
-                content_type="text/plain",
-            ),
-        )
+        existing = self._find_ssh_key(account, ssh_key)
+        if existing is not None:
+            logger.debug(
+                "SSH key %s already present on %s; skipping add",
+                existing.get("seq", "?"),
+                account,
+            )
+            return existing
+
+        attempt = 0
+        while True:
+            attempt += 1
+            try:
+                with self.no_transport_retries():
+                    return cast(
+                        dict[str, Any],
+                        self.post(
+                            f"accounts/{account}/sshkeys",
+                            data=ssh_key,
+                            content_type="text/plain",
+                        ),
+                    )
+            except GerritAPIError as exc:
+                # Only the statuses the transport used to replay are
+                # retried.  Anything else — 409 Conflict, a validation
+                # rejection, the garbled-verb 501 that add_ssh_keys
+                # handles on a fresh connection — is a real answer and
+                # is raised for the caller to act on.
+                if exc.status_code not in RETRYABLE_STATUSES:
+                    raise
+                last_error: Exception = exc
+            except RequestException as exc:
+                # Connection dropped or reset: the request may or may
+                # not have reached Gerrit, which is exactly why the
+                # read-back below has to decide.
+                last_error = exc
+
+            # Strict read-back.  Unlike the preflight, this one must
+            # distinguish "key absent" from "could not look": reposting
+            # on an inspection failure is exactly the duplicate this
+            # method exists to avoid.  Only a successful key list that
+            # does not contain the key justifies another POST.
+            keys = self._read_ssh_keys(account)
+            if keys is None:
+                logger.debug(
+                    "Cannot confirm whether the SSH key for %s landed "
+                    "after %s; not reposting",
+                    account,
+                    last_error,
+                )
+                raise last_error
+
+            landed = _match_ssh_key(keys, ssh_key)
+            if landed is not None:
+                logger.debug(
+                    "SSH key %s for %s landed despite %s; not retrying",
+                    landed.get("seq", "?"),
+                    account,
+                    last_error,
+                )
+                return landed
+
+            if attempt >= _KEY_POST_ATTEMPTS:
+                raise last_error
+
+            logger.debug(
+                "SSH key add attempt %d/%d for %s failed: %s",
+                attempt,
+                _KEY_POST_ATTEMPTS,
+                account,
+                last_error,
+            )
+            time.sleep(_KEY_POST_BACKOFF * attempt)
+
+    def _read_ssh_keys(self, account: str | int) -> list[dict[str, Any]] | None:
+        """Return the account's SSH keys, or None if they cannot be read.
+
+        The ``None`` return is deliberately distinct from an empty
+        list: callers deciding whether to repeat a non-idempotent write
+        must not read "could not look" as "not there".
+
+        A failure here already means four attempts have been made, as
+        the GET is idempotent and still rides the session's transport
+        retry policy.
+        """
+        try:
+            return self.list_ssh_keys(account)
+        except (GerritAPIError, RequestException) as exc:
+            logger.debug("Could not list SSH keys for %s: %s", account, exc)
+            return None
+
+    def _find_ssh_key(self, account: str | int, ssh_key: str) -> dict[str, Any] | None:
+        """Return the account's entry for *ssh_key*, or None.
+
+        This is the best-effort preflight.  A failure to read the key
+        list is not fatal: the caller falls through to the POST, which
+        is exactly the behaviour before this guard existed.  Only a
+        positive match suppresses the write, so both Gerrit errors and
+        transport failures return None rather than propagating.
+
+        The read-back *between* POST attempts uses
+        :meth:`_read_ssh_keys` directly instead, because there an
+        unreadable list must not be mistaken for an absent key.
+        """
+        keys = self._read_ssh_keys(account)
+        if keys is None:
+            return None
+        return _match_ssh_key(keys, ssh_key)
 
     def add_ssh_keys(
         self, account: str | int, ssh_keys: list[str]
@@ -86,6 +240,14 @@ class GerritSshKeyClient(GerritAccountsClient):
         Tailscale + the runner's request stack rather than a real
         method mismatch — keys 1 and 2 succeed, key 3 trips the
         garbled verb, and a separate fresh connection retries fine.
+
+        Every per-key failure is contained here rather than allowed to
+        propagate, including the transport failures
+        :meth:`add_ssh_key` raises when it cannot confirm whether an
+        ambiguous POST landed.  The account-setup caller retries on
+        transport errors, and a second pass through this method would
+        re-run the best-effort preflight and could repost a key that
+        had in fact landed.
 
         We therefore:
 
@@ -129,6 +291,17 @@ class GerritSshKeyClient(GerritAccountsClient):
             except GerritConflictError:
                 logger.debug(f"SSH key already exists for {account}")
                 continue
+            except RequestException as exc:
+                # ``add_ssh_key`` raises this when it could not
+                # establish whether an ambiguous POST landed.  It must
+                # not escape: the caller retries the whole account
+                # setup on transport errors, and a second pass would
+                # run the best-effort preflight again and could repost
+                # a key that did land — reintroducing the duplicate the
+                # strict read-back exists to prevent.  Record it as a
+                # deferred failure like any other per-key problem.
+                deferred_failures.append(str(exc))
+                continue
             except GerritAPIError as exc:
                 if not _looks_like_method_mangle(exc):
                     # Genuine API error (validation, auth, etc.) —
@@ -157,7 +330,7 @@ class GerritSshKeyClient(GerritAccountsClient):
                 )
             except GerritConflictError:
                 logger.debug(f"SSH key already exists for {account} (after retry)")
-            except GerritAPIError as exc:
+            except (GerritAPIError, RequestException) as exc:
                 # Retry also failed — record but do not WARN per key.
                 deferred_failures.append(str(exc))
 

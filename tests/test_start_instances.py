@@ -1575,7 +1575,6 @@ class TestConfigureGerrit:
                     slug="test",
                     canonical_url="http://localhost:18080/",
                     listen_url="http://*:8080/",
-                    api_path="",
                     advertised_ssh_addr="localhost:29418",
                     use_tunnel=False,
                 ),
@@ -1602,7 +1601,6 @@ class TestConfigureGerrit:
                     slug="test",
                     canonical_url="http://localhost:18080/",
                     listen_url="http://*:8080/",
-                    api_path="",
                     advertised_ssh_addr="localhost:29418",
                     use_tunnel=False,
                 ),
@@ -1635,7 +1633,6 @@ class TestConfigureGerrit:
                     slug="test",
                     canonical_url="http://tunnel.example.com:8080/",
                     listen_url="http://*:8080/",
-                    api_path="",
                     advertised_ssh_addr="tunnel.example.com:12345",
                     use_tunnel=True,
                     tunnel_host="bore.pub",
@@ -1670,7 +1667,6 @@ class TestConfigureGerrit:
                     slug="test",
                     canonical_url="http://100.100.50.1:8080/",
                     listen_url="http://*:8080/",
-                    api_path="",
                     advertised_ssh_addr="100.100.50.1:29418",
                     use_tunnel=True,
                     tunnel_host="100.100.50.1",
@@ -1715,7 +1711,6 @@ class TestConfigureGerrit:
                     slug="test",
                     canonical_url="http://bore.pub:8080/",
                     listen_url="http://*:8080/",
-                    api_path="",
                     advertised_ssh_addr="bore.pub:12345",
                     use_tunnel=True,
                     tunnel_host="bore.pub",
@@ -1753,7 +1748,6 @@ class TestConfigureGerrit:
                     slug="test",
                     canonical_url="http://localhost:18080/",
                     listen_url="http://*:8080/",
-                    api_path="",
                     advertised_ssh_addr="localhost:29418",
                     use_tunnel=False,
                 ),
@@ -1780,7 +1774,6 @@ class TestConfigureGerrit:
                     slug="test",
                     canonical_url="http://localhost:18080/r/",
                     listen_url="http://*:8080/r/",
-                    api_path="/r",
                     advertised_ssh_addr="localhost:29418",
                     use_tunnel=False,
                 ),
@@ -1792,6 +1785,45 @@ class TestConfigureGerrit:
         ]
         assert len(redirect_calls) == 1
         assert "/r/login/" in redirect_calls[0][-1]
+
+    def test_ootb_redirect_omits_prefix_when_served_at_root(
+        self, tmp_path: Path
+    ) -> None:
+        """A detected-but-disabled API path must not reach the redirect.
+
+        When ``USE_API_PATH`` is false, ``_build_urls`` serves the
+        instance at root and the canonical URL carries no prefix.  The
+        OOTB first-time redirect used to be built from the *detected*
+        API path regardless, pointing first-time login at a path the
+        instance does not serve.
+        """
+        instance_dir = tmp_path / "instance"
+        (instance_dir / "etc").mkdir(parents=True)
+        (instance_dir / "etc" / "gerrit.config").write_text("")
+
+        calls_made: list[list[str]] = []
+
+        def record_call(*args: Any, **kwargs: Any) -> subprocess.CompletedProcess[str]:
+            calls_made.append(args[0])
+            return _cp()
+
+        with patch("start_instances.subprocess.run", side_effect=record_call):
+            start_instances.configure_gerrit(
+                instance_dir,
+                GerritConfigOptions(
+                    slug="test",
+                    canonical_url="http://localhost:18080/",
+                    listen_url="http://*:8080/",
+                    advertised_ssh_addr="localhost:29418",
+                    use_tunnel=False,
+                ),
+            )
+
+        redirect_calls = [
+            c for c in calls_made if any("firstTimeRedirectUrl" in elem for elem in c)
+        ]
+        assert len(redirect_calls) == 1
+        assert redirect_calls[0][-1] == "/login/%23%2F?account_id=1000000"
 
 
 class TestIsPrivateTunnel:

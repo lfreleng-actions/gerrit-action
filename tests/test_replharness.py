@@ -11,13 +11,19 @@ worth pinning down.
 
 from __future__ import annotations
 
+import itertools
+import time
+from unittest.mock import MagicMock, patch
+
 import pytest
+from replharness_checks import _test_steady_state_detection
 
 # ``TestResult`` is aliased because pytest would otherwise try to
 # collect the harness's result record as a test class.
 from replharness_model import Scenario, ScenarioResult
 from replharness_model import TestResult as HarnessTestResult
 from replharness_report import print_summary
+from replication_model import ReplicationSnapshot
 
 
 def _scenario(name: str = "lf-small") -> Scenario:
@@ -112,3 +118,64 @@ class TestPrintSummary:
         messages = [r.getMessage() for r in caplog.records]
         assert any("failed before testing" in m for m in messages)
         assert not any("ALL TESTS PASSED" in m for m in messages)
+
+
+class TestSteadyStateDetection:
+    """The steady-state check must be able to report a failure."""
+
+    def test_stable_state_passes(self) -> None:
+        """A tracker that reaches stability yields a pass."""
+        # A snapshot timestamped a full window in the past makes the
+        # tracker report stable on the first query.
+        snap = ReplicationSnapshot(
+            timestamp=time.time() - 120,
+            completed_count=10,
+            disk_usage_kb=5000,
+            log_line_count=200,
+            repo_count=10,
+        )
+
+        with (
+            patch("replharness_checks.take_snapshot", return_value=snap),
+            patch("replharness_checks.time.sleep"),
+        ):
+            result = _test_steady_state_detection(
+                MagicMock(), "abc123", _scenario(), stability_window=30
+            )
+
+        assert result.passed is True
+        assert "stable=True" in result.message
+
+    def test_state_still_changing_fails(self) -> None:
+        """State that never settles now fails instead of passing.
+
+        The check previously returned passed=True on both branches, so
+        it could not report a regression in steady-state detection.
+        """
+        counter = itertools.count(1)
+
+        def _moving_snapshot(*_args: object, **_kwargs: object) -> ReplicationSnapshot:
+            """Return a snapshot that differs on every call."""
+            n = next(counter)
+            return ReplicationSnapshot(
+                timestamp=time.time(),
+                completed_count=n,
+                disk_usage_kb=1000 * n,
+                log_line_count=10 * n,
+                repo_count=n,
+            )
+
+        with (
+            patch("replharness_checks.take_snapshot", side_effect=_moving_snapshot),
+            patch("replharness_checks.time.sleep") as mock_sleep,
+        ):
+            result = _test_steady_state_detection(
+                MagicMock(), "abc123", _scenario(), stability_window=30
+            )
+
+        assert result.passed is False
+        assert "stable=False" in result.message
+        # Bounded: it samples across the budget rather than forever.
+        # budget = 3 × 30s, sampled every max(30 // 3, 5) = 10s.
+        assert mock_sleep.call_count == 9
+        assert mock_sleep.call_args_list[0].args[0] == 10

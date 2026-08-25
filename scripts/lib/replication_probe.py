@@ -94,6 +94,88 @@ def check_secure_config(docker: DockerManager, cid: str) -> bool:
 # ---------------------------------------------------------------------------
 
 
+def classify_log_matches(text: str) -> list[ErrorMatch]:
+    """Turn matched ``pull_replication_log`` lines into classified records.
+
+    *text* is the raw output of a ``grep -iE`` over the log with the
+    ``_REPLICATION_ERROR_PATTERNS`` alternation, so the lines arrive in
+    the order they appear in the file.  Because every line of a Java
+    stack trace contains a class name with ``TransportException`` in it
+    (the plugin's own classes plus the ``Caused by:`` line), grep
+    returns every frame of a multi-line exception.  We walk them in
+    order, tag the headline by its exception class and target
+    repository, and propagate that classification onto the subsequent
+    stack frames / ``Caused by:`` lines until the next headline resets
+    the state.
+
+    Both flags are propagated for the same reason.  Without it the
+    generic ``PermanentTransportException.wrapIfPermanent…`` wrapper
+    frame and the JGit ``Caused by:`` line of an
+    ``InexistentRefTransportException`` would each get tagged as a
+    separate hard failure and fail the workflow on what is in fact a
+    single soft exception; and the frames of an ``All-Users.git`` fetch
+    failure — which name a class and method but not the repository URL
+    — would be scored as user-project errors even though the headline
+    they belong to targets a magic repository.
+
+    Returns one :class:`ErrorMatch` per non-blank line, in input order.
+    """
+    matches: list[ErrorMatch] = []
+    current_soft_state = False
+    current_magic_state = False
+
+    for raw_line in text.splitlines():
+        line = raw_line.rstrip()
+        if not line:
+            continue
+        matched_pattern = next(
+            (
+                p
+                for p in _REPLICATION_ERROR_PATTERNS
+                if re.search(p, line, re.IGNORECASE)
+            ),
+            "|".join(_REPLICATION_ERROR_PATTERNS),
+        )
+        line_matches_soft = any(
+            re.search(p, line, re.IGNORECASE) for p in _SOFT_FAILURE_PATTERNS
+        )
+        line_matches_magic = bool(_MAGIC_REPO_RE.search(line))
+
+        if _CONTINUATION_LINE_RE.match(line):
+            # Stack frame or ``Caused by:`` line: inherit the most
+            # recent exception headline's classification unless the
+            # frame itself carries the evidence.  If no headline has
+            # been seen yet (the scan window started mid-trace), the
+            # inherited value is False and the operator sees the line
+            # under the user-project heading; that is the conservative
+            # default.
+            is_soft = line_matches_soft or current_soft_state
+            is_magic = line_matches_magic or current_magic_state
+            current_soft_state = is_soft
+            current_magic_state = is_magic
+        else:
+            # Headline: it alone decides the classification, and
+            # resets the propagation state so a subsequent stack frame
+            # cannot inherit a stale flag from an earlier exception in
+            # the same scan window.
+            is_soft = line_matches_soft
+            is_magic = line_matches_magic
+            current_soft_state = is_soft
+            current_magic_state = is_magic
+
+        matches.append(
+            ErrorMatch(
+                source="pull_replication_log",
+                pattern=matched_pattern,
+                line=line,
+                is_magic_repo=is_magic,
+                is_soft_failure=is_soft,
+            )
+        )
+
+    return matches
+
+
 def check_replication_errors(
     docker: DockerManager,
     cid: str,
@@ -142,71 +224,7 @@ def check_replication_errors(
                 f"grep -iE '{grep_pattern}'",
                 check=False,
             )
-            # ``check_replication_errors`` scans matches in the order
-            # ``grep`` emits them, which is the order they appear in
-            # the log file.  Because every line in a Java stack trace
-            # contains a class name with ``TransportException`` in it
-            # (the plugin's own classes plus the ``Caused by:`` line),
-            # grep returns every frame of a multi-line exception.  We
-            # walk them in order, tag the headline by its exception
-            # class, and propagate that classification onto the
-            # subsequent stack frames / ``Caused by:`` lines until the
-            # next headline resets the state.  Without this, the
-            # generic ``PermanentTransportException.wrapIfPermanent…``
-            # wrapper frame and the JGit ``Caused by:`` line of an
-            # ``InexistentRefTransportException`` would each get tagged
-            # as a separate hard failure and fail the workflow on
-            # what is in fact a single soft exception.
-            current_soft_state = False
-            for line in result.splitlines():
-                line = line.rstrip()
-                if not line:
-                    continue
-                matched_pattern = next(
-                    (
-                        p
-                        for p in _REPLICATION_ERROR_PATTERNS
-                        if re.search(p, line, re.IGNORECASE)
-                    ),
-                    "|".join(_REPLICATION_ERROR_PATTERNS),
-                )
-                line_matches_soft = any(
-                    re.search(p, line, re.IGNORECASE) for p in _SOFT_FAILURE_PATTERNS
-                )
-                is_continuation = bool(_CONTINUATION_LINE_RE.match(line))
-                if line_matches_soft:
-                    # Explicit soft-pattern match: this line itself
-                    # carries a known-soft exception class or the
-                    # JGit cause phrase.  Mark soft and update the
-                    # propagation state so any subsequent stack
-                    # frames inherit the flag.
-                    is_soft = True
-                    current_soft_state = True
-                elif is_continuation:
-                    # Stack frame or ``Caused by:`` line: inherit the
-                    # most recent exception headline's classification.
-                    # If no headline has been seen yet (the scan
-                    # window started mid-trace), inherit ``False`` and
-                    # let the operator see the line under the
-                    # user-project heading; that is the conservative
-                    # default.
-                    is_soft = current_soft_state
-                else:
-                    # Non-continuation, non-soft headline.  Reset the
-                    # propagation state so a subsequent stack frame
-                    # cannot inherit a stale soft flag from an
-                    # earlier exception in the same scan window.
-                    is_soft = False
-                    current_soft_state = False
-                report.log_file_matches.append(
-                    ErrorMatch(
-                        source="pull_replication_log",
-                        pattern=matched_pattern,
-                        line=line,
-                        is_magic_repo=bool(_MAGIC_REPO_RE.search(line)),
-                        is_soft_failure=is_soft,
-                    )
-                )
+            report.log_file_matches.extend(classify_log_matches(result))
         except DockerError as exc:
             logger.debug("Could not read pull_replication_log: %s", exc)
 

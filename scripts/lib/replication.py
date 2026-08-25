@@ -98,6 +98,7 @@ from replication_probe import (
     check_replication_config,
     check_replication_errors,
     check_secure_config,
+    classify_log_matches,
     show_replication_config,
 )
 from replication_report import ErrorMatch, ReplicationErrorReport
@@ -151,6 +152,7 @@ __all__ = [
     "check_replication_errors",
     "check_replication_has_content",
     "check_secure_config",
+    "classify_log_matches",
     "count_repositories",
     "get_completed_repo_count",
     "get_disk_usage_kb",

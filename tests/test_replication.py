@@ -1179,6 +1179,78 @@ class TestCheckReplicationErrors:
         assert report.has_user_project_errors is True
         assert report.has_soft_failures is True
 
+    def test_magic_repo_propagates_across_stack_trace(self, mock_docker):
+        """Stack-trace frames inherit the headline's magic-repo flag.
+
+        ``_CONTINUATION_LINE_RE`` matches ``at …`` / ``Caused by: …``
+        frames, which carry a class and method but typically not the
+        repository URL.  Classifying each line independently therefore
+        scored the frames of an ``All-Users.git`` fetch failure as
+        user-project errors, failing the workflow on exactly the case
+        the magic-repo classification exists to suppress.
+        """
+        from replication import check_replication_errors
+
+        docker, mock_run = mock_docker
+        mock_run.side_effect = [
+            make_completed_process(returncode=0),
+            make_completed_process(
+                stdout=(
+                    # Headline names the magic repository.
+                    "[2026-05-22 18:00:00,000] [aaa] Cannot replicate from "
+                    "https://gerrit.onap.org/r/a/All-Users.git\n"
+                    # Frames carry no URL at all.
+                    "\tat org.eclipse.jgit.transport.TransportHttp.connect("
+                    "TransportHttp.java:696)\n"
+                    "Caused by: org.eclipse.jgit.errors.TransportException: "
+                    "not authorized\n"
+                )
+            ),
+            make_completed_process(stdout="INFO: ready"),
+        ]
+
+        report = check_replication_errors(docker, "abc123")
+        assert len(report.log_file_matches) == 3
+        assert all(m.is_magic_repo for m in report.log_file_matches), [
+            (m.is_magic_repo, m.line[:80]) for m in report.log_file_matches
+        ]
+        # Only the magic-repo signal fires; the workflow keeps going.
+        assert report.has_magic_repo_errors is True
+        assert report.has_user_project_errors is False
+
+    def test_user_project_headline_resets_magic_propagation(self, mock_docker):
+        """A user-project headline clears an earlier magic-repo flag.
+
+        The propagation must not leak across an exception boundary: a
+        frame following a user-project headline is a user-project
+        error even when the preceding trace targeted a magic repo.
+        """
+        from replication import check_replication_errors
+
+        docker, mock_run = mock_docker
+        mock_run.side_effect = [
+            make_completed_process(returncode=0),
+            make_completed_process(
+                stdout=(
+                    "[2026-05-22 18:00:00,000] [aaa] Cannot replicate from "
+                    "https://gerrit.onap.org/r/a/All-Users.git\n"
+                    "\tat org.eclipse.jgit.transport.TransportHttp.connect("
+                    "TransportHttp.java:696)\n"
+                    "[2026-05-22 18:00:01,000] [bbb] Cannot replicate from "
+                    "https://gerrit.onap.org/r/a/aai/resources.git\n"
+                    "\tat org.eclipse.jgit.transport.TransportHttp.connect("
+                    "TransportHttp.java:696)\n"
+                )
+            ),
+            make_completed_process(stdout="INFO: ready"),
+        ]
+
+        report = check_replication_errors(docker, "abc123")
+        magic_flags = [m.is_magic_repo for m in report.log_file_matches]
+        assert magic_flags == [True, True, False, False], magic_flags
+        assert report.has_magic_repo_errors is True
+        assert report.has_user_project_errors is True
+
 
 # =========================================================================
 # get_completed_repo_count

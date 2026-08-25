@@ -103,9 +103,29 @@ def print_summary(
     )
     logger.info("-" * 60)
 
+    # A scenario that dies during start-up or readiness contributes no
+    # TestResult entries at all, so it adds nothing to either count
+    # above.  Reporting those separately keeps "never got far enough to
+    # test anything" from reading like "every test passed".
+    incomplete = [sr for sr in scenario_results if not sr.passed and not sr.tests]
+    if incomplete:
+        logger.info("")
+        logger.info("Scenarios that failed before testing:")
+        for sr in incomplete:
+            logger.info("  ❌ %s — %s", sr.scenario.name, sr.error or "no tests ran")
+
     if total_failed > 0:
         logger.info("")
         logger.info("❌ SOME TESTS FAILED")
+        return 1
+
+    # Scenario-level outcomes gate the exit code too.  Deriving it from
+    # the test tally alone let a scenario whose container never started
+    # exit 0, which is exactly the case where a green result misleads
+    # most.
+    if scenarios_passed != scenarios_total:
+        logger.info("")
+        logger.info("❌ SOME SCENARIOS FAILED")
         return 1
 
     logger.info("")

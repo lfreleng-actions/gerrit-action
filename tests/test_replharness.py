@@ -23,7 +23,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 from errors import DockerError
 from replharness_checks import _test_steady_state_detection
-from replharness_cli import install_cleanup_handler
+from replharness_cli import install_cleanup_handler, resolve_harness_config
 from replharness_container import _start_container
 
 # ``TestResult`` is aliased because pytest would otherwise try to
@@ -852,3 +852,144 @@ class TestScenarioOutcome:
 
         assert result.passed is False
         assert print_summary([result], []) == 1
+
+
+class TestHarnessConfig:
+    """Environment values the harness cannot act on must be rejected."""
+
+    ENV_VARS = (
+        "GERRIT_VERSION",
+        "PLUGIN_VERSION",
+        "REPLICATION_WAIT_TIMEOUT",
+        "STABILITY_WINDOW",
+        "FETCH_EVERY",
+    )
+
+    @pytest.fixture(autouse=True)
+    def _clear_env(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Keep the host environment out of these tests."""
+        for name in self.ENV_VARS:
+            monkeypatch.delenv(name, raising=False)
+
+    def test_defaults_are_valid(self) -> None:
+        """Every documented default passes validation."""
+        config = resolve_harness_config()
+
+        assert config.timeout == 180
+        assert config.stability_window == 30
+        assert config.fetch_every == "15s"
+
+    def test_valid_overrides_are_respected(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Legitimate values pass through unchanged."""
+        monkeypatch.setenv("REPLICATION_WAIT_TIMEOUT", "120")
+        monkeypatch.setenv("STABILITY_WINDOW", "20")
+        monkeypatch.setenv("FETCH_EVERY", "5m")
+
+        config = resolve_harness_config()
+
+        assert config.timeout == 120
+        assert config.stability_window == 20
+        assert config.fetch_every == "5m"
+
+    @pytest.mark.parametrize("name", ["REPLICATION_WAIT_TIMEOUT", "STABILITY_WINDOW"])
+    @pytest.mark.parametrize("value", ["3O", "", "12.5", "abc"])
+    def test_non_numeric_is_rejected_by_name(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+        name: str,
+        value: str,
+    ) -> None:
+        """A typo fails with the variable named, not a traceback."""
+        monkeypatch.setenv(name, value)
+
+        with (
+            caplog.at_level("ERROR", logger="replharness_cli"),
+            pytest.raises(SystemExit) as excinfo,
+        ):
+            resolve_harness_config()
+
+        assert excinfo.value.code == 1
+        assert any(name in r.getMessage() for r in caplog.records)
+
+    @pytest.mark.parametrize("name", ["REPLICATION_WAIT_TIMEOUT", "STABILITY_WINDOW"])
+    @pytest.mark.parametrize("value", ["0", "-5"])
+    def test_non_positive_is_rejected(
+        self, monkeypatch: pytest.MonkeyPatch, name: str, value: str
+    ) -> None:
+        """Zero and negatives reach the timing arithmetic otherwise.
+
+        STABILITY_WINDOW=0 previously divided by zero inside the
+        steady-state check, killing the run before its summary.
+        """
+        monkeypatch.setenv(name, value)
+
+        with pytest.raises(SystemExit) as excinfo:
+            resolve_harness_config()
+
+        assert excinfo.value.code == 1
+
+    @pytest.mark.parametrize("value", ["15sec", "soon", "-1s", "0s"])
+    def test_bad_fetch_every_fails_before_any_container(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+        value: str,
+    ) -> None:
+        """FETCH_EVERY was previously parsed only after a container ran.
+
+        `wait_initial_cycle` calls `parse_interval_to_seconds` once the
+        scenario is under way, so a typo cost a full image build and
+        container start before surfacing.
+        """
+        monkeypatch.setenv("FETCH_EVERY", value)
+
+        with (
+            caplog.at_level("ERROR", logger="replharness_cli"),
+            pytest.raises(SystemExit) as excinfo,
+        ):
+            resolve_harness_config()
+
+        assert excinfo.value.code == 1
+        assert any("FETCH_EVERY" in r.getMessage() for r in caplog.records)
+
+
+class TestTunnelOnlyEntryPoint:
+    """Tunnel checks must not depend on scenario tuning values."""
+
+    def test_tunnel_only_ignores_invalid_scenario_config(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """An unusable FETCH_EVERY must not block a tunnel check.
+
+        The tunnel tests are container-free and use none of the
+        scenario knobs, so resolving (and validating) those before the
+        tunnel-only early return would fail a run that never needed
+        them.
+        """
+        harness = _load_harness_entry_point()
+        monkeypatch.setenv("FETCH_EVERY", "not-an-interval")
+        monkeypatch.setenv("STABILITY_WINDOW", "0")
+
+        args = SimpleNamespace(
+            list=False,
+            tunnel_only=True,
+            scenario=None,
+            keep=False,
+            skip_build=False,
+        )
+
+        with (
+            patch.object(harness, "parse_args", return_value=args),
+            patch.object(harness, "setup_logging"),
+            patch.object(harness, "run_tunnel_tests", return_value=[]) as mock_tunnel,
+            patch.object(harness, "resolve_harness_config") as mock_config,
+        ):
+            exit_code = harness.main()
+
+        assert exit_code == 0
+        mock_tunnel.assert_called_once()
+        # The scenario configuration is never resolved on this path.
+        mock_config.assert_not_called()

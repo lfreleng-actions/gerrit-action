@@ -270,11 +270,10 @@ def main() -> int:
         list_scenarios()
         return 0
 
-    # --- Resolve configuration ---
-    config = resolve_harness_config()
-    log_harness_config(config, debug=debug)
-
     # --- Tunnel-only mode ---
+    # These checks are container-free and use none of the scenario
+    # tuning knobs, so they run before those are resolved: an invalid
+    # FETCH_EVERY should not stop a developer verifying a tunnel.
     tunnel_results = run_tunnel_tests()
     for t in tunnel_results:
         logger.info(str(t))
@@ -282,6 +281,10 @@ def main() -> int:
     if args.tunnel_only:
         failed = sum(1 for t in tunnel_results if not t.passed)
         return 1 if failed else 0
+
+    # --- Resolve configuration ---
+    config = resolve_harness_config()
+    log_harness_config(config, debug=debug)
 
     # --- Resolve scenarios ---
     selected = select_scenarios(args.scenario)

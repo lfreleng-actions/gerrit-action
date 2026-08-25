@@ -36,6 +36,14 @@ _INITIAL_RETRY_DELAY = 3  # seconds
 # or these HTTP codes.  401/403 are included because the Gerrit auth
 # subsystem may not be fully ready immediately after the container
 # passes its health check (which hits a public endpoint).
+#
+# The 5xx entries are a fallback rather than the usual path.  The
+# session ``GerritTransport`` builds retries 500/502/503/504 itself,
+# so those statuses normally surface as a ``requests`` transport
+# exception once urllib3 has exhausted its own attempts, and
+# ``_setup_with_retries`` catches that separately.  They stay listed
+# so a raw 5xx response still reaches the backoff if that transport
+# policy is ever narrowed.
 _TRANSIENT_STATUS = {401, 403, 429, 500, 502, 503, 504}
 
 

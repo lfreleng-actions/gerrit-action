@@ -1323,6 +1323,116 @@ class TestGerritDevClientSshKeyManagement:
 
         assert len(result) == 2
 
+    def test_add_ssh_key_skips_post_when_already_present(
+        self, authenticated_session: MockSession
+    ) -> None:
+        """A key already on the account is not POSTed again.
+
+        The session retries POST on 5xx at the transport layer, and
+        POST is not idempotent: a request Gerrit applied but whose
+        response was lost would otherwise be replayed and add the key
+        twice.  The read-back makes the replay a no-op.
+        """
+        key = str(SAMPLE_SSH_KEY["ssh_public_key"])
+
+        with patch("requests.Session", return_value=authenticated_session):
+            client = GerritDevClient("http://localhost:8080")
+            client._xsrf_token = "test-token"
+
+            authenticated_session.add_response(
+                "GET",
+                "/a/accounts/1000000/sshkeys",
+                MockResponse(json_data=[SAMPLE_SSH_KEY]),
+            )
+            authenticated_session.add_response(
+                "POST",
+                "/a/accounts/1000000/sshkeys",
+                MockResponse(status_code=201, json_data=SAMPLE_SSH_KEY),
+            )
+
+            # Simulate the retry: the same key added twice.
+            first = client.add_ssh_key(1000000, key)
+            second = client.add_ssh_key(1000000, key)
+
+        assert first["seq"] == 1
+        assert second["seq"] == 1
+        posts = [
+            r
+            for r in authenticated_session._request_history
+            if r["method"] == "POST" and "sshkeys" in r["url"]
+        ]
+        assert posts == []
+
+    def test_add_ssh_key_ignores_comment_when_matching(
+        self, authenticated_session: MockSession
+    ) -> None:
+        """The same key material with a different comment is a match."""
+        stored = str(SAMPLE_SSH_KEY["ssh_public_key"])
+        algorithm, material = stored.split()[:2]
+
+        with patch("requests.Session", return_value=authenticated_session):
+            client = GerritDevClient("http://localhost:8080")
+            client._xsrf_token = "test-token"
+
+            authenticated_session.add_response(
+                "GET",
+                "/a/accounts/1000000/sshkeys",
+                MockResponse(json_data=[SAMPLE_SSH_KEY]),
+            )
+
+            result = client.add_ssh_key(
+                1000000, f"{algorithm} {material} someone-else@example.com"
+            )
+
+        assert result["seq"] == 1
+
+    def test_add_ssh_key_posts_when_key_is_new(
+        self, authenticated_session: MockSession
+    ) -> None:
+        """A key absent from the account is still POSTed."""
+        with patch("requests.Session", return_value=authenticated_session):
+            client = GerritDevClient("http://localhost:8080")
+            client._xsrf_token = "test-token"
+
+            authenticated_session.add_response(
+                "GET",
+                "/a/accounts/1000000/sshkeys",
+                MockResponse(json_data=[SAMPLE_SSH_KEY]),
+            )
+            authenticated_session.add_response(
+                "POST",
+                "/a/accounts/1000000/sshkeys",
+                MockResponse(status_code=201, json_data={"seq": 2, "valid": True}),
+            )
+
+            result = client.add_ssh_key(
+                1000000, "ssh-rsa AAAAB3NzaC1yc2EDIFFERENT... new@example.com"
+            )
+
+        assert result["seq"] == 2
+
+    def test_add_ssh_key_posts_when_read_back_fails(
+        self, authenticated_session: MockSession
+    ) -> None:
+        """An unreadable key list must not suppress the add."""
+        with patch("requests.Session", return_value=authenticated_session):
+            client = GerritDevClient("http://localhost:8080")
+            client._xsrf_token = "test-token"
+
+            # No GET response registered, so the read-back 404s.
+            authenticated_session.add_response(
+                "POST",
+                "/a/accounts/1000000/sshkeys",
+                MockResponse(status_code=201, json_data=SAMPLE_SSH_KEY),
+            )
+
+            result = client.add_ssh_key(
+                1000000,
+                "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5... test@example.com",
+            )
+
+        assert result["seq"] == 1
+
 
 class TestGerritDevClientGroupManagement:
     """Tests for GerritDevClient group management methods."""

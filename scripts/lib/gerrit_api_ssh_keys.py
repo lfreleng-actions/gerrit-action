@@ -32,6 +32,19 @@ from gerrit_api_protocol import (
 logger = logging.getLogger(__name__)
 
 
+def _ssh_key_identity(key: str) -> tuple[str, ...]:
+    """Return the fields that identify an SSH public key.
+
+    An OpenSSH public key is ``<algorithm> <base64 material> [comment]``.
+    The comment is free-form and Gerrit echoes back whatever it stored,
+    so only the first two fields are compared when deciding whether a
+    key is already on an account.  Returns an empty tuple for input
+    that is not shaped like a key, which callers treat as "no match".
+    """
+    fields = tuple(key.split()[:2])
+    return fields if len(fields) == 2 else ()
+
+
 class GerritSshKeyClient(GerritAccountsClient):
     """Adds SSH public key endpoints to the accounts client."""
 
@@ -51,16 +64,37 @@ class GerritSshKeyClient(GerritAccountsClient):
         """
         Add an SSH public key to an account.
 
+        The POST is guarded by a read-back of the account's existing
+        keys, because the session mounts a ``urllib3`` retry policy that
+        includes ``POST`` and retries on ``5xx``.  POST is not
+        idempotent: if Gerrit applies the change but the response is
+        lost, or it returns a transient ``5xx`` after the key has
+        landed, the retry would add the same key twice.  Skipping the
+        POST when the key material is already present makes the one
+        non-idempotent write on this session safe under retry, without
+        giving up transport-level resilience that the surrounding code
+        (see :meth:`add_ssh_keys`) demonstrably relies on.
+
         Args:
             account: Account identifier (ID, username, or "self")
             ssh_key: SSH public key in OpenSSH format
 
         Returns:
-            Added SSH key info
+            Added SSH key info, or the existing entry when the key was
+            already present on the account
 
         Raises:
             GerritAPIError: If the key is invalid
         """
+        existing = self._find_ssh_key(account, ssh_key)
+        if existing is not None:
+            logger.debug(
+                "SSH key %s already present on %s; skipping add",
+                existing.get("seq", "?"),
+                account,
+            )
+            return existing
+
         return cast(
             dict[str, Any],
             self.post(
@@ -69,6 +103,29 @@ class GerritSshKeyClient(GerritAccountsClient):
                 content_type="text/plain",
             ),
         )
+
+    def _find_ssh_key(self, account: str | int, ssh_key: str) -> dict[str, Any] | None:
+        """Return the account's entry for *ssh_key*, or None.
+
+        A failure to read the key list is not fatal: the caller falls
+        through to the POST, which is exactly the behaviour before this
+        guard existed.  Only a positive match suppresses the write.
+        """
+        identity = _ssh_key_identity(ssh_key)
+        if not identity:
+            return None
+
+        try:
+            keys = self.list_ssh_keys(account)
+        except GerritAPIError as exc:
+            logger.debug("Could not list SSH keys for %s: %s", account, exc)
+            return None
+
+        for key in keys:
+            material = key.get("ssh_public_key", "")
+            if isinstance(material, str) and _ssh_key_identity(material) == identity:
+                return key
+        return None
 
     def add_ssh_keys(
         self, account: str | int, ssh_keys: list[str]

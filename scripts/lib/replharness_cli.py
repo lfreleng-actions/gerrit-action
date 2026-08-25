@@ -157,14 +157,22 @@ def install_cleanup_handler(docker: DockerManager) -> list[_ContainerContext]:
     """Install SIGINT/SIGTERM handlers that tear down tracked containers.
 
     Returns the list the handler drains, so callers can register the
-    containers they want removed on interrupt.
+    containers they want removed on interrupt.  A caller that discards
+    the return value gets handlers that report an interrupt and exit
+    without removing anything.
     """
     shutdown_contexts: list[_ContainerContext] = []
 
     def _signal_handler(_signum: int, _frame: Any) -> None:
-        logger.info("\nInterrupted — cleaning up…")
-        for ctx in shutdown_contexts:
-            _cleanup_container(docker, ctx)
+        if shutdown_contexts:
+            logger.info(
+                "\nInterrupted — removing %d container(s)…",
+                len(shutdown_contexts),
+            )
+            for ctx in shutdown_contexts:
+                _cleanup_container(docker, ctx)
+        else:
+            logger.info("\nInterrupted — no containers to clean up")
         sys.exit(130)
 
     signal.signal(signal.SIGINT, _signal_handler)

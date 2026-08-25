@@ -187,8 +187,16 @@ def run_scenario(
     scenario: Scenario,
     index: int,
     options: ScenarioRunOptions,
+    tracked: list[_ContainerContext] | None = None,
 ) -> ScenarioResult:
-    """Execute all tests for a single scenario."""
+    """Execute all tests for a single scenario.
+
+    *tracked* is the registry the interrupt handler drains.  The
+    container is registered as soon as it starts and deregistered once
+    the normal path has released it, so Ctrl-C part-way through a
+    scenario removes the container that is actually running and never
+    tries to remove one that has already gone.
+    """
     result = ScenarioResult(scenario=scenario)
     log_scenario_banner(scenario, options)
 
@@ -204,6 +212,8 @@ def run_scenario(
             fetch_every=options.fetch_every,
         )
         result.container_started = True
+        if tracked is not None:
+            tracked.append(ctx)
 
         # Wait for Gerrit to be ready
         result.error = await_gerrit_ready(docker, ctx.cid)
@@ -222,6 +232,12 @@ def run_scenario(
 
     finally:
         release_container(docker, ctx, keep=options.keep)
+        # Deregister whichever way release_container went: the
+        # container has either been removed, or deliberately kept by
+        # --keep, and in both cases a later interrupt must leave it
+        # alone.
+        if tracked is not None and ctx is not None and ctx in tracked:
+            tracked.remove(ctx)
 
     return result
 
@@ -273,8 +289,10 @@ def main() -> int:
     # --- Run scenarios ---
     scenario_results: list[ScenarioResult] = []
 
-    # Install signal handler for clean shutdown
-    install_cleanup_handler(docker)
+    # Install signal handler for clean shutdown.  The returned list is
+    # the registry the handler drains; each scenario registers its
+    # container into it while that container is running.
+    shutdown_contexts = install_cleanup_handler(docker)
 
     for idx, scenario in enumerate(selected):
         # Check credentials before starting container
@@ -299,6 +317,7 @@ def main() -> int:
                     fetch_every=config.fetch_every,
                     keep=args.keep,
                 ),
+                shutdown_contexts,
             )
         )
 

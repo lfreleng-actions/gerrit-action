@@ -178,13 +178,34 @@ __all__ = [
 
 
 def take_snapshot(docker: DockerManager, cid: str) -> ReplicationSnapshot:
-    """Capture a point-in-time snapshot of all replication indicators."""
+    """Capture a point-in-time snapshot of all replication indicators.
+
+    The four probes run first and the timestamp is taken afterwards, so
+    the field records when the state was *observed* rather than when
+    collection began.  Each probe is a separate ``docker exec`` with a
+    10-15 second timeout, and consumers — :class:`_StabilityTracker`
+    above all — measure quiet time from this field against the wall
+    clock.  Timestamping first credited the collection time itself as
+    quiet time, so a single slow poll could satisfy the stability
+    window on its own and declare replication complete while it was
+    still running.
+
+    The probes remain non-atomic: ``completed_count`` is read before
+    ``repo_count``, so a snapshot can still straddle a change.  Taking
+    the timestamp last bounds that error to one collection window
+    rather than removing it, which is what the stability comparison
+    needs.
+    """
+    completed_count = get_completed_repo_count(docker, cid)
+    disk_usage_kb = get_disk_usage_kb(docker, cid)
+    log_line_count = get_log_line_count(docker, cid)
+    repo_count = count_repositories(docker, cid)
     return ReplicationSnapshot(
         timestamp=time.time(),
-        completed_count=get_completed_repo_count(docker, cid),
-        disk_usage_kb=get_disk_usage_kb(docker, cid),
-        log_line_count=get_log_line_count(docker, cid),
-        repo_count=count_repositories(docker, cid),
+        completed_count=completed_count,
+        disk_usage_kb=disk_usage_kb,
+        log_line_count=log_line_count,
+        repo_count=repo_count,
     )
 
 

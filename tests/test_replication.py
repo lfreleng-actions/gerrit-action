@@ -1811,6 +1811,76 @@ class TestTakeSnapshot:
         assert snap.repo_count == 36
         assert snap.timestamp > 0
 
+    @patch("replication.get_log_line_count", return_value=150)
+    @patch("replication.get_disk_usage_kb", return_value=88064)
+    @patch("replication.get_completed_repo_count", return_value=36)
+    @patch("replication.count_repositories", return_value=36)
+    def test_timestamp_taken_after_collection(
+        self, mock_count, mock_completed, mock_disk, mock_log
+    ):
+        """The timestamp records observation, not the start of collection.
+
+        Consumers measure quiet time from this field against the wall
+        clock, so timestamping first credited the collection time as
+        quiet time — letting one slow poll satisfy the stability
+        window and declare replication complete while it was running.
+        """
+        from replication import take_snapshot
+
+        # The last probe to run takes 40 seconds of wall clock.
+        def _slow_probe(*_args, **_kwargs):
+            """Stand in for a sluggish docker exec."""
+            fake_clock[0] += 40
+            return 36
+
+        fake_clock = [1000.0]
+        mock_count.side_effect = _slow_probe
+
+        with patch("replication.time.time", side_effect=lambda: fake_clock[0]):
+            snap = take_snapshot(MagicMock(), "abc123")
+
+        # 1040, not the 1000 that collection started at.
+        assert snap.timestamp == 1040.0
+
+    @patch("replication.get_log_line_count", return_value=150)
+    @patch("replication.get_disk_usage_kb", return_value=88064)
+    @patch("replication.get_completed_repo_count", return_value=36)
+    @patch("replication.count_repositories", return_value=36)
+    def test_slow_collection_does_not_satisfy_window(
+        self, mock_count, mock_completed, mock_disk, mock_log
+    ):
+        """A slow cycle cannot declare stability by itself.
+
+        Two identical snapshots collected back to back, each taking
+        longer than the stability window, must not report stable until
+        the window has passed between their observation times.
+        """
+        from replication import _StabilityTracker, take_snapshot
+
+        fake_clock = [1000.0]
+
+        def _slow_probe(*_args, **_kwargs):
+            """Consume 40 seconds per collection."""
+            fake_clock[0] += 40
+            return 36
+
+        mock_count.side_effect = _slow_probe
+        tracker = _StabilityTracker(window=30)
+
+        with patch("replication.time.time", side_effect=lambda: fake_clock[0]):
+            first = take_snapshot(MagicMock(), "abc123")
+            tracker.update(first)
+            # Immediately after the first snapshot lands, no quiet time
+            # has been observed at all.
+            assert tracker.is_stable(fake_clock[0]) is False
+
+            second = take_snapshot(MagicMock(), "abc123")
+            tracker.update(second)
+            # The state is unchanged and 40s of wall clock has passed
+            # since it was first observed, so now it is stable.
+            assert second.is_same_as(first)
+            assert tracker.is_stable(fake_clock[0]) is True
+
 
 # =========================================================================
 # list_repositories

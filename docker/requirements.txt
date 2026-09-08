@@ -9,5 +9,6 @@
 #     $(pip download --no-deps --dest /tmp gerrit-to-platform==<version> 2>&1 \
 #       | grep -oP 'Saved \K.*')
 #
-gerrit-to-platform==0.3.1 \
-    --hash=sha256:6aab2b9e555f5af4c6e3c096b767f198712ef6799658bdd64354abc50e24d646
+gerrit-to-platform==0.4.0 \
+    --hash=sha256:72bcdc79882901a0bb3f0098bf836279a6f80a883c2c32adc0e3c2b1a0b37e45 \
+    --hash=sha256:9c6c218da6e6c3cba99f6d142e75b927f6b1af283e465e44e9a0c4ba7b63bae5

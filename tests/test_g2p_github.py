@@ -9,6 +9,7 @@ import json
 from typing import Any
 from unittest.mock import MagicMock, patch
 
+from credential_stubs import pem_header
 from g2p_config import (
     G2PConfig,
 )
@@ -1779,7 +1780,7 @@ class TestProvisionOrgConfig:
                 },
             ),
         ]
-        gerrit_info = {"ssh_private_key": "-----BEGIN OPENSSH-----"}
+        gerrit_info = {"ssh_private_key": pem_header()}
         results = provision_org_config(config, audit, gerrit_info)
         # Always-overwrite semantics: every required secret is
         # provisioned regardless of prior audit pass/fail state.
@@ -1819,7 +1820,7 @@ class TestProvisionOrgConfig:
                 },
             ),
         ]
-        gerrit_info = {"ssh_private_key": "-----BEGIN OPENSSH-----"}
+        gerrit_info = {"ssh_private_key": pem_header()}
         provision_org_config(config, audit, gerrit_info)
         mock_prov_secret.assert_called_once()
 

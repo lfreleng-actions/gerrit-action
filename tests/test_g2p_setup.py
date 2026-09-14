@@ -13,6 +13,7 @@ from typing import Any
 from unittest.mock import MagicMock, patch
 
 import pytest
+from credential_stubs import KEY, pem_block, pem_header
 from errors import G2PSetupError
 from g2p_config import (
     DEFAULT_COMMENT_MAPPINGS,
@@ -331,7 +332,7 @@ class TestGenerateSshKeypair:
 
     @patch("g2p_setup.subprocess.run")
     def test_successful_generation(self, mock_run: MagicMock, tmp_path: Path) -> None:
-        private_key_content = "-----BEGIN OPENSSH PRIVATE KEY-----\nkey\n-----END OPENSSH PRIVATE KEY-----"
+        private_key_content = pem_block("key")
         public_key_content = "ssh-ed25519 AAAAC3test gerrit-action-g2p"
 
         def fake_run(cmd: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
@@ -344,7 +345,7 @@ class TestGenerateSshKeypair:
 
         mock_run.side_effect = fake_run
         private, public = generate_ssh_keypair()
-        assert "BEGIN OPENSSH PRIVATE KEY" in private
+        assert pem_header() in private
         assert public.startswith("ssh-ed25519")
 
         # Verify ssh-keygen was called with correct args
@@ -874,7 +875,7 @@ class TestSetupG2pSsh:
         config = G2PConfig(
             enabled=True,
             github_owner="test",
-            ssh_private_key="-----BEGIN OPENSSH PRIVATE KEY-----\nkeydata\n-----END OPENSSH PRIVATE KEY-----",
+            ssh_private_key=pem_block("keydata"),
             github_known_hosts="github.com ssh-ed25519 AAAA",
         )
         with patch("g2p_setup.subprocess.run") as mock_run:
@@ -887,7 +888,7 @@ class TestSetupG2pSsh:
             public_key, private_key = setup_g2p_ssh(docker, CID, config)
 
         assert public_key.startswith("ssh-ed25519")
-        assert "BEGIN OPENSSH PRIVATE KEY" in private_key
+        assert pem_header() in private_key
         docker.cp.assert_called()
 
     def test_auto_generates_keypair(self) -> None:
@@ -900,7 +901,7 @@ class TestSetupG2pSsh:
         )
         with patch("g2p_setup.generate_ssh_keypair") as mock_keygen:
             mock_keygen.return_value = (
-                "-----BEGIN KEY-----\nprivate\n-----END KEY-----",
+                pem_block("private", KEY),
                 "ssh-ed25519 AAAAgenerated gerrit-action-g2p",
             )
             public_key, private_key = setup_g2p_ssh(docker, CID, config)
@@ -1071,7 +1072,7 @@ class TestSetupG2p:
         mock_ini.return_value = G2P_INI_PATH
         mock_repl_remote.return_value = True
         mock_hooks.return_value = ["patchset-created", "comment-added"]
-        mock_ssh.return_value = ("ssh-ed25519 AAAAkey", "-----BEGIN KEY-----")
+        mock_ssh.return_value = ("ssh-ed25519 AAAAkey", pem_header(KEY))
 
         docker = _make_docker_mock()
         config = G2PConfig(

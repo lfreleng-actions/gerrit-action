@@ -503,6 +503,37 @@ jobs:
           # No-cache test completed
           echo "No-cache test completed ✅"
 
+  ### Unit Tests ###
+  # The Python suite under tests/ covers the helper scripts that the
+  # action runs inside the container. It also carries the guard in
+  # tests/test_no_credential_patterns.py, which keeps credential-shaped
+  # literals out of the tree; that guard only prevents anything if CI
+  # actually runs it.
+  unit-tests:
+    name: 'Unit tests'
+    runs-on: 'ubuntu-latest'
+    permissions:
+      contents: read
+    timeout-minutes: 10
+    steps:
+      - name: 'Checkout repository'
+        # yamllint disable-line rule:line-length
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: 'Install uv'
+        # yamllint disable-line rule:line-length
+        uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4  # v10.1.0
+        with:
+          enable-cache: true
+
+      - name: 'Run pytest'
+        shell: bash
+        run: |
+          # Run pytest
+          uv run --extra test pytest tests/ -q
+
   ### Test Summary ###
   test-summary:
     name: 'Test summary'
@@ -514,6 +545,7 @@ jobs:
       - test-persistent
       - test-validation
       - test-no-cache
+      - unit-tests
     if: always()
     permissions:
       contents: read
@@ -535,6 +567,7 @@ jobs:
             echo "| Persistent Container | ${NEEDS_TEST_PERSISTENT_RESULT} |"  # yamllint disable-line rule:line-length
             echo "| Input Validation | ${NEEDS_TEST_VALIDATION_RESULT} |"
             echo "| No Cache | ${NEEDS_TEST_NO_CACHE_RESULT} |"
+            echo "| Unit Tests | ${NEEDS_UNIT_TESTS_RESULT} |"
           } >> "$GITHUB_STEP_SUMMARY"
         env:
           NEEDS_TEST_BASIC_RESULT: ${{ needs.test-basic.result }}
@@ -542,6 +575,7 @@ jobs:
           NEEDS_TEST_PERSISTENT_RESULT: ${{ needs.test-persistent.result }}
           NEEDS_TEST_VALIDATION_RESULT: ${{ needs.test-validation.result }}
           NEEDS_TEST_NO_CACHE_RESULT: ${{ needs.test-no-cache.result }}
+          NEEDS_UNIT_TESTS_RESULT: ${{ needs.unit-tests.result }}
 
       - name: 'Check for failures'
         shell: bash
@@ -551,7 +585,8 @@ jobs:
              [ "${NEEDS_TEST_MULTIPLE_INSTANCES_RESULT}" != "success" ] || \
              [ "${NEEDS_TEST_PERSISTENT_RESULT}" != "success" ] || \
              [ "${NEEDS_TEST_VALIDATION_RESULT}" != "success" ] || \
-             [ "${NEEDS_TEST_NO_CACHE_RESULT}" != "success" ]; then
+             [ "${NEEDS_TEST_NO_CACHE_RESULT}" != "success" ] || \
+             [ "${NEEDS_UNIT_TESTS_RESULT}" != "success" ]; then
             echo "::error::Some tests failed ❌"
             exit 1
           fi
@@ -564,3 +599,4 @@ jobs:
           NEEDS_TEST_PERSISTENT_RESULT: ${{ needs.test-persistent.result }}
           NEEDS_TEST_VALIDATION_RESULT: ${{ needs.test-validation.result }}
           NEEDS_TEST_NO_CACHE_RESULT: ${{ needs.test-no-cache.result }}
+          NEEDS_UNIT_TESTS_RESULT: ${{ needs.unit-tests.result }}

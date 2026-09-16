@@ -647,8 +647,8 @@ ssh -p 29418 admin@localhost gerrit version
 # Clone a repository
 git clone http://localhost:8080/my-project
 
-# With authentication
-git clone http://username:password@localhost:8080/my-project
+# With authentication; git prompts for the Gerrit HTTP password
+git clone http://admin@localhost:8080/my-project
 ```
 
 ## Monitoring Replication
@@ -946,7 +946,7 @@ Pre-encoding JSON (single org):
 ```json
 [
   {"github_org": "modeseven-gerrit-onap",
-   "token": "ghp_DUMMYTOKEN1234567890abcdefABCDEF1234"}
+   "token": "<github-pat>"}
 ]
 ```
 
@@ -954,8 +954,8 @@ Pre-encoding JSON (multiple orgs):
 
 ```json
 [
-  {"github_org": "modeseven-gerrit-onap", "token": "ghp_xxx..."},
-  {"github_org": "modeseven-gerrit-other", "token": "ghp_yyy..."}
+  {"github_org": "modeseven-gerrit-onap", "token": "<github-pat-onap>"},
+  {"github_org": "modeseven-gerrit-other", "token": "<github-pat-other>"}
 ]
 ```
 
@@ -964,7 +964,7 @@ Encode it (whitespace tolerated; single-line or wrapped both work):
 <!-- markdownlint-disable MD013 -->
 
 ```bash
-JSON='[{"github_org":"modeseven-gerrit-onap","token":"ghp_DUMMYTOKEN1234567890abcdefABCDEF1234"}]'
+JSON='[{"github_org":"modeseven-gerrit-onap","token":"<github-pat>"}]'
 printf '%s' "$JSON" | base64
 ```
 
@@ -973,7 +973,7 @@ printf '%s' "$JSON" | base64
 Example resulting value (single line):
 
 ```text
-W3siZ2l0aHViX29yZyI6Im1vZGVzZXZlbi1nZXJyaXQtb25hcCIsInRva2VuIjoiZ2hwX0RVTU1ZVE9LRU4xMjM0NTY3ODkwYWJjZGVmQUJDREVGMTIzNCJ9XQ==
+W3siZ2l0aHViX29yZyI6Im1vZGVzZXZlbi1nZXJyaXQtb25hcCIsInRva2VuIjoiPGdpdGh1Yi1wYXQ+In1d
 ```
 
 Store the encoded string as a repo or org secret (for example

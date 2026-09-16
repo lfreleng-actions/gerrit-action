@@ -1425,11 +1425,11 @@ remerge-gha = merge
 
 # GitHub credentials
 [github.com]
-token = ghp_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+token = <github-pat>
 
 # GitLab credentials (future)
 # [gitlab.com]
-# token = glpat-xxxxxxxxxxxxxxxxxxxx
+# token = <gitlab-pat>
 ```
 
 ## Appendix C — Replication Config G2P Section

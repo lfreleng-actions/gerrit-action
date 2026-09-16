@@ -269,15 +269,15 @@ raw token patterns that GitHub looks for.
 [
   {
     "github_org": "modeseven-gerrit-onap",
-    "token": "ghp_xxxxxxxxxxxxxxxxxxxx"
+    "token": "<github-pat-onap>"
   },
   {
     "github_org": "modeseven-gerrit-lf",
-    "token": "ghp_yyyyyyyyyyyyyyyyyyyy"
+    "token": "<github-pat-lf>"
   },
   {
     "github_org": "modeseven-gerrit-oran",
-    "token": "github_pat_zzzzzzzzzzzzzzzz"
+    "token": "<github-fine-grained-pat-oran>"
   }
 ]
 ```
@@ -297,11 +297,11 @@ cat > org-tokens.json << 'EOF'
 [
   {
     "github_org": "modeseven-gerrit-onap",
-    "token": "ghp_xxxxxxxxxxxxxxxxxxxx"
+    "token": "<github-pat-onap>"
   },
   {
     "github_org": "modeseven-gerrit-lf",
-    "token": "ghp_yyyyyyyyyyyyyyyyyyyy"
+    "token": "<github-pat-lf>"
   }
 ]
 EOF

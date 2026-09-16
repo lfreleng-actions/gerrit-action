@@ -9,6 +9,7 @@ import json
 import logging
 
 import pytest
+from credential_stubs import KEY, pem_header
 from errors import ConfigError
 from g2p_config import (
     DEFAULT_COMMENT_MAPPINGS,
@@ -86,7 +87,7 @@ def full_g2p_env(
     minimal_g2p_env.setenv("G2P_VALIDATION_MODE", "error")
     minimal_g2p_env.setenv("G2P_VALIDATE_WORKFLOWS", "false")
     minimal_g2p_env.setenv("G2P_VALIDATE_REPOS", "ci-management,releng-lftools")
-    minimal_g2p_env.setenv("G2P_SSH_PRIVATE_KEY", "-----BEGIN KEY-----")
+    minimal_g2p_env.setenv("G2P_SSH_PRIVATE_KEY", pem_header(KEY))
     minimal_g2p_env.setenv(
         "G2P_GITHUB_KNOWN_HOSTS",
         "github.com ssh-ed25519 AAAAC3...",
@@ -343,7 +344,7 @@ class TestG2PConfigFromEnvironmentEnabled:
             "ci-management",
             "releng-lftools",
         ]
-        assert cfg.ssh_private_key == "-----BEGIN KEY-----"
+        assert cfg.ssh_private_key == pem_header(KEY)
         assert cfg.github_known_hosts == "github.com ssh-ed25519 AAAAC3..."
 
     def test_name_style_normalised_to_lowercase(

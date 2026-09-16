@@ -16,6 +16,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 from conftest import FIXTURES_DIR
+from credential_stubs import KEY, pem_block
 from g2p_config import (
     DEFAULT_COMMENT_MAPPINGS,
     VALID_HOOKS,
@@ -424,8 +425,7 @@ class TestConfigToContainerSetupFlow:
         config = G2PConfig.from_environment()
 
         mock_keygen.return_value = (
-            "-----BEGIN OPENSSH PRIVATE KEY-----\ntest\n"
-            "-----END OPENSSH PRIVATE KEY-----",
+            pem_block("test"),
             "ssh-ed25519 AAAAtest gerrit-action-g2p",
         )
         mock_host_keys.return_value = "github.com ssh-ed25519 AAAAhostkey"
@@ -460,7 +460,7 @@ class TestConfigToContainerSetupFlow:
 
         with patch("g2p_setup.generate_ssh_keypair") as mock_keygen:
             mock_keygen.return_value = (
-                "-----BEGIN KEY-----\ntest\n-----END KEY-----",
+                pem_block("test", KEY),
                 "ssh-ed25519 AAAAgenerated gerrit-action-g2p",
             )
             result = setup_g2p(config, docker, "container456")
@@ -504,8 +504,7 @@ class TestConfigToContainerSetupFlow:
         _set_minimal_env(clean_g2p_env)
         clean_g2p_env.setenv(
             "G2P_SSH_PRIVATE_KEY",
-            "-----BEGIN OPENSSH PRIVATE KEY-----\nprovided\n"
-            "-----END OPENSSH PRIVATE KEY-----",
+            pem_block("provided"),
         )
         config = G2PConfig.from_environment()
 
@@ -846,7 +845,7 @@ class TestDeferredConfigPattern:
         config = G2PConfig.from_environment()
 
         mock_keygen.return_value = (
-            "-----BEGIN KEY-----\nprivate\n-----END KEY-----",
+            pem_block("private", KEY),
             "ssh-ed25519 AAAAdeferred gerrit-action-g2p",
         )
         mock_host_keys.return_value = "github.com ssh-ed25519 AAAAhostkey"

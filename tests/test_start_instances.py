@@ -33,6 +33,7 @@ from urllib.parse import urlparse
 
 import pytest
 import requests
+from credential_stubs import RSA_PRIVATE_KEY, pem_block
 
 # ---------------------------------------------------------------------------
 # Path setup – ensure scripts and lib are importable
@@ -79,7 +80,7 @@ def _make_config(**overrides: Any) -> ActionConfig:
     """Build an ActionConfig with sensible defaults for testing."""
     defaults: dict[str, Any] = {
         "auth_type": "ssh",
-        "ssh_private_key": "-----BEGIN RSA PRIVATE KEY-----\nfake\n-----END RSA PRIVATE KEY-----",
+        "ssh_private_key": pem_block("fake", RSA_PRIVATE_KEY),
         "ssh_known_hosts": "",
         "http_username": "",
         "http_password": "",

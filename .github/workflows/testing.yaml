@@ -32,12 +32,6 @@ jobs:
       contents: read
     timeout-minutes: 20
     steps:
-      - name: 'Checkout repository'
-        # yamllint disable-line rule:line-length
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
-        with:
-          persist-credentials: false
-
       # Cache Docker layers
       - name: 'Cache Docker layers'
         # yamllint disable-line rule:line-length
@@ -71,7 +65,7 @@ jobs:
       # Test: Single instance without replication
       - name: "Test: Single instance (no sync)"
         id: basic-test
-        uses: ./
+        uses: $/
         with:
           gerrit_setup: |
             [{
@@ -124,12 +118,6 @@ jobs:
       contents: read
     timeout-minutes: 25
     steps:
-      - name: 'Checkout repository'
-        # yamllint disable-line rule:line-length
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
-        with:
-          persist-credentials: false
-
       # Cache Docker layers
       - name: 'Cache Docker layers'
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
@@ -160,7 +148,7 @@ jobs:
       # Test: Multiple instances
       - name: "Test: Multiple instances"
         id: multi-test
-        uses: ./
+        uses: $/
         with:
           gerrit_setup: |
             [
@@ -240,12 +228,6 @@ jobs:
       contents: read
     timeout-minutes: 20
     steps:
-      - name: 'Checkout repository'
-        # yamllint disable-line rule:line-length
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
-        with:
-          persist-credentials: false
-
       # Cache Docker layers
       - name: 'Cache Docker layers'
         # yamllint disable-line rule:line-length
@@ -277,7 +259,7 @@ jobs:
       # Start persistent container
       - name: "Start persistent Gerrit container"
         id: persistent
-        uses: ./
+        uses: $/
         with:
           gerrit_setup: |
             [{
@@ -386,16 +368,10 @@ jobs:
       contents: read
     timeout-minutes: 10
     steps:
-      - name: 'Checkout repository'
-        # yamllint disable-line rule:line-length
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
-        with:
-          persist-credentials: false
-
       # Test: Missing required input
       - name: "Test: Missing gerrit_setup"
         id: missing-setup
-        uses: ./
+        uses: $/
         continue-on-error: true
         with:
           ssh_private_key: "fake-key"
@@ -412,7 +388,7 @@ jobs:
       # Test: Invalid JSON
       - name: "Test: Invalid JSON format"
         id: invalid-json
-        uses: ./
+        uses: $/
         continue-on-error: true
         with:
           gerrit_setup: "not valid json"
@@ -429,7 +405,7 @@ jobs:
       # Test: Invalid auth type
       - name: "Test: Invalid auth type"
         id: invalid-auth
-        uses: ./
+        uses: $/
         continue-on-error: true
         with:
           gerrit_setup: '[{"slug": "test", "gerrit": "example.org"}]'
@@ -457,12 +433,6 @@ jobs:
       contents: read
     timeout-minutes: 25
     steps:
-      - name: 'Checkout repository'
-        # yamllint disable-line rule:line-length
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
-        with:
-          persist-credentials: false
-
       # Generate ephemeral SSH key for testing
       - name: 'Generate ephemeral SSH key'
         id: ssh-key
@@ -482,7 +452,7 @@ jobs:
 
       # Test without cache
       - name: "Test: No caching"
-        uses: ./
+        uses: $/
         with:
           gerrit_setup: |
             [{

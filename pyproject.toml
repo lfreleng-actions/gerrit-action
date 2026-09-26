@@ -26,6 +26,7 @@ classifiers = [
 dependencies = [
     "PyYAML>=6.0",
     "requests>=2.34.2",
+    "urllib3>=1.26",
 ]
 
 [project.optional-dependencies]
@@ -144,5 +145,6 @@ disallow_untyped_defs = false
 
 [dependency-groups]
 dev = [
+    "gerrit-action[test]",
     "types-requests>=2.33.0.20260712",
 ]

@@ -1,12 +1,11 @@
 {
   "extraPaths": [
+    "scripts",
     "scripts/lib",
     "tests"
   ],
   "pythonVersion": "3.11",
   "typeCheckingMode": "standard",
-  "venvPath": ".",
-  "venv": ".venv",
   "reportMissingImports": "error",
   "reportImplicitStringConcatenation": false,
   "exclude": [

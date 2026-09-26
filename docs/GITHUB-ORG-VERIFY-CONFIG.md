@@ -317,6 +317,7 @@ base64 < org-tokens.json
 import base64
 import json
 
+
 def decode_org_tokens(
     b64_value: str,
 ) -> dict[str, str]:
@@ -326,10 +327,7 @@ def decode_org_tokens(
     """
     decoded = base64.b64decode(b64_value).decode("utf-8")
     entries = json.loads(decoded)
-    return {
-        entry["github_org"]: entry["token"]
-        for entry in entries
-    }
+    return {entry["github_org"]: entry["token"] for entry in entries}
 ```
 
 **Design rationale:**
@@ -700,6 +698,7 @@ available on the runner:
 ```python
 import subprocess
 
+
 def encrypt_secret_openssl(
     public_key_b64: str,
     secret_value: str,
@@ -758,14 +757,10 @@ audit query, then acts accordingly.
 
 ```python
 # Required secrets at the org level
-REQUIRED_ORG_SECRETS: tuple[str, ...] = (
-    "GERRIT_SSH_PRIVKEY",
-)
+REQUIRED_ORG_SECRETS: tuple[str, ...] = ("GERRIT_SSH_PRIVKEY",)
 
 # Optional secrets (warn if absent, do not error)
-OPTIONAL_ORG_SECRETS: tuple[str, ...] = (
-    "GERRIT_SSH_PRIVKEY_G2G",
-)
+OPTIONAL_ORG_SECRETS: tuple[str, ...] = ("GERRIT_SSH_PRIVKEY_G2G",)
 
 
 def check_org_secrets(
@@ -863,19 +858,11 @@ def check_github_config(config: G2PConfig) -> list:
 
     # -- Check 8: Org secrets (NEW) -----------------
     if config.org_setup != "skip":
-        results.append(
-            check_org_secrets(
-                config.github_token, config.github_owner
-            )
-        )
+        results.append(check_org_secrets(config.github_token, config.github_owner))
 
     # -- Check 9: Org variables (NEW) ---------------
     if config.org_setup != "skip":
-        results.append(
-            check_org_variables(
-                config.github_token, config.github_owner
-            )
-        )
+        results.append(check_org_variables(config.github_token, config.github_owner))
 
     # -- Check 10: Workflow inputs (NEW) -------------
     # Run for each discovered workflow from checks 5-6
@@ -1002,8 +989,7 @@ def resolve_org_token(
         if token:
             return token
         logger.warning(
-            "No entry for '%s' in g2p_org_token_map; "
-            "falling back to g2p_github_token",
+            "No entry for '%s' in g2p_org_token_map; falling back to g2p_github_token",
             config.github_owner,
         )
     return config.github_token

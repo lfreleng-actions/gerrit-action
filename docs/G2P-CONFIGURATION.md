@@ -525,14 +525,14 @@ class G2PConfig:
     enabled: bool
     github_token: str
     github_owner: str
-    remote_name_style: str       # dash, underscore, slash
-    remote_url: str              # auto-generated if empty
+    remote_name_style: str  # dash, underscore, slash
+    remote_url: str  # auto-generated if empty
     remote_auth_group: str
-    comment_mappings: dict       # keyword → filter
-    hooks: list                  # list of hook names
-    validation_mode: str         # error, warn, skip
+    comment_mappings: dict  # keyword → filter
+    hooks: list  # list of hook names
+    validation_mode: str  # error, warn, skip
     validate_workflows: bool
-    validate_repos: list         # list of repo names
+    validate_repos: list  # list of repo names
     ssh_private_key: str
     github_known_hosts: str
 ```
@@ -796,18 +796,12 @@ class G2PConfig:
     remote_url: str = ""
     remote_auth_group: str = "GitHub Replication"
     comment_mappings: dict = field(
-        default_factory=lambda: dict(
-            DEFAULT_COMMENT_MAPPINGS
-        )
+        default_factory=lambda: dict(DEFAULT_COMMENT_MAPPINGS)
     )
-    hooks: list = field(
-        default_factory=lambda: list(VALID_HOOKS)
-    )
+    hooks: list = field(default_factory=lambda: list(VALID_HOOKS))
     validation_mode: str = "warn"
     validate_workflows: bool = True
-    validate_repos: list = field(
-        default_factory=list
-    )
+    validate_repos: list = field(default_factory=list)
     ssh_private_key: str = ""
     github_known_hosts: str = ""
 
@@ -826,10 +820,7 @@ class G2PConfig:
         if self.remote_url:
             return self.remote_url
         if self.github_owner:
-            return (
-                f"git@github.com:{self.github_owner}"
-                "/${name}.git"
-            )
+            return f"git@github.com:{self.github_owner}/${{name}}.git"
         return ""
 ```
 
@@ -861,9 +852,7 @@ def main() -> int:
         errors = config.check()
         if errors:
             for err in errors:
-                log.error(
-                    "G2P config error: %s", err
-                )
+                log.error("G2P config error: %s", err)
             return 1
 
         # Phase 1: GitHub checks
@@ -879,9 +868,7 @@ def main() -> int:
         return 0
 
     except Exception as e:
-        log.error(
-            "G2P configuration failed: %s", e
-        )
+        log.error("G2P configuration failed: %s", e)
         return 2
 
 
@@ -931,16 +918,12 @@ def check_token(token: str) -> G2PCheckResult:
     ...
 
 
-def check_org_access(
-    token: str, owner: str
-) -> G2PCheckResult:
+def check_org_access(token: str, owner: str) -> G2PCheckResult:
     """Check token can access the target org."""
     ...
 
 
-def check_magic_repo(
-    token: str, owner: str
-) -> G2PCheckResult:
+def check_magic_repo(token: str, owner: str) -> G2PCheckResult:
     """Check .github repo exists in org."""
     ...
 
@@ -962,20 +945,17 @@ def check_github_config(
     results = []
 
     if not config.github_token:
-        results.append(G2PCheckResult(
-            check_name="token_provided",
-            passed=False,
-            message=(
-                "No GitHub token provided; g2p "
-                "cannot dispatch workflows"
-            ),
-            severity="warning",
-        ))
+        results.append(
+            G2PCheckResult(
+                check_name="token_provided",
+                passed=False,
+                message=("No GitHub token provided; g2p cannot dispatch workflows"),
+                severity="warning",
+            )
+        )
         return results  # Cannot check further
 
-    results.append(
-        check_token(config.github_token)
-    )
+    results.append(check_token(config.github_token))
     results.append(
         check_org_access(
             config.github_token,
@@ -1030,10 +1010,14 @@ def generate_ssh_keypair() -> tuple[str, str]:
     result = subprocess.run(
         [
             "ssh-keygen",
-            "-t", "ed25519",
-            "-f", "/tmp/g2p_key",
-            "-N", "",
-            "-C", "gerrit-action-g2p",
+            "-t",
+            "ed25519",
+            "-f",
+            "/tmp/g2p_key",
+            "-N",
+            "",
+            "-C",
+            "gerrit-action-g2p",
         ],
         capture_output=True,
         text=True,
@@ -1058,7 +1042,8 @@ def fetch_github_host_keys() -> str:
     result = subprocess.run(
         [
             "ssh-keyscan",
-            "-t", "ed25519,rsa",
+            "-t",
+            "ed25519,rsa",
             "github.com",
         ],
         capture_output=True,
@@ -1140,11 +1125,14 @@ check_github_config()  → G2PCheckResult list
 class G2PError(GerritActionError):
     """Base for G2P operations."""
 
+
 class G2PConfigError(G2PError):
     """G2P configuration has problems."""
 
+
 class G2PCheckError(G2PError):
     """GitHub-side check failed in error mode."""
+
 
 class G2PSetupError(G2PError):
     """Failed to set up G2P inside the container."""

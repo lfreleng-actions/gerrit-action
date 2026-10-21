@@ -59,8 +59,8 @@ RUN set -eux; \
 #   3. Paste the hex digest into UV_CHECKSUM below
 #
 # renovate: datasource=github-releases depName=astral-sh/uv
-ARG UV_VERSION=0.10.4
-ARG UV_CHECKSUM=6b52a47358deea1c5e173278bf46b2b489747a59ae31f2a4362ed5c6c1c269f7
+ARG UV_VERSION=0.13.4
+ARG UV_CHECKSUM=2b428396f12572d4429cf210ca234dd599a33b3af0958a4d5ed569d63e3f344f
 
 RUN set -eux; \
     UV_TARBALL="uv-x86_64-unknown-linux-gnu.tar.gz"; \

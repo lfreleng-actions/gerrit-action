@@ -37,7 +37,14 @@ LABEL org.opencontainers.image.licenses="Apache-2.0"
 # Install dependencies as root
 USER root
 
-# Install Python and required packages
+# Install Python and required packages. The same layer removes
+# emSign ECC Root CA - G3 (GHSA-6q48-6c7w-9gw2, compromised
+# intermediate keys) from the JDK trust store: Temurin drops it from
+# 21.0.13+9, which no Gerrit image bundles yet. The delete is
+# conditional so a base image that already lacks the root still
+# builds; the final check is what the build guarantees. The listing
+# is captured before it is searched so a failing keytool fails the
+# build under set -e instead of reading as "root absent".
 RUN set -eux; \
     apt-get update; \
     apt-get install -y --no-install-recommends \
@@ -46,7 +53,16 @@ RUN set -eux; \
         python3 \
         python3-venv; \
     apt-get clean; \
-    rm -rf /var/lib/apt/lists/*
+    rm -rf /var/lib/apt/lists/*; \
+    alias='cn_emsign_ecc_root_ca__g3,o_emudhra_technologies_limited,ou_emsign_pki,c_in [jdk]'; \
+    if keytool -list -cacerts -storepass changeit -alias "$alias" >/dev/null 2>&1; then \
+        keytool -delete -cacerts -storepass changeit -alias "$alias"; \
+    fi; \
+    listing=$(keytool -list -cacerts -storepass changeit); \
+    if printf '%s\n' "$listing" | grep -qi 'emsign_ecc_root_ca__g3'; then \
+        echo 'emSign ECC Root CA - G3 is still in the JDK trust store' >&2; \
+        exit 1; \
+    fi
 
 # --- uv: direct binary install with SHA-256 integrity verification ----------
 # Version and checksum are kept in sync by the pre-commit hook

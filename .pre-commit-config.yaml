@@ -40,9 +40,14 @@ repos:
       - id: check-added-large-files
       - id: check-ast
       - id: check-json
+        # .zed/settings.json is JSONC (comments are allowed)
+        exclude: ^\.zed/
       - id: check-merge-conflict
       - id: check-xml
       - id: check-yaml
+        # Helm templates are Go-templated, not YAML; helm lint and
+        # helm template validate them in CI.
+        exclude: ^K8S/charts/[^/]+/templates/
       - id: debug-statements
       - id: end-of-file-fixer
       - id: requirements-txt-fixer
@@ -72,6 +77,9 @@ repos:
     hooks:
       - id: yamllint
         types: [yaml]
+        # Helm templates are Go-templated, not YAML; helm lint and
+        # helm template validate them in CI.
+        exclude: ^K8S/charts/[^/]+/templates/
 
   - repo: https://github.com/astral-sh/ruff-pre-commit
     rev: f368fb366ff7f2f808dd324b83a6d32267799e19  # frozen: v0.17.2
@@ -93,7 +101,16 @@ repos:
     hooks:
       - id: write-good
         files: "\\.(rst|md|markdown|mdown|mkdn)$"
-        exclude: "^(README\\.md|docs/G2P-CONFIGURATION\\.md|docs/GITHUB-ORG-VERIFY-CONFIG\\.md|docs/G2P-LOGGING-IMPROVEMENTS\\.md)$"
+        # Long-form K8S design and runbook prose uses tutorial voice
+        exclude: >-
+          (?x)^(
+            README\.md|
+            docs/G2P-CONFIGURATION\.md|
+            docs/GITHUB-ORG-VERIFY-CONFIG\.md|
+            docs/G2P-LOGGING-IMPROVEMENTS\.md|
+            K8S/docs/.*|
+            K8S/charts/gerrit/README\.md
+          )$
 
   - repo: https://github.com/shellcheck-py/shellcheck-py
     rev: a6564f5d57444e123433a5c9af733e3975c77229  # frozen: v0.11.0.1-1
@@ -105,6 +122,14 @@ repos:
     hooks:
       - id: markdownlint
         args: ["--fix"]
+        # Long-form K8S design and runbook prose uses wide tables
+        exclude: ^(K8S/docs/|K8S/charts/gerrit/README\.md$)
+
+  - repo: https://github.com/AleksaC/hadolint-py
+    rev: 6e7504451511eaeb62a3e7f14d63b0296cbf86eb  # frozen: v2.15.1
+    hooks:
+      - id: hadolint
+        files: '(?i)(^|/)Dockerfile($|\.)'
 
   - repo: https://github.com/fsfe/reuse-tool
     rev: 9fabf9eb815a57aac116b435e8346c200cdb8604  # frozen: v6.2.0

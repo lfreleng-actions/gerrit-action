@@ -1,0 +1,18 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: 2026 The Linux Foundation
+//
+// Zed project settings (JSONC: comments are allowed).
+//
+// Helm chart templates under K8S/charts/*/templates/ are Go templates
+// that render to YAML, not YAML themselves. Mapping them to the Helm
+// language stops the editor's YAML language server from reporting
+// parse errors on template directives such as {{- if ... }}.
+{
+  "file_types": {
+    "Helm": [
+      "**/charts/*/templates/**/*.yaml",
+      "**/charts/*/templates/**/*.yml",
+      "**/charts/*/templates/**/*.tpl"
+    ]
+  }
+}

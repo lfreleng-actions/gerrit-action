@@ -1,0 +1,20 @@
+---
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: 2026 The Linux Foundation
+
+# Hadolint configuration for the Dockerfile linter pre-commit hook.
+# Only errors fail the hook; warnings stay advisory, as in sigul.
+failure-threshold: error
+
+ignored:
+  # Debian/Ubuntu package versions in the base image rotate with
+  # security updates; pinning them breaks rebuilds. The base image tag
+  # (GERRIT_VERSION) is what pins the userland.
+  - DL3008
+  # The upstream Gerrit image defines the named "gerrit" user; its
+  # numeric UID is the base image's concern, not this Dockerfile's.
+  - DL3066
+  # The piped RUN steps run under "set -eux" and end in the command
+  # whose status matters (sha256sum -c, grep -q), so pipefail would
+  # not change their outcome.
+  - DL4006

@@ -1014,6 +1014,52 @@ the string **github** (case-insensitive) for detection to succeed. The
 how Gerrit project names (e.g. `foo/bar`) are converted to GitHub
 repository names (e.g. `foo-bar`).
 
+## Exporting a Gerrit Site
+
+`scripts/gerrit-site-export.py` copies an existing Gerrit site into the
+archive layout the Helm chart's import Job and backup CronJob consume:
+`<out>/site` (the site minus `cache`, `index`, `logs`, `tmp`, `bin` and
+`.gerritcodereview/tmp`), `<out>/git` (the bare repositories under
+`gerrit.basePath`) and `<out>/manifest.json`. It is a single file that
+needs only Python 3.8 or newer and its standard library, plus `rsync`
+and `git`, so it runs with the `python3` an existing Gerrit host
+already has. SSH host keys need `ssh-keygen`; `--pack` needs `zstd`,
+and `age`, `gpg` or `aws` matter only when you ask for encryption or
+upload. The archives are readable by their owner only. The tool does
+not follow symlinks inside the repository store: a linked repository
+or directory of repositories stops the run before anything is written,
+naming each link, so replace it with the directory it points to.
+`gerrit.basePath` itself may be a symlink; the tool exports the
+directory it resolves to.
+
+`final` refuses to run while a Gerrit daemon serves the site, judged
+from `logs/gerrit.pid` and `/proc`, or when it cannot tell, unless you
+pass `--i-stopped-writes`. A `/proc` that hides pid 1, as `hidepid`
+does from users other than root and its `gid` group, counts as unable
+to tell. So does a Gerrit daemon in another root directory or mount
+namespace, such as a container or chroot, or one whose namespace the
+tool cannot read, such as another user's process when the tool does
+not run as root: its `-d` path names a directory in its own view,
+which the tool does not map onto the host. Each run removes the
+previous manifest and archives first and writes the new manifest
+last, so a directory with a `manifest.json` holds a complete export.
+`--upload` does the same at the S3 prefix: it deletes the old
+`manifest.json` there before sending the archives, so its credentials
+need `s3:DeleteObject` as well as `s3:PutObject`.
+
+```bash
+# Pre-copy while Gerrit runs; re-run as often as you like
+python3 scripts/gerrit-site-export.py seed --site /var/gerrit --out /backup/gerrit
+
+# After stopping Gerrit: last copy, full manifest and tar.zst archives
+python3 scripts/gerrit-site-export.py final --site /var/gerrit \
+  --out /backup/gerrit --pack
+```
+
+Run `python3 scripts/gerrit-site-export.py --help` for every option.
+The chart README covers the import side: how the import Job reads this
+archive into a new deployment.
+
 ## Advanced Configuration
 
 ### Custom Gerrit Configuration

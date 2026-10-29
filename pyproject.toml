@@ -95,6 +95,13 @@ fail_under = 70
 target-version = "py310"
 line-length = 88
 
+# The site export tool runs with whatever python3 an existing Gerrit
+# host provides, and CI runs its tests under that floor too, so keep
+# the UP rules from rewriting either file to newer syntax.
+[tool.ruff.per-file-target-version]
+"scripts/gerrit-site-export.py" = "py38"
+"tests/test_site_export.py" = "py38"
+
 [tool.ruff.lint]
 select = [
     "E",     # pycodestyle errors

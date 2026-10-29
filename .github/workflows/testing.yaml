@@ -256,6 +256,25 @@ jobs:
             echo "EOF"
           } >> "$GITHUB_OUTPUT"
 
+      # The action's steps start in the workspace. Plant modules there
+      # that its inline Python must not import; each one records its
+      # name and exits non-zero.
+      - name: 'Plant modules in the workspace'
+        shell: bash
+        run: |
+          # Plant modules in the workspace
+          cd "$GITHUB_WORKSPACE"
+          mkdir -p pip nacl
+          for f in pip/__init__ pip/__main__ nacl/__init__ nacl/public \
+            json pathlib sitecustomize; do
+            cat > "$f.py" <<'EOF'
+          import os, sys
+          with open(os.path.join(os.environ['RUNNER_TEMP'], 'planted-ran'), 'a') as fh:
+              fh.write(__name__ + '\n')
+          sys.exit(97)
+          EOF
+          done
+
       # Start persistent container
       - name: "Start persistent Gerrit container"
         id: persistent
@@ -275,6 +294,19 @@ jobs:
           skip_plugin_install: true
           enable_cache: true
           cache_key_suffix: '-persist'
+
+      - name: 'Check no workspace module was imported'
+        shell: bash
+        run: |
+          # Check no workspace module was imported
+          if [ -e "$RUNNER_TEMP/planted-ran" ]; then
+            echo "Error: the action imported workspace modules ❌"
+            cat "$RUNNER_TEMP/planted-ran"
+            exit 1
+          fi
+          cd "$GITHUB_WORKSPACE"
+          rm -rf pip nacl json.py pathlib.py sitecustomize.py
+          echo "No workspace module was imported ✅"
 
       # Verify container persists
       - name: 'Verify container still running'

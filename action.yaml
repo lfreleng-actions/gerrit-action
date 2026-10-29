@@ -923,6 +923,8 @@ runs:
         inputs.g2p_enable == 'true' &&
         inputs.g2p_org_setup == 'provision'
       shell: bash
+      env:
+        ACTION_PATH: ${{ github.action_path }}
       run: |
         # Install PyNaCl for org secret provisioning.
         #
@@ -941,7 +943,14 @@ runs:
         #   ships modern manylinux wheels for the cpython versions
         #   GitHub runners ship today; older releases would force
         #   a slow source build of libsodium on each run.
+        #
+        # Run from the action's own directory: -m and -c put the
+        # working directory first on sys.path, and the default one
+        # is the caller's workspace, whose files would be imported
+        # in place of pip and nacl.  -I would avoid that too, but it
+        # hides the user site this step installs into and checks.
         set -euo pipefail
+        cd "$ACTION_PATH"
         echo "Installing PyNaCl (user site)…"
         python3 -m pip install --user --upgrade 'PyNaCl>=1.5,<2'
         python3 -c "import nacl.public; print('PyNaCl OK')"
@@ -1006,7 +1015,10 @@ runs:
       shell: bash
       run: |
         # Containers will continue/persist (Python)
-        python3 - <<'PY'
+        # -I keeps the working directory (the caller's workspace)
+        # off sys.path, so its files cannot stand in for json or
+        # pathlib; the program reads only absolute paths from env.
+        python3 -I - <<'PY'
         import json, os, pathlib, sys
 
         summary = os.environ.get('GITHUB_STEP_SUMMARY', '')

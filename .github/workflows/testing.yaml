@@ -504,6 +504,37 @@ jobs:
           # Run pytest
           uv run --extra test pytest tests/ -q
 
+  ### Site Export Tool on Python 3.8 ###
+  # scripts/gerrit-site-export.py runs with whatever python3 an existing
+  # Gerrit host provides, so its tests also run under the oldest Python
+  # it supports. The project itself needs a newer one, so this leg runs
+  # outside the project with only pytest installed.
+  site-export-py38:
+    name: 'Site export tool (Python 3.8)'
+    runs-on: 'ubuntu-latest'
+    permissions:
+      contents: read
+    timeout-minutes: 10
+    steps:
+      - name: 'Checkout repository'
+        # yamllint disable-line rule:line-length
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: 'Install uv'
+        # yamllint disable-line rule:line-length
+        uses: astral-sh/setup-uv@18d369b23da25a81e9458561248e1aafff6a70fa  # v10.3.1
+        with:
+          enable-cache: true
+
+      - name: 'Run the site export tests under Python 3.8'
+        shell: bash
+        run: |
+          # Run the site export tests under Python 3.8
+          uv run --no-project --python 3.8 --with pytest==8.3.5 \
+            pytest tests/test_site_export.py
+
   ### Test Summary ###
   test-summary:
     name: 'Test summary'
@@ -516,6 +547,7 @@ jobs:
       - test-validation
       - test-no-cache
       - unit-tests
+      - site-export-py38
     if: always()
     permissions:
       contents: read
@@ -538,6 +570,7 @@ jobs:
             echo "| Input Validation | ${NEEDS_TEST_VALIDATION_RESULT} |"
             echo "| No Cache | ${NEEDS_TEST_NO_CACHE_RESULT} |"
             echo "| Unit Tests | ${NEEDS_UNIT_TESTS_RESULT} |"
+            echo "| Site Export (Python 3.8) | ${NEEDS_SITE_EXPORT_PY38_RESULT} |"
           } >> "$GITHUB_STEP_SUMMARY"
         env:
           NEEDS_TEST_BASIC_RESULT: ${{ needs.test-basic.result }}
@@ -546,6 +579,7 @@ jobs:
           NEEDS_TEST_VALIDATION_RESULT: ${{ needs.test-validation.result }}
           NEEDS_TEST_NO_CACHE_RESULT: ${{ needs.test-no-cache.result }}
           NEEDS_UNIT_TESTS_RESULT: ${{ needs.unit-tests.result }}
+          NEEDS_SITE_EXPORT_PY38_RESULT: ${{ needs.site-export-py38.result }}
 
       - name: 'Check for failures'
         shell: bash
@@ -556,7 +590,8 @@ jobs:
              [ "${NEEDS_TEST_PERSISTENT_RESULT}" != "success" ] || \
              [ "${NEEDS_TEST_VALIDATION_RESULT}" != "success" ] || \
              [ "${NEEDS_TEST_NO_CACHE_RESULT}" != "success" ] || \
-             [ "${NEEDS_UNIT_TESTS_RESULT}" != "success" ]; then
+             [ "${NEEDS_UNIT_TESTS_RESULT}" != "success" ] || \
+             [ "${NEEDS_SITE_EXPORT_PY38_RESULT}" != "success" ]; then
             echo "::error::Some tests failed ❌"
             exit 1
           fi
@@ -570,3 +605,4 @@ jobs:
           NEEDS_TEST_VALIDATION_RESULT: ${{ needs.test-validation.result }}
           NEEDS_TEST_NO_CACHE_RESULT: ${{ needs.test-no-cache.result }}
           NEEDS_UNIT_TESTS_RESULT: ${{ needs.unit-tests.result }}
+          NEEDS_SITE_EXPORT_PY38_RESULT: ${{ needs.site-export-py38.result }}

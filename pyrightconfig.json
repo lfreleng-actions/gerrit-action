@@ -8,6 +8,16 @@
   "typeCheckingMode": "standard",
   "reportMissingImports": "error",
   "reportImplicitStringConcatenation": false,
+  "executionEnvironments": [
+    {
+      "root": "scripts/gerrit-site-export.py",
+      "pythonVersion": "3.8"
+    },
+    {
+      "root": "tests/test_site_export.py",
+      "pythonVersion": "3.8"
+    }
+  ],
   "exclude": [
     "**/__pycache__",
     ".venv",

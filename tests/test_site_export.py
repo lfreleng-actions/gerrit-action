@@ -51,13 +51,10 @@ MNT_NS = "mnt:[4026531841]"
 # Stands in for zstd: passes data through and accepts any archive.
 FAKE_ZSTD = 'if [ "$1" = -tq ]; then exit 0; fi; cat'
 
-pytestmark = [
-    pytest.mark.skipif(
-        not (shutil.which("rsync") and shutil.which("git")),
-        reason="the export needs rsync and git",
-    ),
-    pytest.mark.xfail(strict=True, reason="gerrit-site-export.py not added yet"),
-]
+pytestmark = pytest.mark.skipif(
+    not (shutil.which("rsync") and shutil.which("git")),
+    reason="the export needs rsync and git",
+)
 needs_zstd = pytest.mark.skipif(not shutil.which("zstd"), reason="packing needs zstd")
 needs_proc = pytest.mark.skipif(not HAS_PROC, reason="needs a Linux /proc")
 

@@ -1,0 +1,32 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: 2026 The Linux Foundation
+
+# Local smoke overlay for kind or Docker Desktop. Load an image built
+# from this repository's Dockerfile first, for example:
+#   docker build -t gerrit-local:dev .
+#   kind load docker-image gerrit-local:dev
+
+image:
+  repository: gerrit-local
+  tag: dev
+  pullPolicy: Never
+
+gerrit:
+  host: localhost:8080
+  webScheme: http
+  listenScheme: http
+
+persistence:
+  size: 2Gi
+  volumePermissions:
+    enabled: true
+
+resources:
+  requests:
+    cpu: 250m
+    memory: 1Gi
+  limits:
+    memory: 2Gi
+
+ssh:
+  advertisedAddress: localhost:29418

@@ -1,0 +1,16 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: 2026 The Linux Foundation
+
+apiVersion: v2
+name: gerrit
+description: Gerrit Code Review primary, one per release
+type: application
+# Placeholder; the release pipeline sets the published chart version
+version: 0.1.0
+appVersion: "3.13.1"
+home: https://github.com/lfreleng-actions/gerrit-docker-k8s
+sources:
+  - https://github.com/lfreleng-actions/gerrit-docker-k8s
+keywords:
+  - gerrit
+  - code-review

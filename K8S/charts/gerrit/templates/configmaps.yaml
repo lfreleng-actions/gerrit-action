@@ -1,0 +1,33 @@
+{{/*
+SPDX-License-Identifier: Apache-2.0
+SPDX-FileCopyrightText: 2026 The Linux Foundation
+*/}}
+{{- $fullname := include "gerrit.fullname" . }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ $fullname }}-scripts
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "gerrit.labels" . | nindent 4 }}
+data:
+  {{- (.Files.Glob "files/scripts/*.sh").AsConfig | nindent 2 }}
+---
+# gerrit.config fragment; site-init.sh writes each value with git config
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ $fullname }}-config
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "gerrit.labels" . | nindent 4 }}
+data:
+  GERRIT_CANONICAL_WEB_URL: {{ include "gerrit.canonicalWebUrl" . | quote }}
+  GERRIT_LISTEN_URL: {{ include "gerrit.listenUrl" . | quote }}
+  GERRIT_SSHD_LISTEN_ADDRESS: "*:29418"
+  GERRIT_SSHD_ADVERTISED_ADDRESS: {{ include "gerrit.sshAdvertisedAddress" . | quote }}
+  GERRIT_AUTH_TYPE: {{ .Values.gerrit.auth | quote }}
+  GERRIT_JAVA_OPTIONS: {{ include "gerrit.javaOptions" . | quote }}
+  GERRIT_CATALOGUE: {{ .Values.pluginCatalogue.path | quote }}
+  GERRIT_PLUGINS: {{ join " " .Values.pluginCatalogue.plugins | quote }}
+  GERRIT_LIBS: {{ join " " .Values.pluginCatalogue.libs | quote }}

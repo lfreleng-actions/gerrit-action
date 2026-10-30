@@ -567,6 +567,226 @@ jobs:
           uv run --no-project --python 3.8 --with pytest==8.3.5 \
             pytest tests/test_site_export.py
 
+  ### Helm Chart Smoke Test ###
+  # Lints and renders K8S/charts/gerrit, then installs it on a kind
+  # cluster with an image built from this checkout and checks the site
+  # with verify-site.py.
+  #
+  # The install uses values-local-smoke.yaml, which enables the root
+  # volume-permissions init container because kind's local-path
+  # provisioner ignores fsGroup. The smoke namespace therefore carries
+  # no restricted Pod Security label, and the default restricted,
+  # fsGroup-only path is not exercised here.
+  chart-smoke:
+    name: 'Helm chart smoke test'
+    runs-on: 'ubuntu-latest'
+    permissions:
+      contents: read
+    timeout-minutes: 45
+    env:
+      CHART: K8S/charts/gerrit
+      SMOKE_IMAGE: gerrit-local
+      SMOKE_TAG: smoke
+      SMOKE_NAMESPACE: gerrit-smoke
+    steps:
+      # Harden the runner used by this workflow
+      # yamllint disable-line rule:line-length
+      - uses: step-security/harden-runner@46b06cea07f9e64621fdf066ba77ac6915163d43 # v2.22.3
+        with:
+          egress-policy: 'audit'
+
+      - name: 'Checkout repository'
+        # yamllint disable-line rule:line-length
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: 'Install Helm'
+        # yamllint disable-line rule:line-length
+        uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
+        with:
+          version: 'v3.22.1'
+
+      - name: 'Lint the chart'
+        shell: bash
+        run: |
+          # Lint the chart
+          set -euo pipefail
+          shopt -s nullglob
+          helm lint "$CHART"
+          helm lint "$CHART" -f "$CHART/values-local-smoke.yaml"
+          examples=("$CHART"/examples/*.yaml)
+          if [ "${#examples[@]}" -eq 0 ]; then
+            echo "::error::No values files under $CHART/examples ❌"
+            exit 1
+          fi
+          for f in "${examples[@]}"; do
+            echo "Linting with $f"
+            helm lint "$CHART" -f "$f"
+          done
+
+      - name: 'Install uv'
+        # yamllint disable-line rule:line-length
+        uses: astral-sh/setup-uv@18d369b23da25a81e9458561248e1aafff6a70fa  # v10.3.1
+        with:
+          enable-cache: true
+
+      # scripts/lib/chart_digests.py parses the rendered manifests as
+      # YAML and requires every container, init container and ephemeral
+      # container image in every pod spec to end in @<digest>
+      - name: 'Render the chart and check image digests'
+        shell: bash
+        run: |
+          # Render the chart and check image digests
+          set -euo pipefail
+          shopt -s nullglob
+          out="$RUNNER_TEMP/rendered"
+          mkdir -p "$out"
+          # Fake, well-formed digest; nothing pulls it
+          digest="sha256:$(printf 'chart-smoke' | sha256sum | cut -d' ' -f1)"
+
+          check_digest() {
+            uv run --no-dev python scripts/lib/chart_digests.py \
+              --digest "$digest" "$1"
+          }
+
+          for f in "$CHART/values-local-smoke.yaml" "$CHART"/examples/*.yaml; do
+            name=$(basename "$f" .yaml)
+            echo "Rendering with $f"
+            helm template gerrit "$CHART" --namespace "$SMOKE_NAMESPACE" \
+              -f "$f" > "$out/$name.yaml"
+            helm template gerrit "$CHART" --namespace "$SMOKE_NAMESPACE" \
+              -f "$f" --set "image.digest=$digest" \
+              > "$out/$name-digest.yaml"
+            check_digest "$out/$name-digest.yaml"
+            # Guard the guard: the undigested render must fail it with
+            # a finding (exit 1), not a parse or usage error (exit 2)
+            rc=0
+            check_digest "$out/$name.yaml" >/dev/null || rc=$?
+            if [ "$rc" -ne 1 ]; then
+              echo "::error::Digest check gave $rc on an undigested render ❌"
+              exit 1
+            fi
+          done
+          echo "Every render carries the image digest when it is set ✅"
+
+      # Guards the lint steps against passing silently: a chart copy
+      # with a broken template must fail both lint and render
+      - name: 'Check a broken template fails lint'
+        shell: bash
+        run: |
+          # Check a broken template fails lint
+          set -euo pipefail
+          broken="$RUNNER_TEMP/broken-chart"
+          rm -rf "$broken"
+          cp -R "$CHART" "$broken"
+          printf '%s\n' '{{- if .Values.gerrit.host }}' 'kind: Broken' \
+            > "$broken/templates/broken.yaml"
+          if helm lint "$broken" >/dev/null 2>&1; then
+            echo "::error::helm lint passed a broken template ❌"
+            exit 1
+          fi
+          if helm template gerrit "$broken" >/dev/null 2>&1; then
+            echo "::error::helm template rendered a broken template ❌"
+            exit 1
+          fi
+          echo "A broken template fails lint and render ✅"
+
+      - name: 'Cache Docker layers'
+        # yamllint disable-line rule:line-length
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: /tmp/.buildx-cache
+          # yamllint disable-line rule:line-length
+          key: gerrit-docker-${{ runner.os }}-${{ env.gerrit-version }}-chart-smoke
+          restore-keys: |
+            gerrit-docker-${{ runner.os }}-${{ env.gerrit-version }}
+            gerrit-docker-${{ runner.os }}-
+
+      - name: 'Set up Docker Buildx'
+        # yamllint disable-line rule:line-length
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - name: 'Build the image from the Dockerfile'
+        shell: bash
+        env:
+          GERRIT_VERSION: ${{ env.gerrit-version }}
+        run: |
+          # Build the image from the Dockerfile
+          set -euo pipefail
+          docker buildx build \
+            --build-arg "GERRIT_VERSION=${GERRIT_VERSION}" \
+            --cache-from type=local,src=/tmp/.buildx-cache \
+            --cache-to type=local,dest=/tmp/.buildx-cache-new,mode=max \
+            -t "${SMOKE_IMAGE}:${SMOKE_TAG}" \
+            --load \
+            .
+          # Replace the cache so it does not grow without bound
+          rm -rf /tmp/.buildx-cache
+          mv /tmp/.buildx-cache-new /tmp/.buildx-cache
+
+      - name: 'Create kind cluster'
+        # yamllint disable-line rule:line-length
+        uses: helm/kind-action@1544676c07bb3570fcb70166beaa07c4528fd4aa # v1.15.1
+        with:
+          cluster_name: 'chart-smoke'
+
+      - name: 'Install the chart'
+        shell: bash
+        run: |
+          # Install the chart
+          set -euo pipefail
+          kind load docker-image "${SMOKE_IMAGE}:${SMOKE_TAG}" \
+            --name chart-smoke
+          helm install gerrit "$CHART" \
+            --namespace "$SMOKE_NAMESPACE" --create-namespace \
+            -f "$CHART/values-local-smoke.yaml" \
+            --set "image.repository=${SMOKE_IMAGE}" \
+            --set "image.tag=${SMOKE_TAG}" \
+            --set "image.digest=" \
+            --wait --timeout 15m
+
+      - name: 'Verify the site'
+        shell: bash
+        run: |
+          # Verify the site
+          python3 "$CHART/files/scripts/verify-site.py" \
+            --namespace "$SMOKE_NAMESPACE" --fullname gerrit \
+            --url-prefix /r
+
+      - name: 'Collect diagnostics'
+        if: failure()
+        shell: bash
+        run: |
+          # Collect diagnostics
+          out="$RUNNER_TEMP/chart-smoke-diagnostics"
+          mkdir -p "$out"
+          ns="$SMOKE_NAMESPACE"
+          helm status gerrit -n "$ns" > "$out/helm-status.txt" 2>&1 || true
+          kubectl get all,pvc,configmap,networkpolicy -n "$ns" -o wide \
+            > "$out/resources.txt" 2>&1 || true
+          kubectl describe all,pvc -n "$ns" > "$out/describe.txt" 2>&1 || true
+          kubectl get events -n "$ns" --sort-by=.lastTimestamp \
+            > "$out/events.txt" 2>&1 || true
+          for pod in $(kubectl get pods -n "$ns" -o name 2>/dev/null); do
+            name=${pod#pod/}
+            kubectl logs -n "$ns" "$pod" --all-containers --prefix \
+              > "$out/logs-$name.txt" 2>&1 || true
+            kubectl logs -n "$ns" "$pod" --all-containers --prefix \
+              --previous > "$out/logs-$name-previous.txt" 2>&1 || true
+          done
+          kubectl describe nodes > "$out/nodes.txt" 2>&1 || true
+
+      - name: 'Upload diagnostics'
+        if: failure()
+        # yamllint disable-line rule:line-length
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: chart-smoke-diagnostics
+          path: ${{ runner.temp }}/chart-smoke-diagnostics
+          if-no-files-found: ignore
+          retention-days: 7
+
   ### Test Summary ###
   test-summary:
     name: 'Test summary'
@@ -580,6 +800,7 @@ jobs:
       - test-no-cache
       - unit-tests
       - site-export-py38
+      - chart-smoke
     if: always()
     permissions:
       contents: read
@@ -603,6 +824,7 @@ jobs:
             echo "| No Cache | ${NEEDS_TEST_NO_CACHE_RESULT} |"
             echo "| Unit Tests | ${NEEDS_UNIT_TESTS_RESULT} |"
             echo "| Site Export (Python 3.8) | ${NEEDS_SITE_EXPORT_PY38_RESULT} |"
+            echo "| Helm Chart Smoke | ${NEEDS_CHART_SMOKE_RESULT} |"
           } >> "$GITHUB_STEP_SUMMARY"
         env:
           NEEDS_TEST_BASIC_RESULT: ${{ needs.test-basic.result }}
@@ -612,6 +834,7 @@ jobs:
           NEEDS_TEST_NO_CACHE_RESULT: ${{ needs.test-no-cache.result }}
           NEEDS_UNIT_TESTS_RESULT: ${{ needs.unit-tests.result }}
           NEEDS_SITE_EXPORT_PY38_RESULT: ${{ needs.site-export-py38.result }}
+          NEEDS_CHART_SMOKE_RESULT: ${{ needs.chart-smoke.result }}
 
       - name: 'Check for failures'
         shell: bash
@@ -623,7 +846,8 @@ jobs:
              [ "${NEEDS_TEST_VALIDATION_RESULT}" != "success" ] || \
              [ "${NEEDS_TEST_NO_CACHE_RESULT}" != "success" ] || \
              [ "${NEEDS_UNIT_TESTS_RESULT}" != "success" ] || \
-             [ "${NEEDS_SITE_EXPORT_PY38_RESULT}" != "success" ]; then
+             [ "${NEEDS_SITE_EXPORT_PY38_RESULT}" != "success" ] || \
+             [ "${NEEDS_CHART_SMOKE_RESULT}" != "success" ]; then
             echo "::error::Some tests failed ❌"
             exit 1
           fi
@@ -638,3 +862,4 @@ jobs:
           NEEDS_TEST_NO_CACHE_RESULT: ${{ needs.test-no-cache.result }}
           NEEDS_UNIT_TESTS_RESULT: ${{ needs.unit-tests.result }}
           NEEDS_SITE_EXPORT_PY38_RESULT: ${{ needs.site-export-py38.result }}
+          NEEDS_CHART_SMOKE_RESULT: ${{ needs.chart-smoke.result }}

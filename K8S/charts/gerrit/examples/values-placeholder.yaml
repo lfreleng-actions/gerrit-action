@@ -1,0 +1,16 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: 2026 The Linux Foundation
+
+# Synthetic example: a placeholder host served under a non-root URL
+# prefix behind a TLS-terminating proxy. CI lints and renders the
+# chart with every file in this directory.
+
+gerrit:
+  host: gerrit.example.org
+  urlPrefix: /gerrit
+  webScheme: https
+  listenScheme: proxy-https
+
+ssh:
+  service:
+    enabled: true

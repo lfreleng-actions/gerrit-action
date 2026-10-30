@@ -120,3 +120,21 @@ kubectl -n gerrit-smoke rollout status sts/gerrit       # site survives
 
 `All-Projects` holds only `refs/meta/config`, so the clone succeeds
 with an "empty repository" warning.
+
+`files/scripts/verify-site.py` runs the last four checks itself, port
+forwarding the Service and proving persistence with a marker project
+it creates before deleting the pod. It needs only python3, `kubectl`
+and `git`, and stays out of the scripts `ConfigMap`, which takes
+`*.sh` alone:
+
+```sh
+python3 K8S/charts/gerrit/files/scripts/verify-site.py \
+  --namespace gerrit-smoke --fullname gerrit --url-prefix /r
+```
+
+The `chart-smoke` job in `.github/workflows/testing.yaml` runs this
+sequence on every pull request. It also lints and renders the chart
+with each values file under `examples/`. With `image.digest` set, it
+parses each render with `scripts/lib/chart_digests.py` and checks
+that every container, init container and ephemeral container image
+ends in that digest.

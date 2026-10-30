@@ -1,0 +1,82 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: 2026 The Linux Foundation
+
+# Default values for the gerrit chart: one Gerrit primary per release.
+
+nameOverride: ""
+fullnameOverride: ""
+
+image:
+  # Placeholder until the published image exists; build the image from
+  # this repository's Dockerfile and override repository and tag.
+  repository: ghcr.io/lfreleng-actions/gerrit
+  tag: ""                         # defaults to the chart appVersion
+  digest: ""                      # sha256:...; takes precedence over tag
+  pullPolicy: IfNotPresent
+
+imagePullSecrets: []
+
+gerrit:
+  host: gerrit.example.org        # gerrit.canonicalWebUrl host
+  urlPrefix: /r                   # served path prefix; "" for root
+  # Smoke default only; the real authentication types arrive later
+  auth: DEVELOPMENT_BECOME_ANY_ACCOUNT
+  # Scheme of gerrit.canonicalWebUrl
+  webScheme: https
+  # proxy-https behind a TLS-terminating proxy; http for direct access
+  listenScheme: proxy-https
+
+# Plugins and libraries copied into the site from the image catalogue
+# at every start. Each name is a jar basename without ".jar".
+pluginCatalogue:
+  path: /var/gerrit-catalogue
+  plugins: []
+  libs: []
+
+persistence:
+  storageClassName: ""
+  size: 20Gi
+  # Root init container that chowns the site volume, for provisioners
+  # that ignore fsGroup (kind's local-path). It runs as root, so the
+  # namespace cannot enforce the restricted Pod Security level.
+  volumePermissions:
+    enabled: false
+
+resources:
+  requests:
+    cpu: 500m
+    memory: 2Gi
+  limits:
+    memory: 4Gi
+
+# Extra JVM options, one string. When empty the heap is sized as a
+# share of resources.limits.memory.
+javaOptions: ""
+
+# The chart generates each Secret once and reuses its values on upgrade
+# through lookup. A GitOps tool that renders offline, such as Argo CD,
+# sees no existing values and would replace them at every sync: create
+# the Secrets outside the chart and name them here instead.
+secrets:
+  admin:
+    existingSecret: ""            # keys: username, password
+  secureConfig:
+    existingSecret: ""            # key: registerEmailPrivateKey
+
+ssh:
+  # Address clients use for SSH; defaults to gerrit.host, without any
+  # port, followed by :29418
+  advertisedAddress: ""
+  service:
+    enabled: false
+    type: LoadBalancer
+    annotations: {}
+
+networkPolicy:
+  enabled: true
+
+podAnnotations: {}
+
+nodeSelector: {}
+tolerations: []
+affinity: {}

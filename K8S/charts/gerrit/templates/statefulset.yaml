@@ -1,0 +1,187 @@
+{{/*
+SPDX-License-Identifier: Apache-2.0
+SPDX-FileCopyrightText: 2026 The Linux Foundation
+*/}}
+{{- $fullname := include "gerrit.fullname" . }}
+{{- $probePath := printf "%s/config/server/version" (include "gerrit.urlPrefix" .) }}
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ $fullname }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "gerrit.labels" . | nindent 4 }}
+spec:
+  replicas: 1
+  podManagementPolicy: OrderedReady
+  serviceName: {{ $fullname }}-headless
+  selector:
+    matchLabels:
+      {{- include "gerrit.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "gerrit.labels" . | nindent 8 }}
+      annotations:
+        checksum/config: {{ include (print $.Template.BasePath "/configmaps.yaml") . | sha256sum }}
+        {{- include "gerrit.otelOptOutAnnotations" . | nindent 8 }}
+        {{- with .Values.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+    spec:
+      automountServiceAccountToken: false
+      {{- include "gerrit.imagePullSecrets" . | nindent 6 }}
+      securityContext:
+        {{- include "gerrit.podSecurityContext" . | nindent 8 }}
+      initContainers:
+        {{- if .Values.persistence.volumePermissions.enabled }}
+        # Runs as root: provisioners such as kind's local-path ignore
+        # fsGroup, so the site volume needs an explicit chown.
+        - name: volume-permissions
+          image: {{ include "gerrit.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command:
+            - sh
+            - -c
+            - >-
+              find /mnt/site \( ! -user {{ include "gerrit.uid" . }} -o ! -group {{ include "gerrit.uid" . }} \)
+              -exec chown -h {{ include "gerrit.uid" . }}:{{ include "gerrit.uid" . }} {} +
+          securityContext:
+            runAsNonRoot: false
+            runAsUser: 0
+            runAsGroup: 0
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+              add:
+                - CHOWN
+                - DAC_OVERRIDE
+          volumeMounts:
+            - name: site
+              mountPath: /mnt/site
+        {{- end }}
+        - name: site-init
+          image: {{ include "gerrit.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command: ["sh", "/scripts/site-init.sh"]
+          env:
+            - name: GERRIT_SITE
+              value: /mnt/site
+            - name: GERRIT_SITE_DIRS
+              value: {{ include "gerrit.imageVolumeDirs" . | quote }}
+            - name: HOME
+              value: /tmp
+          envFrom:
+            - configMapRef:
+                name: {{ $fullname }}-config
+          securityContext:
+            {{- include "gerrit.containerSecurityContext" . | nindent 12 }}
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+          volumeMounts:
+            - name: site
+              mountPath: /mnt/site
+            - name: scripts
+              mountPath: /scripts
+              readOnly: true
+            - name: tmp
+              mountPath: /tmp
+        - name: render-config
+          image: {{ include "gerrit.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command: ["sh", "/scripts/render-config.sh"]
+          env:
+            - name: GERRIT_SITE
+              value: /var/gerrit
+            - name: HOME
+              value: /tmp
+            - name: GERRIT_REGISTER_EMAIL_PRIVATE_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "gerrit.secureConfigSecretName" . }}
+                  key: registerEmailPrivateKey
+          securityContext:
+            {{- include "gerrit.containerSecurityContext" . | nindent 12 }}
+          volumeMounts:
+            {{- include "gerrit.siteMounts" . | nindent 12 }}
+            - name: scripts
+              mountPath: /scripts
+              readOnly: true
+            - name: tmp
+              mountPath: /tmp
+      containers:
+        - name: gerrit
+          image: {{ include "gerrit.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command: ["/var/gerrit/bin/gerrit.sh", "run"]
+          env:
+            - name: HOME
+              value: /tmp
+          ports:
+            - name: http
+              containerPort: 8080
+            - name: ssh
+              containerPort: 29418
+          # First boot runs init and index creation in site-init, but
+          # the daemon still loads caches and indexes before serving
+          startupProbe:
+            httpGet:
+              path: {{ $probePath }}
+              port: http
+            periodSeconds: 10
+            failureThreshold: 60
+          readinessProbe:
+            httpGet:
+              path: {{ $probePath }}
+              port: http
+            periodSeconds: 10
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: {{ $probePath }}
+              port: http
+            periodSeconds: 30
+            timeoutSeconds: 5
+            failureThreshold: 5
+          securityContext:
+            {{- include "gerrit.containerSecurityContext" . | nindent 12 }}
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+          volumeMounts:
+            {{- include "gerrit.siteMounts" . | nindent 12 }}
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: scripts
+          configMap:
+            name: {{ $fullname }}-scripts
+        - name: tmp
+          emptyDir: {}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+  volumeClaimTemplates:
+    - metadata:
+        name: site
+        labels:
+          {{- include "gerrit.selectorLabels" . | nindent 10 }}
+      spec:
+        accessModes:
+          - ReadWriteOnce
+        {{- with .Values.persistence.storageClassName }}
+        storageClassName: {{ . }}
+        {{- end }}
+        resources:
+          requests:
+            storage: {{ .Values.persistence.size }}

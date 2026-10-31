@@ -20,6 +20,18 @@ ConfigMap. Keys the chart derives win over the same key in values.
 {{- range $sections }}
 {{- $values := deepCopy (default dict (index $v .)) -}}
 {{- if eq . "gerrit" }}{{ $values = dict }}{{ end -}}
+{{- if eq . "cache" }}
+{{- /* cache.limits fills diskLimit into each named subsection that
+does not set its own */}}
+{{- $limits := default dict $values.limits -}}
+{{- $values = omit $values "limits" -}}
+{{- range $name, $size := $limits }}
+{{- $sub := deepCopy (default dict (index $values $name)) }}
+{{- if not (or (hasKey $sub "diskLimit") (kindIs "invalid" $size) (eq (toString $size) "")) }}
+{{- $_ := set $values $name (set $sub "diskLimit" $size) }}
+{{- end }}
+{{- end }}
+{{- end -}}
 {{- $values = merge (deepCopy (default dict (index $derived .))) $values -}}
 {{- include "gerrit.configSection" (dict "name" . "values" $values) }}
 {{- end }}

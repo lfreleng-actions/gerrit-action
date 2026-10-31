@@ -77,7 +77,6 @@ def cronjobs(docs: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 
 @needs_helm
-@pytest.mark.xfail(strict=True, reason="gc and autogc defaults not rendered yet")
 def test_gc_scheduler_and_autogc_defaults(tmp_path: Path) -> None:
     docs = render()
     config = config_file(docs, "gerrit.config")
@@ -88,7 +87,6 @@ def test_gc_scheduler_and_autogc_defaults(tmp_path: Path) -> None:
 
 
 @needs_helm
-@pytest.mark.xfail(strict=True, reason="cache.limits not rendered yet")
 def test_cache_limits_render_by_default(tmp_path: Path) -> None:
     config = config_file(render(), "gerrit.config")
     for name in CACHE_LIMITS:
@@ -97,7 +95,6 @@ def test_cache_limits_render_by_default(tmp_path: Path) -> None:
 
 
 @needs_helm
-@pytest.mark.xfail(strict=True, reason="cache.limits not rendered yet")
 def test_cache_limits_override(tmp_path: Path) -> None:
     config = config_file(
         render(

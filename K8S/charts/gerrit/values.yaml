@@ -84,14 +84,18 @@ container:
 # cache.directory is always "cache" on the site volume. Each map
 # renders one [cache "<name>"] subsection.
 cache:
-  diff_summary:
-    diskLimit: 1g
-  gerrit_file_diff:
-    diskLimit: 1g
-  git_file_diff:
-    diskLimit: 1g
-  modified_files:
-    diskLimit: 1g
+  # diskLimit of each persistent cache, rendered into its subsection
+  # unless that sets diskLimit itself; null or "" drops one. Gerrit
+  # trims a cache over its limit once a day, at 1 AM server time.
+  limits:
+    comment_context: 128m
+    conflicts: 128m
+    diff_intraline: 512m
+    diff_summary: 1g
+    gerrit_file_diff: 1g
+    git_file_diff: 1g
+    git_modified_files: 512m
+    modified_files: 1g
 
 change:
   updateDelay: null
@@ -114,9 +118,10 @@ index:
   maxLimit: null
   onlineUpgrade: null
 
+# Gerrit's built-in gc scheduler, weekly and off-peak by default
 gc:
-  startTime: null
-  interval: null
+  startTime: Sun 03:00
+  interval: 1 week
   aggressive: null
 
 plugins:
@@ -131,7 +136,10 @@ suggest: {}
 
 # etc/jgit.config and etc/notedb.config, rendered the same way: each
 # top-level key is a section, for example {core: {packedGitLimit: 1g}}
-jgit: {}
+jgit:
+  # Gerrit packs through gc above, never after each push
+  receive:
+    autogc: false
 notedb: {}
 
 # Plugins and libraries copied into the site from the image catalogue

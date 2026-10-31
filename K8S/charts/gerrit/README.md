@@ -159,11 +159,14 @@ subsection, as in `cache.diff_summary.diskLimit` becoming
 | `sendemail.enable`          | `false`                          | Gerrit's default relays through `localhost`, which the pod lacks |
 | `sshd.listenAddress`        | `*:29418`                        |                                                          |
 | `container.user`            | `gerrit`                         |                                                          |
-| `cache.*.diskLimit`         | `1g`                             | For `diff_summary`, `gerrit_file_diff`, `git_file_diff` and `modified_files` |
+| `cache.limits`              | See [Cache limits](#cache-limits) | `diskLimit` of each persistent cache                    |
+| `gc.startTime`, `gc.interval` | `Sun 03:00`, `1 week`          | See [Garbage collection](#garbage-collection)            |
 | `plugins.allowRemoteAdmin`  | `false`                          | Plugins come from `pluginCatalogue`, not remote installs |
 
 `jgit` and `notedb` render `etc/jgit.config` and `etc/notedb.config`
-the same way, each top-level key a section. Secrets never go in
+the same way, each top-level key a section. `jgit` defaults to
+`receive.autogc: false`, which `gerrit init` would otherwise write and
+the render would then replace. Secrets never go in
 values: `auth.registerEmailPrivateKey` and `sendemail.smtpPass` come
 from the [Secret contract](#secret-contract).
 
@@ -344,6 +347,81 @@ every capability dropped and no service account token, so it meets the
 runs as root with `CHOWN` and `DAC_OVERRIDE`. That container breaks
 the `restricted` level but stays within `baseline`, so enable it only
 where the namespace allows `baseline` or less, as in local smoke tests.
+
+## Maintenance
+
+A long-running site on a fixed-size volume needs its repositories
+packed and its persistent caches bounded.
+
+### Garbage collection
+
+Gerrit's built-in scheduler runs `git gc` over every repository at
+`gc.startTime`, then every `gc.interval`: weekly at 03:00 on Sunday,
+server time, by default. `gc.aggressive` turns on aggressive mode.
+`receive.autogc` stays `false` in `jgit.config`, so a push never
+starts a gc of its own. Set `gc.startTime` and `gc.interval` to `null`
+to turn the scheduler off.
+
+### Cache limits
+
+Gerrit keeps its persistent caches as H2 files under `cache/`. Once a
+day, at 1 AM server time, it trims each cache over its `diskLimit`,
+and the limit is 128 MiB for a cache that sets none. On a busy site
+the diff caches can outgrow the git data, so the chart sets a limit
+for each of these caches in `cache.limits`:
+
+| Cache                | `diskLimit` |
+| -------------------- | ----------- |
+| `comment_context`    | `128m`      |
+| `conflicts`          | `128m`      |
+| `diff_intraline`     | `512m`      |
+| `diff_summary`       | `1g`        |
+| `gerrit_file_diff`   | `1g`        |
+| `git_file_diff`      | `1g`        |
+| `git_modified_files` | `512m`      |
+| `modified_files`     | `1g`        |
+
+Each entry renders `diskLimit` into the `[cache "<name>"]`
+subsection. Override one in `cache.limits`, or drop it with `null` or
+`""`; a `diskLimit` set in the subsection itself, as in
+`cache.git_file_diff.diskLimit`, wins over `cache.limits`. A limit of
+`0` turns disk storage off for that cache.
+
+### Purging caches and stale indexes
+
+Trimming keeps a cache within its limit, but an H2 file never shrinks
+on disk, and every index version an upgrade leaves behind stays in
+`index/` as `<name>_NNNN`. To reclaim the space, stop Gerrit, delete
+the files from a pod that mounts the site volume, and start Gerrit
+again. Gerrit rebuilds the caches as it needs them. The purge pod
+below meets the `restricted` Pod Security Standard the chart's
+namespace enforces:
+
+```sh
+ns=gerrit
+kubectl -n "$ns" scale sts/gerrit --replicas=0
+kubectl -n "$ns" wait --for=delete pod/gerrit-0 --timeout=5m
+kubectl -n "$ns" run gerrit-purge --rm -i --restart=Never \
+  --image=busybox:1.37 --overrides='{"spec": {
+    "securityContext": {"runAsUser": 1001, "runAsGroup": 1001,
+      "runAsNonRoot": true, "seccompProfile": {"type": "RuntimeDefault"}},
+    "containers": [{"name": "gerrit-purge", "image": "busybox:1.37",
+      "command": ["sh", "-c", "rm -fv /site/cache/*.h2.db; ls /site/index"],
+      "securityContext": {"allowPrivilegeEscalation": false,
+        "capabilities": {"drop": ["ALL"]}},
+      "volumeMounts": [{"name": "site", "mountPath": "/site"}]}],
+    "volumes": [{"name": "site",
+      "persistentVolumeClaim": {"claimName": "site-gerrit-0"}}]}}'
+kubectl -n "$ns" scale sts/gerrit --replicas=1
+```
+
+`index/gerrit_index.config` names the version of each index Gerrit
+uses, as `[index "changes_0084"]` with `ready = true`. Every other
+`index/<name>_NNNN` directory is left over from an earlier release and
+can go in the same step, for example by adding
+`rm -rf /site/index/changes_0083` to the command above. Never delete
+the versions `gerrit_index.config` marks ready: Gerrit would need an
+offline reindex to rebuild them.
 
 ## Quick validation
 

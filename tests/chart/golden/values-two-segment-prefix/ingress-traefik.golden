@@ -1,0 +1,101 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: 2026 The Linux Foundation
+---
+# Source: gerrit/templates/ingress.yaml
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: gerrit-tls
+  namespace: gerrit-test
+  labels:
+    helm.sh/chart: gerrit-0.1.0
+    app.kubernetes.io/name: gerrit
+    app.kubernetes.io/instance: gerrit
+    app.kubernetes.io/version: "3.13.1"
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/part-of: gerrit
+spec:
+  secretName: gerrit-tls
+  dnsNames:
+    - "www.example.org"
+  issuerRef:
+    group: cert-manager.io
+    kind: ClusterIssuer
+    name: "letsencrypt-prod"
+---
+# Source: gerrit/templates/ingress.yaml
+apiVersion: traefik.io/v1alpha1
+kind: IngressRoute
+metadata:
+  name: gerrit
+  namespace: gerrit-test
+  labels:
+    helm.sh/chart: gerrit-0.1.0
+    app.kubernetes.io/name: gerrit
+    app.kubernetes.io/instance: gerrit
+    app.kubernetes.io/version: "3.13.1"
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/part-of: gerrit
+  annotations:
+    kubernetes.io/ingress.class: traefik
+spec:
+  entryPoints:
+    - websecure
+  routes:
+    - kind: Rule
+      match: "Host(`www.example.org`) && (Path(`/code/review`) || PathPrefix(`/code/review/`))"
+      middlewares:
+        - name: gerrit-security-headers
+      services:
+        - name: gerrit-http
+          port: 8080
+    - kind: Rule
+      match: "Host(`www.example.org`) && Path(`/`)"
+      middlewares:
+        - name: gerrit-security-headers
+        - name: gerrit-root-redirect
+      services:
+        - name: gerrit-http
+          port: 8080
+  tls:
+    secretName: gerrit-tls
+---
+# Source: gerrit/templates/ingress.yaml
+apiVersion: traefik.io/v1alpha1
+kind: Middleware
+metadata:
+  name: gerrit-security-headers
+  namespace: gerrit-test
+  labels:
+    helm.sh/chart: gerrit-0.1.0
+    app.kubernetes.io/name: gerrit
+    app.kubernetes.io/instance: gerrit
+    app.kubernetes.io/version: "3.13.1"
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/part-of: gerrit
+spec:
+  headers:
+    contentSecurityPolicy: "default-src 'self'; script-src 'self' 'unsafe-inline' 'unsafe-eval'; style-src 'self' 'unsafe-inline'; img-src 'self' data: https:; font-src 'self' data:; connect-src 'self'; worker-src 'self' blob:; object-src 'none'; base-uri 'self'; frame-ancestors 'self'"
+    stsSeconds: 31536000
+    referrerPolicy: strict-origin-when-cross-origin
+    permissionsPolicy: "camera=(), geolocation=(), microphone=(), payment=(), usb=()"
+    contentTypeNosniff: true
+---
+# Source: gerrit/templates/ingress.yaml
+apiVersion: traefik.io/v1alpha1
+kind: Middleware
+metadata:
+  name: gerrit-root-redirect
+  namespace: gerrit-test
+  labels:
+    helm.sh/chart: gerrit-0.1.0
+    app.kubernetes.io/name: gerrit
+    app.kubernetes.io/instance: gerrit
+    app.kubernetes.io/version: "3.13.1"
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/part-of: gerrit
+spec:
+  redirectRegex:
+    regex: "^(https?://[^/]+)/?"
+    replacement: "${1}/code/review/"
+    permanent: true

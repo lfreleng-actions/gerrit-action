@@ -107,18 +107,69 @@ argocd.argoproj.io/sync-options: Prune=false,Delete=false
 {{- if $p -}}/{{ $p }}{{- end -}}
 {{- end -}}
 
+{{/* gerrit.host without any port, as the Ingress host */}}
+{{- define "gerrit.httpHost" -}}
+{{- regexReplaceAll ":[0-9]+$" .Values.gerrit.host "" -}}
+{{- end -}}
+
+{{/* ssh.host, or gerrit.host, without any port */}}
+{{- define "gerrit.sshHost" -}}
+{{- regexReplaceAll ":[0-9]+$" (default .Values.gerrit.host .Values.ssh.host) "" -}}
+{{- end -}}
+
+{{/* Behind the chart's Ingress the schemes follow ingress.tls.enabled,
+so the URL Gerrit builds links with matches what the Ingress serves */}}
+{{- define "gerrit.webScheme" -}}
+{{- if and .Values.ingress.enabled .Values.ingress.tls.enabled -}}
+https
+{{- else if .Values.ingress.enabled -}}
+http
+{{- else -}}
+{{- .Values.gerrit.webScheme -}}
+{{- end -}}
+{{- end -}}
+
+{{- define "gerrit.listenScheme" -}}
+{{- if and .Values.ingress.enabled .Values.ingress.tls.enabled -}}
+proxy-https
+{{- else if .Values.ingress.enabled -}}
+proxy-http
+{{- else -}}
+{{- .Values.gerrit.listenScheme -}}
+{{- end -}}
+{{- end -}}
+
 {{- define "gerrit.canonicalWebUrl" -}}
-{{- printf "%s://%s%s/" .Values.gerrit.webScheme .Values.gerrit.host (include "gerrit.urlPrefix" .) -}}
+{{- printf "%s://%s%s/" (include "gerrit.webScheme" .) .Values.gerrit.host (include "gerrit.urlPrefix" .) -}}
 {{- end -}}
 
 {{- define "gerrit.listenUrl" -}}
-{{- printf "%s://*:8080%s/" .Values.gerrit.listenScheme (include "gerrit.urlPrefix" .) -}}
+{{- printf "%s://*:8080%s/" (include "gerrit.listenScheme" .) (include "gerrit.urlPrefix" .) -}}
 {{- end -}}
 
-{{/* gerrit.host without the HTTP port, followed by the SSH port */}}
+{{/* The SSH port clients use: ssh.port, else a fixed node port on a
+NodePort Service, else 29418. Kubernetes picks an unset node port at
+random, so a NodePort Service without either cannot be advertised. */}}
+{{- define "gerrit.sshPort" -}}
+{{- $svc := .Values.ssh.service -}}
+{{- $nodePort := and $svc.enabled (eq $svc.type "NodePort") -}}
+{{- if .Values.ssh.port -}}
+{{- int .Values.ssh.port -}}
+{{- else if and $nodePort $svc.nodePort -}}
+{{- int $svc.nodePort -}}
+{{- else if $nodePort -}}
+{{- fail "ssh.service.type NodePort needs ssh.service.nodePort or ssh.port, so that sshd.advertisedAddress names a port clients can reach" -}}
+{{- else -}}
+29418
+{{- end -}}
+{{- end -}}
+
 {{- define "gerrit.sshAdvertisedAddress" -}}
-{{- $host := regexReplaceAll ":[0-9]+$" .Values.gerrit.host "" -}}
-{{- default (printf "%s:29418" $host) .Values.ssh.advertisedAddress -}}
+{{- printf "%s:%s" (include "gerrit.sshHost" .) (include "gerrit.sshPort" .) -}}
+{{- end -}}
+
+{{- define "gerrit.tlsSecretName" -}}
+{{- default (printf "%s-tls" (include "gerrit.fullname" .)) .Values.ingress.tls.secretName -}}
 {{- end -}}
 
 {{/* container.javaOptions: the options the image needs, a heap of 70%
@@ -242,4 +293,42 @@ cache db etc git index
   mountPath: /var/gerrit/{{ . }}
   subPath: {{ . }}
 {{- end }}
+{{- end -}}
+
+{{/* Default Content-Security-Policy for the Gerrit web UI: same-origin
+resources, with the inline scripts and styles the UI and the SAML
+auto-post page use, workers from blob: URLs as the UI's syntax
+highlighting creates them, and avatars from any HTTPS origin */}}
+{{- define "gerrit.contentSecurityPolicy" -}}
+default-src 'self'; script-src 'self' 'unsafe-inline' 'unsafe-eval'; style-src 'self' 'unsafe-inline'; img-src 'self' data: https:; font-src 'self' data:; connect-src 'self'; worker-src 'self' blob:; object-src 'none'; base-uri 'self'; frame-ancestors 'self'
+{{- end -}}
+
+{{/* Ingress annotations: cert-manager's and, for ingress-nginx, those
+for large git pushes and the root redirect, then ingress.annotations */}}
+{{- define "gerrit.ingressAnnotations" -}}
+{{- $ing := .Values.ingress -}}
+{{- $ann := dict -}}
+{{- if and $ing.tls.enabled $ing.tls.issuer -}}
+{{- $_ := set $ann "cert-manager.io/cluster-issuer" $ing.tls.issuer -}}
+{{- end -}}
+{{- if eq $ing.className "nginx" -}}
+{{- $_ := set $ann "nginx.ingress.kubernetes.io/proxy-body-size" "0" -}}
+{{- $_ := set $ann "nginx.ingress.kubernetes.io/proxy-read-timeout" "3600" -}}
+{{- $_ := set $ann "nginx.ingress.kubernetes.io/proxy-send-timeout" "3600" -}}
+{{- if include "gerrit.nginxRootRedirect" . -}}
+{{- $_ := set $ann "nginx.ingress.kubernetes.io/app-root" (printf "%s/" (include "gerrit.urlPrefix" .)) -}}
+{{- end -}}
+{{- end -}}
+{{- toYaml (merge (deepCopy (default dict $ing.annotations)) $ann) -}}
+{{- end -}}
+
+{{/* "true" when ingress-nginx redirects "/" to the URL prefix. The
+Ingress then also routes an Exact "/" path, so that "/" reaches a
+location carrying its app-root annotation rather than the default
+backend */}}
+{{- define "gerrit.nginxRootRedirect" -}}
+{{- $ing := .Values.ingress -}}
+{{- if and (eq $ing.className "nginx") $ing.redirectRootToPrefix (include "gerrit.urlPrefix" .) -}}
+true
+{{- end -}}
 {{- end -}}

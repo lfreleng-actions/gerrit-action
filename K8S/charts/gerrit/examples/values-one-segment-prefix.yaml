@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: 2026 The Linux Foundation
 
 # Synthetic example: a placeholder host served under a one-segment URL
-# prefix behind a TLS-terminating proxy, with mail, download schemes
+# prefix behind an ingress-nginx Ingress, with mail, download schemes
 # and issue tracker links. CI lints and renders the chart with every
 # file in this directory, and tests/chart compares each rendered
 # gerrit.config with a golden file.
@@ -48,6 +48,11 @@ trackingid:
     link: "https://issues.example.org/browse/$0"
     system: EXAMPLE
 
-ssh:
-  service:
-    enabled: true
+ingress:
+  enabled: true
+  className: nginx
+
+networkPolicy:
+  ingressNamespaceSelector:
+    matchLabels:
+      kubernetes.io/metadata.name: ingress-nginx

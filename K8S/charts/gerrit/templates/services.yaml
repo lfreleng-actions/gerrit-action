@@ -35,25 +35,41 @@ spec:
     - name: http
       port: 8080
       targetPort: http
-{{- if .Values.ssh.service.enabled }}
+{{- with .Values.ssh.service }}
+{{- if .enabled }}
+{{- $sshHost := include "gerrit.sshHost" $ }}
+{{- $annotations := deepCopy (default dict .annotations) }}
+{{- if .externalDNS }}
+{{- if and $.Values.ingress.enabled (eq $sshHost (include "gerrit.httpHost" $)) }}
+{{- fail "ssh.service.externalDNS with ingress.enabled needs an ssh.host other than gerrit.host: the SSH Service and the Ingress would claim the same DNS name" }}
+{{- end }}
+{{- $_ := set $annotations "external-dns.alpha.kubernetes.io/hostname" $sshHost }}
+{{- end }}
 ---
 apiVersion: v1
 kind: Service
 metadata:
   name: {{ $fullname }}-ssh
-  namespace: {{ .Release.Namespace }}
+  namespace: {{ $.Release.Namespace }}
   labels:
-    {{- include "gerrit.labels" . | nindent 4 }}
-  {{- with .Values.ssh.service.annotations }}
+    {{- include "gerrit.labels" $ | nindent 4 }}
+  {{- with $annotations }}
   annotations:
     {{- toYaml . | nindent 4 }}
   {{- end }}
 spec:
-  type: {{ .Values.ssh.service.type }}
+  type: {{ .type }}
+  {{- if and .externalTrafficPolicy (has .type (list "LoadBalancer" "NodePort")) }}
+  externalTrafficPolicy: {{ .externalTrafficPolicy }}
+  {{- end }}
   selector:
-    {{- include "gerrit.selectorLabels" . | nindent 4 }}
+    {{- include "gerrit.selectorLabels" $ | nindent 4 }}
   ports:
     - name: ssh
       port: 29418
       targetPort: ssh
+      {{- if and (eq .type "NodePort") .nodePort }}
+      nodePort: {{ int .nodePort }}
+      {{- end }}
+{{- end }}
 {{- end }}

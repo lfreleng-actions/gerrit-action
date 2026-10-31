@@ -19,9 +19,10 @@ imagePullSecrets: []
 gerrit:
   host: gerrit.example.org        # gerrit.canonicalWebUrl host
   urlPrefix: /r                   # served path prefix; "" for root
-  # Scheme of gerrit.canonicalWebUrl
+  # Scheme of gerrit.canonicalWebUrl, without the chart's Ingress
   webScheme: https
-  # proxy-https behind a TLS-terminating proxy; http for direct access
+  # proxy-https behind a TLS-terminating proxy; http for direct access.
+  # With ingress.enabled the chart derives both schemes instead.
   listenScheme: proxy-https
   instanceId: ""
   # Site identity, stamped on every change. Leave empty for a new site
@@ -47,7 +48,7 @@ httpd:
   maxQueued: null
   requestLog: null
 
-# sshd.advertisedAddress is derived; see ssh.advertisedAddress
+# sshd.advertisedAddress is derived: ssh.host and the SSH port; see ssh
 sshd:
   listenAddress: "*:29418"
   threads: null
@@ -168,17 +169,63 @@ secrets:
     # needs a password
     existingSecret: ""
 
-ssh:
-  # Address clients use for SSH; defaults to gerrit.host, without any
-  # port, followed by :29418
-  advertisedAddress: ""
-  service:
+# HTTP access through the cluster's Ingress controller. TLS ends at
+# the controller, and Gerrit listens on proxy-https:// behind it, or
+# proxy-http:// with tls.enabled false.
+ingress:
+  enabled: false
+  className: ""                   # e.g. traefik or nginx
+  annotations: {}                 # added to the chart's own; win on a clash
+  tls:
+    enabled: true
+    secretName: ""                # defaults to <fullname>-tls
+    # cert-manager ClusterIssuer that issues the Secret; "" to create
+    # the Secret yourself
+    issuer: letsencrypt-prod
+  redirectRootToPrefix: true      # "/" -> "<urlPrefix>/"
+  securityHeaders:
+    # CSP, HSTS, Referrer-Policy, Permissions-Policy and
+    # X-Content-Type-Options; rendered with traefik.enabled only
+    enabled: true
+    contentSecurityPolicy: ""     # "" for the chart's default policy
+  traefik:
+    # Render a Traefik IngressRoute and Middlewares instead of a plain
+    # Ingress; needs Traefik's CRDs, and cert-manager's with tls.issuer
     enabled: false
+    entryPoints: []               # [] for Traefik's default entry points
+
+ssh:
+  # Host clients use for SSH, without a port; defaults to gerrit.host.
+  # sshd.advertisedAddress is this host followed by the SSH port.
+  host: ""
+  # Port clients use for SSH, for when something in front publishes
+  # 29418 on another port; null for service.nodePort with a NodePort
+  # Service, else 29418
+  port: null
+  service:
+    enabled: true
     type: LoadBalancer
+    # Fixed node port with type NodePort, and the advertised port unless
+    # ssh.port is set; a NodePort Service needs this or ssh.port
+    nodePort: null
+    # For an AWS NLB through the AWS Load Balancer Controller:
+    #   service.beta.kubernetes.io/aws-load-balancer-type: external
+    #   service.beta.kubernetes.io/aws-load-balancer-nlb-target-type: ip
+    #   service.beta.kubernetes.io/aws-load-balancer-scheme: internet-facing
     annotations: {}
+    # Local keeps the client address, so sshd_log records it; applies to
+    # LoadBalancer and NodePort Services only
+    externalTrafficPolicy: Local
+    # Add external-dns.alpha.kubernetes.io/hostname: <ssh.host>
+    externalDNS: false
 
 networkPolicy:
   enabled: true
+  # Namespaces that may reach port 8080, as a label selector; {} admits
+  # any source. For example:
+  #   matchLabels:
+  #     kubernetes.io/metadata.name: traefik
+  ingressNamespaceSelector: {}
 
 podAnnotations: {}
 

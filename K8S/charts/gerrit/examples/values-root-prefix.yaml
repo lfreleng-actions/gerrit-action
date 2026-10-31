@@ -1,19 +1,30 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: 2026 The Linux Foundation
 
-# Synthetic example: Gerrit served from the root of its host, with the
-# server ID, SSH address and heap set explicitly and jgit.config filled
-# in. CI lints and renders the chart with every file in this directory,
-# and tests/chart compares each rendered gerrit.config with a golden
-# file.
+# Synthetic example: Gerrit served from the root of its host behind a
+# plain Ingress, with the server ID, SSH host and heap set explicitly,
+# an AWS NLB with external-dns for SSH, and jgit.config filled in. CI
+# lints and renders the chart with every file in this directory, and
+# tests/chart compares each rendered gerrit.config with a golden file.
 
 gerrit:
   host: review.example.org
   urlPrefix: ""
   serverId: 00000000-0000-4000-8000-000000000000
 
+ingress:
+  enabled: true
+  className: traefik
+
 ssh:
-  advertisedAddress: ssh.review.example.org:29418
+  host: ssh.review.example.org
+  service:
+    annotations:
+      service.beta.kubernetes.io/aws-load-balancer-type: external
+      service.beta.kubernetes.io/aws-load-balancer-nlb-target-type: ip
+      service.beta.kubernetes.io/aws-load-balancer-scheme: internet-facing
+      service.beta.kubernetes.io/aws-load-balancer-target-group-attributes: preserve_client_ip.enabled=true
+    externalDNS: true
 
 sshd:
   threads: 16

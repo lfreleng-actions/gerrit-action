@@ -1,11 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: 2026 The Linux Foundation
 
-# Synthetic example: Gerrit under a two-segment URL prefix, with cache
-# limits, garbage collection, user defaults and a free-form block for a
-# setting the chart has no typed value for. CI lints and renders the
-# chart with every file in this directory, and tests/chart compares
-# each rendered gerrit.config with a golden file.
+# Synthetic example: Gerrit under a two-segment URL prefix behind a
+# Traefik IngressRoute, with cache limits, garbage collection, user
+# defaults and a free-form block for a setting the chart has no typed
+# value for. CI lints and renders the chart with every file in this
+# directory, and tests/chart compares each rendered gerrit.config with
+# a golden file.
 
 gerrit:
   host: www.example.org
@@ -14,6 +15,14 @@ gerrit:
     [commentlink "changeid"]
     	match = (I[0-9a-f]{8,40})
     	link = "#/q/$1"
+
+ingress:
+  enabled: true
+  className: traefik
+  traefik:
+    enabled: true
+    entryPoints:
+      - websecure
 
 httpd:
   maxQueued: 200

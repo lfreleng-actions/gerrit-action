@@ -37,6 +37,12 @@ spec:
     - ports:
         - protocol: TCP
           port: 8080
+      {{- with .Values.networkPolicy.ingressNamespaceSelector }}
+      from:
+        - namespaceSelector:
+            {{- toYaml . | nindent 12 }}
+      {{- end }}
+    - ports:
         - protocol: TCP
           port: 29418
   egress:

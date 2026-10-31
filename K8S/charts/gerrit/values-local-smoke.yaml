@@ -28,5 +28,9 @@ resources:
   limits:
     memory: 2Gi
 
+# kind has no load balancer, so a LoadBalancer Service never gets the
+# address helm install --wait waits for; sshd still advertises
+# localhost:29418, from gerrit.host
 ssh:
-  advertisedAddress: localhost:29418
+  service:
+    enabled: false

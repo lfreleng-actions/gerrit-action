@@ -25,6 +25,7 @@ volume holds state only.
 | `ConfigMap` `<fullname>-config`   | Rendered `gerrit.config`, `jgit.config` and `notedb.config`    |
 | `Secret` `<fullname>-admin`       | Admin credential placeholder; not consumed yet                 |
 | `Secret` `<fullname>-secure-config` | Values `render-config.sh` writes to `etc/secure.config`; see the Secret contract |
+| `CronJob` `<fullname>-git-gc`, `NetworkPolicy` `<fullname>-git-gc-deny` | With `gc.cronJob.enabled`; see [Garbage collection](#garbage-collection) |
 | `NetworkPolicy` (two)             | Default deny; allow ingress to 8080 (from `networkPolicy.ingressNamespaceSelector` when set) and 29418, egress to DNS, HTTPS and, with mail configured, the SMTP relay's port |
 
 The Secrets carry `helm.sh/resource-policy: keep` and
@@ -159,11 +160,14 @@ subsection, as in `cache.diff_summary.diskLimit` becoming
 | `sendemail.enable`          | `false`                          | Gerrit's default relays through `localhost`, which the pod lacks |
 | `sshd.listenAddress`        | `*:29418`                        |                                                          |
 | `container.user`            | `gerrit`                         |                                                          |
-| `cache.*.diskLimit`         | `1g`                             | For `diff_summary`, `gerrit_file_diff`, `git_file_diff` and `modified_files` |
+| `cache.limits`              | See [Cache limits](#cache-limits) | `diskLimit` of each persistent cache                    |
+| `gc.startTime`, `gc.interval` | `Sun 03:00`, `1 week`          | See [Garbage collection](#garbage-collection)            |
 | `plugins.allowRemoteAdmin`  | `false`                          | Plugins come from `pluginCatalogue`, not remote installs |
 
 `jgit` and `notedb` render `etc/jgit.config` and `etc/notedb.config`
-the same way, each top-level key a section. Secrets never go in
+the same way, each top-level key a section. `jgit` defaults to
+`receive.autogc: false`, which `gerrit init` would otherwise write and
+the render would then replace. Secrets never go in
 values: `auth.registerEmailPrivateKey` and `sendemail.smtpPass` come
 from the [Secret contract](#secret-contract).
 
@@ -345,6 +349,112 @@ runs as root with `CHOWN` and `DAC_OVERRIDE`. That container breaks
 the `restricted` level but stays within `baseline`, so enable it only
 where the namespace allows `baseline` or less, as in local smoke tests.
 
+## Maintenance
+
+A long-running site on a fixed-size volume needs its repositories
+packed and its persistent caches bounded.
+
+### Garbage collection
+
+Gerrit's built-in scheduler runs `git gc` over every repository at
+`gc.startTime`, then every `gc.interval`: weekly at 03:00 on Sunday,
+server time, by default. `gc.aggressive` turns on aggressive mode.
+`receive.autogc` stays `false` in `jgit.config`, so a push never
+starts a gc of its own. Set `gc.startTime` and `gc.interval` to `null`
+to turn the scheduler off.
+
+To run gc outside Gerrit's JVM instead, set `gc.cronJob.enabled`. The
+two modes are exclusive: the chart then leaves `gc.startTime` and
+`gc.interval` out of `gerrit.config`, and the `<fullname>-git-gc`
+`CronJob` runs `files/scripts/git-gc.sh` on `gc.cronJob.schedule`,
+Sunday at 03:00 by default. The script runs `git gc` with
+`gc.cronJob.args`, `--auto` by default, over every repository under
+`git/`. Each list entry reaches git as one argument, so
+`--prune=2 weeks ago` needs no quoting:
+
+- `etc/jgit.config` is its system git config, so the `[gc]`, `[pack]`
+  and `[core]` settings Gerrit uses apply, and `gc.aggressive` adds
+  `--aggressive`;
+- `gc.autoDetach` is off, so `git gc --auto` finishes before the Job
+  does and a failure counts against it;
+- a lock on `chart-gc.lock` in each repository skips one that another
+  run still holds;
+- a repository that fails does not stop the rest, and the Job fails
+  after the last one.
+
+With `--auto`, git packs a repository only once it holds more loose
+objects than `gc.auto` allows; set `gc.cronJob.args` to `[]` for a
+full gc every run. The Job runs as the Gerrit UID with
+`concurrencyPolicy: Forbid`, mounts the site volume read-write, has no
+service account token and, with `networkPolicy.enabled`, a
+`NetworkPolicy` that denies it all traffic. It runs only on the node
+the Gerrit pod runs on, where a `ReadWriteOnce` volume is already
+attached; while Gerrit is down the Job waits in `Pending` and starts
+once the Gerrit pod is back. The chart cuts the `<fullname>` prefix of
+the `CronJob` name to 45 characters, within the 52 that Kubernetes
+allows a `CronJob`.
+
+### Cache limits
+
+Gerrit keeps its persistent caches as H2 files under `cache/`. Once a
+day, at 1 AM server time, it trims each cache over its `diskLimit`,
+and the limit is 128 MiB for a cache that sets none. On a busy site
+the diff caches can outgrow the git data, so the chart sets a limit
+for each of these caches in `cache.limits`:
+
+| Cache                | `diskLimit` |
+| -------------------- | ----------- |
+| `comment_context`    | `128m`      |
+| `conflicts`          | `128m`      |
+| `diff_intraline`     | `512m`      |
+| `diff_summary`       | `1g`        |
+| `gerrit_file_diff`   | `1g`        |
+| `git_file_diff`      | `1g`        |
+| `git_modified_files` | `512m`      |
+| `modified_files`     | `1g`        |
+
+Each entry renders `diskLimit` into the `[cache "<name>"]`
+subsection. Override one in `cache.limits`, or drop it with `null` or
+`""`; a `diskLimit` set in the subsection itself, as in
+`cache.git_file_diff.diskLimit`, wins over `cache.limits`. A limit of
+`0` turns disk storage off for that cache.
+
+### Purging caches and stale indexes
+
+Trimming keeps a cache within its limit, but an H2 file never shrinks
+on disk, and every index version an upgrade leaves behind stays in
+`index/` as `<name>_NNNN`. To reclaim the space, stop Gerrit, delete
+the files from a pod that mounts the site volume, and start Gerrit
+again. Gerrit rebuilds the caches as it needs them. The purge pod
+below meets the `restricted` Pod Security Standard the chart's
+namespace enforces:
+
+```sh
+ns=gerrit
+kubectl -n "$ns" scale sts/gerrit --replicas=0
+kubectl -n "$ns" wait --for=delete pod/gerrit-0 --timeout=5m
+kubectl -n "$ns" run gerrit-purge --rm -i --restart=Never \
+  --image=busybox:1.37 --overrides='{"spec": {
+    "securityContext": {"runAsUser": 1001, "runAsGroup": 1001,
+      "runAsNonRoot": true, "seccompProfile": {"type": "RuntimeDefault"}},
+    "containers": [{"name": "gerrit-purge", "image": "busybox:1.37",
+      "command": ["sh", "-c", "rm -fv /site/cache/*.h2.db; ls /site/index"],
+      "securityContext": {"allowPrivilegeEscalation": false,
+        "capabilities": {"drop": ["ALL"]}},
+      "volumeMounts": [{"name": "site", "mountPath": "/site"}]}],
+    "volumes": [{"name": "site",
+      "persistentVolumeClaim": {"claimName": "site-gerrit-0"}}]}}'
+kubectl -n "$ns" scale sts/gerrit --replicas=1
+```
+
+`index/gerrit_index.config` names the version of each index Gerrit
+uses, as `[index "changes_0084"]` with `ready = true`. Every other
+`index/<name>_NNNN` directory is left over from an earlier release and
+can go in the same step, for example by adding
+`rm -rf /site/index/changes_0083` to the command above. Never delete
+the versions `gerrit_index.config` marks ready: Gerrit would need an
+offline reindex to rebuild them.
+
 ## Quick validation
 
 Build the image from this repository's `Dockerfile` until a published
@@ -387,7 +497,11 @@ python3 K8S/charts/gerrit/files/scripts/verify-site.py \
 ```
 
 The `chart-smoke` job in `.github/workflows/testing.yaml` runs this
-sequence on every pull request. It also lints and renders the chart
+sequence on every pull request. It then upgrades the release with
+`gc.cronJob.enabled`, runs the CronJob once with
+`kubectl create job --from` on a fixture repository of loose objects,
+and checks that the Job succeeds and leaves the objects packed. It
+also lints and renders the chart
 with each values file under `examples/`. With `image.digest` set, it
 parses each render with `scripts/lib/chart_digests.py` and checks
 that every container, init container and ephemeral container image
@@ -398,7 +512,8 @@ must render the `gerrit.config`, `jgit.config` and `notedb.config` in
 `tests/chart/golden/<example>/`, and `templates/ingress.yaml` as a
 plain Ingress and as Traefik objects in `ingress-plain.golden` and
 `ingress-traefik.golden` there, and `render-config.sh` must write the
-`secure.config` there with mode `0600`. After an intended change to
+`secure.config` there with mode `0600`. With `gc.cronJob.enabled`,
+`templates/gc-cronjob.yaml` must render `gc-cronjob.golden`. After an intended change to
 the rendered output, regenerate the goldens and review the diff:
 
 ```sh

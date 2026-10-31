@@ -1,0 +1,141 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: 2026 The Linux Foundation
+---
+# Source: gerrit/templates/gc-cronjob.yaml
+# The gc pod needs no network: deny all ingress and egress
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: gerrit-git-gc-deny
+  namespace: gerrit-test
+  labels:
+    helm.sh/chart: gerrit-0.1.0
+    app.kubernetes.io/name: gerrit-git-gc
+    app.kubernetes.io/instance: gerrit
+    app.kubernetes.io/component: git-gc
+    app.kubernetes.io/version: "3.13.1"
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/part-of: gerrit
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: gerrit-git-gc
+      app.kubernetes.io/instance: gerrit
+      app.kubernetes.io/component: git-gc
+  policyTypes:
+    - Ingress
+    - Egress
+---
+# Source: gerrit/templates/gc-cronjob.yaml
+# git gc outside Gerrit's JVM; gerrit.config then leaves gc.startTime
+# and gc.interval out, so Gerrit's own scheduler stays off
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: gerrit-git-gc
+  namespace: gerrit-test
+  labels:
+    helm.sh/chart: gerrit-0.1.0
+    app.kubernetes.io/name: gerrit-git-gc
+    app.kubernetes.io/instance: gerrit
+    app.kubernetes.io/component: git-gc
+    app.kubernetes.io/version: "3.13.1"
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/part-of: gerrit
+spec:
+  schedule: "0 3 * * 0"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 0
+      template:
+        metadata:
+          labels:
+            helm.sh/chart: gerrit-0.1.0
+            app.kubernetes.io/name: gerrit-git-gc
+            app.kubernetes.io/instance: gerrit
+            app.kubernetes.io/component: git-gc
+            app.kubernetes.io/version: "3.13.1"
+            app.kubernetes.io/managed-by: Helm
+            app.kubernetes.io/part-of: gerrit
+          annotations:
+            instrumentation.opentelemetry.io/inject-java: "false"
+            instrumentation.opentelemetry.io/inject-nodejs: "false"
+            instrumentation.opentelemetry.io/inject-python: "false"
+            instrumentation.opentelemetry.io/inject-dotnet: "false"
+            instrumentation.opentelemetry.io/inject-go: "false"
+            instrumentation.opentelemetry.io/inject-sdk: "false"
+        spec:
+          restartPolicy: Never
+          automountServiceAccountToken: false
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 1001
+            runAsGroup: 1001
+            fsGroup: 1001
+            fsGroupChangePolicy: OnRootMismatch
+            seccompProfile:
+              type: RuntimeDefault
+          # The site volume is usually ReadWriteOnce: run only on the
+          # node Gerrit runs on, where the volume is already attached
+          affinity:
+            podAffinity:
+              requiredDuringSchedulingIgnoredDuringExecution:
+                - topologyKey: kubernetes.io/hostname
+                  labelSelector:
+                    matchLabels:
+                      app.kubernetes.io/name: gerrit
+                      app.kubernetes.io/instance: gerrit
+          containers:
+            - name: git-gc
+              image: ghcr.io/lfreleng-actions/gerrit:3.13.1
+              imagePullPolicy: IfNotPresent
+              command: ["sh", "/scripts/git-gc.sh"]
+              args:
+                - --auto
+              env:
+                - name: GERRIT_SITE
+                  value: /var/gerrit
+                - name: HOME
+                  value: /tmp
+              securityContext:
+                allowPrivilegeEscalation: false
+                readOnlyRootFilesystem: true
+                runAsNonRoot: true
+                capabilities:
+                  drop:
+                    - ALL
+              volumeMounts:
+                - name: site
+                  mountPath: /var/gerrit
+                - name: site
+                  mountPath: /var/gerrit/cache
+                  subPath: cache
+                - name: site
+                  mountPath: /var/gerrit/db
+                  subPath: db
+                - name: site
+                  mountPath: /var/gerrit/etc
+                  subPath: etc
+                - name: site
+                  mountPath: /var/gerrit/git
+                  subPath: git
+                - name: site
+                  mountPath: /var/gerrit/index
+                  subPath: index
+                - name: scripts
+                  mountPath: /scripts
+                  readOnly: true
+                - name: tmp
+                  mountPath: /tmp
+          volumes:
+            - name: site
+              persistentVolumeClaim:
+                claimName: site-gerrit-0
+            - name: scripts
+              configMap:
+                name: gerrit-scripts
+            - name: tmp
+              emptyDir: {}

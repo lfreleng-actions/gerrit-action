@@ -1,0 +1,117 @@
+{{/*
+SPDX-License-Identifier: Apache-2.0
+SPDX-FileCopyrightText: 2026 The Linux Foundation
+*/}}
+{{- with .Values.gc.cronJob }}
+{{- if .enabled }}
+{{- $fullname := include "gerrit.fullname" $ }}
+{{- /* A CronJob name may hold 52 characters, leaving room for the
+Job names the controller derives from it */}}
+{{- $gcName := printf "%s-git-gc" ($fullname | trunc 45 | trimSuffix "-") }}
+# git gc outside Gerrit's JVM; gerrit.config then leaves gc.startTime
+# and gc.interval out, so Gerrit's own scheduler stays off
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: {{ $gcName }}
+  namespace: {{ $.Release.Namespace }}
+  labels:
+    {{- include "gerrit.gcLabels" $ | nindent 4 }}
+spec:
+  schedule: {{ .schedule | quote }}
+  {{- with .timeZone }}
+  timeZone: {{ . | quote }}
+  {{- end }}
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 0
+      template:
+        metadata:
+          labels:
+            {{- include "gerrit.gcLabels" $ | nindent 12 }}
+          annotations:
+            {{- include "gerrit.otelOptOutAnnotations" $ | nindent 12 }}
+        spec:
+          restartPolicy: Never
+          automountServiceAccountToken: false
+          {{- with include "gerrit.imagePullSecrets" $ | trim }}
+          {{- . | nindent 10 }}
+          {{- end }}
+          securityContext:
+            {{- include "gerrit.podSecurityContext" $ | nindent 12 }}
+          # The site volume is usually ReadWriteOnce: run only on the
+          # node Gerrit runs on, where the volume is already attached
+          affinity:
+            podAffinity:
+              requiredDuringSchedulingIgnoredDuringExecution:
+                - topologyKey: kubernetes.io/hostname
+                  labelSelector:
+                    matchLabels:
+                      {{- include "gerrit.selectorLabels" $ | nindent 22 }}
+          containers:
+            - name: git-gc
+              image: {{ include "gerrit.image" $ }}
+              imagePullPolicy: {{ $.Values.image.pullPolicy }}
+              command: ["sh", "/scripts/git-gc.sh"]
+              {{- with .args }}
+              args:
+                {{- toYaml . | nindent 16 }}
+              {{- end }}
+              env:
+                - name: GERRIT_SITE
+                  value: /var/gerrit
+                - name: HOME
+                  value: /tmp
+              securityContext:
+                {{- include "gerrit.containerSecurityContext" $ | nindent 16 }}
+              {{- with .resources }}
+              resources:
+                {{- toYaml . | nindent 16 }}
+              {{- end }}
+              volumeMounts:
+                {{- include "gerrit.siteMounts" $ | nindent 16 }}
+                - name: scripts
+                  mountPath: /scripts
+                  readOnly: true
+                - name: tmp
+                  mountPath: /tmp
+          volumes:
+            - name: site
+              persistentVolumeClaim:
+                claimName: site-{{ $fullname }}-0
+            - name: scripts
+              configMap:
+                name: {{ $fullname }}-scripts
+            - name: tmp
+              emptyDir: {}
+          {{- with $.Values.nodeSelector }}
+          nodeSelector:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- with $.Values.tolerations }}
+          tolerations:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+{{- if $.Values.networkPolicy.enabled }}
+---
+# The gc pod needs no network: deny all ingress and egress
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ $gcName }}-deny
+  namespace: {{ $.Release.Namespace }}
+  labels:
+    {{- include "gerrit.gcLabels" $ | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "gerrit.gcSelectorLabels" $ | nindent 6 }}
+  policyTypes:
+    - Ingress
+    - Egress
+{{- end }}
+{{- end }}
+{{- end }}

@@ -45,6 +45,24 @@ app.kubernetes.io/managed-by: {{ .Release.Service }}
 app.kubernetes.io/part-of: gerrit
 {{- end -}}
 
+{{/* Labels of the git gc CronJob's pods. Their name differs from the
+Gerrit pod's, so no Service selector or Gerrit NetworkPolicy matches
+them; the chart name is cut to 56 characters so the "-git-gc" suffix
+still fits the 63-character label limit. */}}
+{{- define "gerrit.gcSelectorLabels" -}}
+app.kubernetes.io/name: {{ include "gerrit.name" . | trunc 56 | trimSuffix "-" }}-git-gc
+app.kubernetes.io/instance: {{ .Release.Name }}
+app.kubernetes.io/component: git-gc
+{{- end -}}
+
+{{- define "gerrit.gcLabels" -}}
+helm.sh/chart: {{ include "gerrit.chart" . }}
+{{ include "gerrit.gcSelectorLabels" . }}
+app.kubernetes.io/version: {{ .Chart.AppVersion | quote }}
+app.kubernetes.io/managed-by: {{ .Release.Service }}
+app.kubernetes.io/part-of: gerrit
+{{- end -}}
+
 {{/* Image reference; a digest takes precedence over the tag */}}
 {{- define "gerrit.image" -}}
 {{- if .Values.image.digest -}}

@@ -323,7 +323,10 @@ initialises the site.
   section 3 from the running deployment and uploads it, so a backup is
   also an import source for a new deployment.
 - The **maintenance CronJob** runs housekeeping that Gerrit does not
-  schedule itself, where the chart enables it.
+  schedule itself, where the chart enables it. The first is the
+  optional git gc CronJob (#243), `gc.cronJob.enabled`: it replaces
+  Gerrit's built-in gc scheduler, which the chart turns off in
+  `gerrit.config` while the CronJob is enabled.
 
 Both need the site volume, so they run on the node that holds it.
 

@@ -458,16 +458,15 @@ An export directory `<out>` holds:
   git.tar.zst      --pack only: tar of git/, zstd-compressed, mode 0600
 ```
 
-- `site/` leaves out `cache`, `index`, `logs`, `tmp`, `bin` and
-  `.gerritcodereview/tmp`, plus the repository store when it sits
-  inside the site. `--include-cache` keeps `cache`. The import
+- `site/` leaves out `cache`, `index`, `logs`, `tmp`, `bin`,
+  `.gerritcodereview/tmp` and `.chart`, plus the repository store when
+  it sits inside the site. `--include-cache` keeps `cache`. The import
   rebuilds the index and caches and takes `bin/gerrit.war` from the
   image.
-- The tool does not yet leave out `.chart/`, so an export of a
-  chart-managed site carries its state directory. `site-import`
-  skips `site/.chart/` whatever the archive holds (section 1.7);
-  excluding it in the export tool too is follow-up code work, tracked
-  in #256.
+- `.chart/` holds a chart-managed site's import state, which describes
+  the source release rather than the export. `site-import` skips
+  `site/.chart/` whatever the archive holds (section 1.7); leaving it
+  out of the export as well keeps archives free of it.
 - `git/` holds every repository under `gerrit.basePath` at the same
   relative path. A symlink inside the repository store stops the
   export.

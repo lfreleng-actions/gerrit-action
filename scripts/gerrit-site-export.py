@@ -24,10 +24,10 @@ Standard library only, Python 3.8 or newer; reads the site, writes under --out.
   -h, --help          Show this help and exit.
 
 Left out of <out>/site whatever their type: cache, index, logs, tmp, bin,
-.gerritcodereview/tmp, and the repositories, as configured and resolved. Symlinks
-inside the repository store are refused, never followed; so are symlinked outputs. Runs
-remove the old manifest (uploaded too) and archives first and write the manifest last,
-so a manifest.json marks a complete export. Any failure exits non-zero.
+.gerritcodereview/tmp, .chart, and the repositories, as configured and resolved.
+Symlinks inside the repository store are refused, never followed; so are symlinked
+outputs. Runs remove the old manifest (uploaded too) and archives first and write the
+manifest last, so a manifest.json marks a complete export. Any failure exits non-zero.
 """
 
 from __future__ import annotations
@@ -50,7 +50,7 @@ from types import SimpleNamespace
 from typing import Any, NoReturn
 
 PROG = "gerrit-site-export.py"
-EXCLUDED = ["cache", "index", "logs", "tmp", "bin", ".gerritcodereview/tmp"]
+EXCLUDED = ["cache", "index", "logs", "tmp", "bin", ".gerritcodereview/tmp", ".chart"]
 PROC_ENV = "GERRIT_SITE_EXPORT_PROC"  # Reserved for tests: stands in for /proc.
 VALUES = ("--site", "--git", "--out", "--encrypt", "--upload")
 FLAGS = ("--i-stopped-writes", "--pack", "--include-cache", "--dry-run")

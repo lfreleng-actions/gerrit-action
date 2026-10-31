@@ -118,7 +118,6 @@ def test_no_cronjob_by_default() -> None:
 
 
 @needs_helm
-@pytest.mark.xfail(strict=True, reason="git gc CronJob not added yet")
 def test_cronjob_matches_golden() -> None:
     out = helm(
         "template",
@@ -137,7 +136,6 @@ def test_cronjob_matches_golden() -> None:
 
 
 @needs_helm
-@pytest.mark.xfail(strict=True, reason="git gc CronJob not added yet")
 def test_cronjob_turns_off_the_builtin_scheduler(tmp_path: Path) -> None:
     config = config_file(render(*CRONJOB), "gerrit.config")
     assert git_config(config, tmp_path, "gc.startTime") == ""
@@ -146,7 +144,6 @@ def test_cronjob_turns_off_the_builtin_scheduler(tmp_path: Path) -> None:
 
 
 @needs_helm
-@pytest.mark.xfail(strict=True, reason="git gc CronJob not added yet")
 def test_cronjob_pod_is_isolated() -> None:
     docs = render(*CRONJOB)
     (cron,) = cronjobs(docs)
@@ -241,7 +238,6 @@ def run_gc(
     )
 
 
-@pytest.mark.xfail(strict=True, reason="git-gc.sh not added yet")
 def test_gc_script_packs_every_repository(tmp_path: Path) -> None:
     site = tmp_path / "site"
     (site / "etc").mkdir(parents=True)
@@ -257,7 +253,6 @@ def test_gc_script_packs_every_repository(tmp_path: Path) -> None:
 
 
 @pytest.mark.skipif(shutil.which("flock") is None, reason="needs flock")
-@pytest.mark.xfail(strict=True, reason="git-gc.sh not added yet")
 def test_gc_script_skips_a_locked_repository(tmp_path: Path) -> None:
     site = tmp_path / "site"
     (site / "etc").mkdir(parents=True)
@@ -269,7 +264,6 @@ def test_gc_script_skips_a_locked_repository(tmp_path: Path) -> None:
     assert loose_objects(repo)
 
 
-@pytest.mark.xfail(strict=True, reason="git-gc.sh not added yet")
 def test_gc_script_fails_on_a_broken_repository(tmp_path: Path) -> None:
     site = tmp_path / "site"
     (site / "etc").mkdir(parents=True)
@@ -281,7 +275,6 @@ def test_gc_script_fails_on_a_broken_repository(tmp_path: Path) -> None:
     assert packs(good)
 
 
-@pytest.mark.xfail(strict=True, reason="git-gc.sh not added yet")
 def test_gc_script_keeps_argument_boundaries(tmp_path: Path) -> None:
     site = tmp_path / "site"
     (site / "etc").mkdir(parents=True)
@@ -291,7 +284,6 @@ def test_gc_script_keeps_argument_boundaries(tmp_path: Path) -> None:
     assert packs(repo)
 
 
-@pytest.mark.xfail(strict=True, reason="git-gc.sh not added yet")
 def test_gc_script_waits_for_auto_gc(tmp_path: Path) -> None:
     site = tmp_path / "site"
     (site / "etc").mkdir(parents=True)
@@ -315,7 +307,6 @@ def test_gc_script_waits_for_auto_gc(tmp_path: Path) -> None:
 
 
 @needs_helm
-@pytest.mark.xfail(strict=True, reason="git gc CronJob not added yet")
 def test_cronjob_passes_args_as_container_args() -> None:
     (cron,) = cronjobs(
         render(*CRONJOB, "--set-json", 'gc.cronJob.args=["--prune=2 weeks ago"]')
@@ -327,7 +318,6 @@ def test_cronjob_passes_args_as_container_args() -> None:
 
 
 @needs_helm
-@pytest.mark.xfail(strict=True, reason="git gc CronJob not added yet")
 def test_cronjob_requires_the_gerrit_node() -> None:
     docs = render(*CRONJOB)
     (cron,) = cronjobs(docs)
@@ -341,7 +331,6 @@ def test_cronjob_requires_the_gerrit_node() -> None:
 
 
 @needs_helm
-@pytest.mark.xfail(strict=True, reason="git gc CronJob not added yet")
 @pytest.mark.parametrize(
     "override",
     [("--set", "nameOverride=" + "n" * 63), ("--set", "fullnameOverride=" + "f" * 52)],

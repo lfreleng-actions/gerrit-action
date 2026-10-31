@@ -25,6 +25,7 @@ volume holds state only.
 | `ConfigMap` `<fullname>-config`   | Rendered `gerrit.config`, `jgit.config` and `notedb.config`    |
 | `Secret` `<fullname>-admin`       | Admin credential placeholder; not consumed yet                 |
 | `Secret` `<fullname>-secure-config` | Values `render-config.sh` writes to `etc/secure.config`; see the Secret contract |
+| `CronJob` `<fullname>-git-gc`, `NetworkPolicy` `<fullname>-git-gc-deny` | With `gc.cronJob.enabled`; see [Garbage collection](#garbage-collection) |
 | `NetworkPolicy` (two)             | Default deny; allow ingress to 8080 (from `networkPolicy.ingressNamespaceSelector` when set) and 29418, egress to DNS, HTTPS and, with mail configured, the SMTP relay's port |
 
 The Secrets carry `helm.sh/resource-policy: keep` and
@@ -362,6 +363,37 @@ server time, by default. `gc.aggressive` turns on aggressive mode.
 starts a gc of its own. Set `gc.startTime` and `gc.interval` to `null`
 to turn the scheduler off.
 
+To run gc outside Gerrit's JVM instead, set `gc.cronJob.enabled`. The
+two modes are exclusive: the chart then leaves `gc.startTime` and
+`gc.interval` out of `gerrit.config`, and the `<fullname>-git-gc`
+`CronJob` runs `files/scripts/git-gc.sh` on `gc.cronJob.schedule`,
+Sunday at 03:00 by default. The script runs `git gc` with
+`gc.cronJob.args`, `--auto` by default, over every repository under
+`git/`. Each list entry reaches git as one argument, so
+`--prune=2 weeks ago` needs no quoting:
+
+- `etc/jgit.config` is its system git config, so the `[gc]`, `[pack]`
+  and `[core]` settings Gerrit uses apply, and `gc.aggressive` adds
+  `--aggressive`;
+- `gc.autoDetach` is off, so `git gc --auto` finishes before the Job
+  does and a failure counts against it;
+- a lock on `chart-gc.lock` in each repository skips one that another
+  run still holds;
+- a repository that fails does not stop the rest, and the Job fails
+  after the last one.
+
+With `--auto`, git packs a repository only once it holds more loose
+objects than `gc.auto` allows; set `gc.cronJob.args` to `[]` for a
+full gc every run. The Job runs as the Gerrit UID with
+`concurrencyPolicy: Forbid`, mounts the site volume read-write, has no
+service account token and, with `networkPolicy.enabled`, a
+`NetworkPolicy` that denies it all traffic. It runs only on the node
+the Gerrit pod runs on, where a `ReadWriteOnce` volume is already
+attached; while Gerrit is down the Job waits in `Pending` and starts
+once the Gerrit pod is back. The chart cuts the `<fullname>` prefix of
+the `CronJob` name to 45 characters, within the 52 that Kubernetes
+allows a `CronJob`.
+
 ### Cache limits
 
 Gerrit keeps its persistent caches as H2 files under `cache/`. Once a
@@ -476,7 +508,8 @@ must render the `gerrit.config`, `jgit.config` and `notedb.config` in
 `tests/chart/golden/<example>/`, and `templates/ingress.yaml` as a
 plain Ingress and as Traefik objects in `ingress-plain.golden` and
 `ingress-traefik.golden` there, and `render-config.sh` must write the
-`secure.config` there with mode `0600`. After an intended change to
+`secure.config` there with mode `0600`. With `gc.cronJob.enabled`,
+`templates/gc-cronjob.yaml` must render `gc-cronjob.golden`. After an intended change to
 the rendered output, regenerate the goldens and review the diff:
 
 ```sh

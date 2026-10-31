@@ -123,6 +123,19 @@ gc:
   startTime: Sun 03:00
   interval: 1 week
   aggressive: null
+  # Run git gc from a CronJob outside Gerrit's JVM instead. The modes
+  # are exclusive: with the CronJob enabled, gerrit.config leaves
+  # startTime and interval out and Gerrit's scheduler stays off.
+  cronJob:
+    enabled: false
+    schedule: "0 3 * * 0"
+    timeZone: ""                  # e.g. Etc/UTC; "" for the controller's
+    # git gc options, each passed to git as one argument; with --auto
+    # git packs a repository only once it holds more loose objects
+    # than gc.auto in jgit.config allows, and [] runs a full gc
+    args:
+      - --auto
+    resources: {}
 
 plugins:
   allowRemoteAdmin: false

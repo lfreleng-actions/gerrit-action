@@ -20,6 +20,12 @@ ConfigMap. Keys the chart derives win over the same key in values.
 {{- range $sections }}
 {{- $values := deepCopy (default dict (index $v .)) -}}
 {{- if eq . "gerrit" }}{{ $values = dict }}{{ end -}}
+{{- if eq . "gc" }}
+{{- $values = omit $values "cronJob" -}}
+{{- if dig "cronJob" "enabled" false $v.gc }}
+{{- $values = omit $values "startTime" "interval" -}}
+{{- end }}
+{{- end -}}
 {{- if eq . "cache" }}
 {{- /* cache.limits fills diskLimit into each named subsection that
 does not set its own */}}

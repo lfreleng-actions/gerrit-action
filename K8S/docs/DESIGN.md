@@ -109,11 +109,15 @@ must succeed before the next starts:
 2. `site-import`: adopts an existing site from an archive, or records
    that the site starts fresh, and keeps its state on the volume
    (section 1.7).
-3. `site-init`: runs `gerrit init --batch --no-auto-start` when
-   `etc/gerrit.config` is absent, so a restart never re-initialises a
-   site; then copies `gerrit.war` and `gerrit.sh` from the image and
+3. `site-init`: copies `gerrit.war` and `gerrit.sh` from the image,
    replaces the site's plugin and library jars with those named in
-   `pluginCatalogue`.
+   `pluginCatalogue`, and installs the rendered `gerrit.config`,
+   `jgit.config` and `notedb.config` (section 1.4). On a site without
+   the repository `gerrit.allProjects` names (`All-Projects` by
+   default) it then runs
+   `gerrit init --batch --no-auto-start` on that configuration, so a
+   restart never re-initialises a site, and installs the rendered
+   files again over whatever init added.
 4. `render-config`: writes `etc/secure.config` from the Secrets
    (section 1.4).
 5. `gerrit`: runs `bin/gerrit.sh run`. A startup probe allows ten
@@ -130,13 +134,15 @@ The volume holds state only. Configuration comes from chart values and
 Secrets in two stages, as #234 specifies:
 
 - **`gerrit.config` from Helm.** Helm renders the complete
-  `gerrit.config` into a ConfigMap, so the output of `helm template`
-  is the configuration Gerrit runs with and golden tests can compare
-  it without a cluster. The file on the volume is replaced from the
-  ConfigMap at every start. The skeleton still passes the individual
-  values to `site-init` as environment variables in
-  `<fullname>-config`, which writes them with `git config`; #234
-  replaces that with the rendered file.
+  `gerrit.config` from `files/conf/gerrit.config.tpl` into the
+  `<fullname>-config` ConfigMap, beside `jgit.config` and
+  `notedb.config`, so the output of `helm template` is the
+  configuration Gerrit runs with and the golden tests in `tests/chart/`
+  compare it without a cluster. `site-init` replaces the files on the
+  volume from the ConfigMap at every start. Typed values cover the
+  settings the chart reasons about, one top-level value per
+  `gerrit.config` section; `gerrit.extraConfig` is appended verbatim
+  for the rest.
 - **`secure.config` from Secrets.** The `render-config` init
   container writes `etc/secure.config` at every start from individual
   environment variables, each filled from one Secret key with
@@ -156,8 +162,8 @@ records it in the change notes it writes and refuses to load changes
 stamped with an ID it does not recognise
 ([config-gerrit: gerrit.serverId][gc-serverid]), so a render that
 drops or changes it makes every existing change unreadable. This
-record therefore treats `gerrit.serverId` as a required value that the
-rendered `gerrit.config` carries, and:
+record therefore treats `gerrit.serverId` as a value no render may
+change, and:
 
 - `site-import` reads `gerrit.serverId` from the archive's
   `site/etc/gerrit.config` and fails, before it changes the volume,
@@ -165,14 +171,17 @@ rendered `gerrit.config` carries, and:
 - on a fresh site, the rendered `gerrit.config`, value included, is
   in `etc/` before `gerrit init` runs, so the site takes the value as
   its ID instead of generating one;
-- the stage that installs the rendered `gerrit.config` fails, and
-  Gerrit does not start, when the value is empty, or when the site
-  already holds a `gerrit.config` whose `gerrit.serverId` differs, so
+- `site-init`, which installs the rendered `gerrit.config`, fails, and
+  Gerrit does not start, when the site already holds a
+  `gerrit.config` whose `gerrit.serverId` differs from the value, so
   no later render can change the ID either.
 
-The skeleton has no `gerrit.serverId` value yet. Section 7 records
-confirming this requirement, and the stage order it needs, against
-#234.
+The value may be empty, so that a new site needs no ID chosen in
+advance: Gerrit then generates one, and `site-init` reads the site's
+ID before each render replaces the file and carries it into the
+installed `gerrit.config`. A site `gerrit.config` it cannot read or
+parse stops `site-init`, rather than reading as a site with no ID. An
+import of an existing site sets the value from the source.
 
 The rendered `gerrit.config` sets `gerrit.basePath` to the git store on
 the volume, `gerrit.canonicalWebUrl` to
@@ -328,7 +337,11 @@ the cluster serves it on port 443.
 
 **Per-feature egress.** The design is that egress beyond DNS is per
 feature: each rule exists because a feature the chart supports needs
-it, and the list grows with the features.
+it, and the list grows with the features. The mail rule is rendered
+today: with `sendemail.smtpServer` set and `sendemail.enable` not
+`false`, the chart allows TCP egress to `sendemail.smtpServerPort`,
+or to Gerrit's default of 465 with `smtpEncryption: ssl` and 25
+otherwise.
 
 | Feature | Egress | Rendered when |
 | ------- | ------ | ------------- |
@@ -538,7 +551,7 @@ sources belong to the deployment, not this document.
 | Value | Keys | Consumer | Notes |
 | ----- | ---- | -------- | ----- |
 | `secrets.admin.existingSecret` | `username`, `password` | Not consumed yet | Generated as `<fullname>-admin` when empty. Later chart work bootstraps the administrator account from it. |
-| `secrets.secureConfig.existingSecret` | `registerEmailPrivateKey` | `render-config` | Generated as `<fullname>-secure-config` when empty. Passed as `GERRIT_REGISTER_EMAIL_PRIVATE_KEY` and written to `auth.registerEmailPrivateKey` in `etc/secure.config`. Each later `secure.config` entry adds one key here and one environment variable (#234). |
+| `secrets.secureConfig.existingSecret` | `registerEmailPrivateKey`, and optionally `smtpPass` | `render-config` | Generated as `<fullname>-secure-config` when empty, with an empty `smtpPass` the operator fills in. Passed as `GERRIT_REGISTER_EMAIL_PRIVATE_KEY` and `GERRIT_SMTP_PASS` and written to `auth.registerEmailPrivateKey` and, when not empty, `sendemail.smtpPass` in `etc/secure.config`. Each later `secure.config` entry adds one key here and one environment variable. |
 | `auth.saml.existingSecret` | `samlKeystore.jks`, `keystore-password`, `private-key-password`, and optionally `idp-metadata.xml` | `render-config` | As #235 specifies. The keystore, and the IdP metadata when it is a file rather than `auth.saml.metadataUrl`, are copied to `etc/` with mode `0600`; the two passwords go into the `[saml]` section of `etc/secure.config`, never into values. To adopt a site that already uses SAML, the operator fills this Secret with the source's keystore, so the service provider keeps the key the identity provider trusts; a new keystore breaks every login until the IdP is updated. |
 | `replication.sshKeySecret` | `id_ed25519` (or `id_rsa`), and optionally `known_hosts` | Gerrit pod | As #236 specifies. SSH identity for the replication remotes, and their pinned host keys. |
 | `siteImport.source.existingSecret` | `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, and `age-identity` or `gpg-private-key` | `site-import` | Reads and decrypts the archive. The object-store keys are optional where the platform supplies workload identity. |
@@ -637,12 +650,6 @@ reference; each updates the section it changes.
 
 Open questions:
 
-- **Server ID.** Section 1.4 treats `gerrit.serverId` as a required
-  value that no render may change, and needs the rendered
-  `gerrit.config` in place before `gerrit init` on a fresh site; the
-  skeleton's `site-init` instead initialises when `etc/gerrit.config`
-  is absent. #234 should confirm both, or the section changes to
-  match.
 - **Configuration drift on import.** Section 1.4 says the import
   reports differences between the imported `gerrit.config` and the
   values. A different `gerrit.serverId` always fails the import;

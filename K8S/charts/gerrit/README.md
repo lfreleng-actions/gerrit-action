@@ -6,9 +6,10 @@ SPDX-FileCopyrightText: 2026 The Linux Foundation
 # Gerrit Helm chart
 
 Runs one Gerrit primary per release as a single-replica `StatefulSet`
-with its site on a persistent volume. This is the chart skeleton: it
-installs, becomes Ready and serves Git over HTTP. Configuration breadth
-arrives in later changes.
+with its site on a persistent volume. Gerrit's configuration comes
+from chart values: Helm renders `etc/gerrit.config`, and
+`etc/secure.config` is written at pod start from Secrets, so the site
+volume holds state only.
 
 ## What it deploys
 
@@ -19,10 +20,10 @@ arrives in later changes.
 | `Service` `<fullname>-ssh`        | Port 29418, type `LoadBalancer`; only with `ssh.service.enabled` |
 | `Service` `<fullname>-headless`   | Governing service of the `StatefulSet`                         |
 | `ConfigMap` `<fullname>-scripts`  | `files/scripts/*.sh`                                           |
-| `ConfigMap` `<fullname>-config`   | `gerrit.config` values, passed to `site-init.sh` as env        |
+| `ConfigMap` `<fullname>-config`   | Rendered `gerrit.config`, `jgit.config` and `notedb.config`    |
 | `Secret` `<fullname>-admin`       | Admin credential placeholder; not consumed yet                 |
-| `Secret` `<fullname>-secure-config` | Values `render-config.sh` writes to `etc/secure.config`      |
-| `NetworkPolicy` (two)             | Default deny; allow ingress to 8080 and 29418, egress to DNS and HTTPS |
+| `Secret` `<fullname>-secure-config` | Values `render-config.sh` writes to `etc/secure.config`; see the Secret contract |
+| `NetworkPolicy` (two)             | Default deny; allow ingress to 8080 and 29418, egress to DNS, HTTPS and, with mail configured, the SMTP relay's port |
 
 The Secrets carry `helm.sh/resource-policy: keep` and
 `argocd.argoproj.io/sync-options: Prune=false,Delete=false`, so they
@@ -40,17 +41,34 @@ and set `secrets.admin.existingSecret` and
 renders neither Secret, and `render-config` reads the named
 secure-config Secret.
 
+### Secret contract
+
+| Value                                 | Key                       | Required | Written to                                    |
+| ------------------------------------- | ------------------------- | -------- | --------------------------------------------- |
+| `secrets.admin.existingSecret`        | `username`, `password`    | Yes      | Not consumed yet                              |
+| `secrets.secureConfig.existingSecret` | `registerEmailPrivateKey` | Yes      | `auth.registerEmailPrivateKey` in `secure.config` |
+| `secrets.secureConfig.existingSecret` | `smtpPass`                | No       | `sendemail.smtpPass` in `secure.config`       |
+
+The generated `<fullname>-secure-config` Secret carries a random
+`registerEmailPrivateKey` and an empty `smtpPass`. Fill `smtpPass` in
+the cluster when the mail relay needs a password; upgrades keep it. An
+empty or absent optional key leaves its entry out of `secure.config`.
+
 ## Start-up sequence
 
 1. `volume-permissions` (only with
    `persistence.volumePermissions.enabled`) chowns anything on the site
    volume the `gerrit` user (UID 1001) does not own.
-2. `site-init` runs `gerrit init --batch --no-auto-start` when
-   `etc/gerrit.config` is absent, so a restart never re-initialises a
-   site. At every start it copies `gerrit.war` and `gerrit.sh` from the
-   image, replaces the site's plugin and library jars with those named
-   in `pluginCatalogue`, and writes `gerrit.config` with `git config`.
-3. `render-config` rewrites `etc/secure.config` from the Secrets.
+2. `site-init` copies `gerrit.war` and `gerrit.sh` from the image,
+   replaces the site's plugin and library jars with those named in
+   `pluginCatalogue`, and copies the rendered `gerrit.config`,
+   `jgit.config` and `notedb.config` over the site's own. On a site
+   without the repository `gerrit.allProjects` names (`All-Projects`
+   unless `gerrit.extraConfig` sets it) it then runs
+   `gerrit init --batch --no-auto-start` on that configuration and
+   installs the rendered files again over whatever init added.
+3. `render-config` rewrites `etc/secure.config` from the Secrets,
+   creating it with mode `0600` before writing any value.
 4. `gerrit` runs `bin/gerrit.sh run`. A startup probe allows ten
    minutes; readiness and liveness probes call
    `<urlPrefix>/config/server/version`.
@@ -69,7 +87,9 @@ mounts empty anonymous volumes over them and the site disappears.
 | `image.digest`                           | `""`                             | Takes precedence over the tag when set                     |
 | `gerrit.host`                            | `gerrit.example.org`             | Host part of `gerrit.canonicalWebUrl`                      |
 | `gerrit.urlPrefix`                       | `/r`                             | Served path prefix; `""` serves from the root              |
-| `gerrit.auth`                            | `DEVELOPMENT_BECOME_ANY_ACCOUNT` | Smoke default only; never use it in production             |
+| `gerrit.instanceId`                      | `""`                             | `gerrit.instanceId`; left out when empty                   |
+| `gerrit.serverId`                        | `""`                             | See [Server ID](#server-id)                                |
+| `gerrit.extraConfig`                     | `""`                             | Appended verbatim to `gerrit.config`                       |
 | `gerrit.webScheme`                       | `https`                          | Scheme of `gerrit.canonicalWebUrl`                         |
 | `gerrit.listenScheme`                    | `proxy-https`                    | `httpd.listenUrl` scheme; `http` for direct access         |
 | `pluginCatalogue.path`                   | `/var/gerrit-catalogue`          | Image directory holding `plugins/` and `lib/`              |
@@ -78,12 +98,71 @@ mounts empty anonymous volumes over them and the site disappears.
 | `persistence.size`                       | `20Gi`                           |                                                            |
 | `persistence.volumePermissions.enabled`  | `false`                          | See below                                                  |
 | `resources`                              | 500m / 2Gi, 4Gi limit            |                                                            |
-| `javaOptions`                            | `""`                             | When empty, the heap is 70% of `resources.limits.memory`   |
 | `secrets.admin.existingSecret`           | `""`                             | Pre-created Secret with `username` and `password`          |
 | `secrets.secureConfig.existingSecret`    | `""`                             | Pre-created Secret with `registerEmailPrivateKey`          |
 | `ssh.advertisedAddress`                  | `""`                             | Defaults to `gerrit.host`, without its port, on port 29418 |
 | `ssh.service.enabled`                    | `false`                          | Adds the SSH `Service`                                     |
 | `networkPolicy.enabled`                  | `true`                           |                                                            |
+
+### gerrit.config
+
+Helm renders the whole of `etc/gerrit.config` from
+`files/conf/gerrit.config.tpl`, so `helm template` shows the
+configuration Gerrit runs with, and `site-init` replaces the site's
+file with it at every start. Edits made on the volume do not survive a
+restart.
+
+The chart derives these keys, and they win over the same key in
+values:
+
+| Key                         | Value                                                         |
+| --------------------------- | ------------------------------------------------------------- |
+| `gerrit.basePath`           | `git`                                                         |
+| `gerrit.canonicalWebUrl`    | `<gerrit.webScheme>://<gerrit.host><gerrit.urlPrefix>/`       |
+| `httpd.listenUrl`           | `<gerrit.listenScheme>://*:8080<gerrit.urlPrefix>/`           |
+| `sshd.advertisedAddress`    | `ssh.advertisedAddress`, else `gerrit.host` on port 29418     |
+| `cache.directory`           | `cache`                                                       |
+| `container.javaOptions`     | The options the image needs, then `-XX:MaxRAMPercentage=70.0` unless `container.heapLimit` is set or there is no memory limit, then `container.javaOptions` from values |
+
+Each of these top-level values renders the `gerrit.config` section of
+the same name, key for key, with the defaults `values.yaml` lists:
+`httpd`, `sshd`, `auth`, `sendemail`, `container`, `cache`, `change`,
+`receive`, `download`, `index`, `gc`, `plugins`, `user`, `trackingid`,
+`accounts` and `suggest`. A key set to `null` or `""` is left out, so
+Gerrit's own default applies; a list repeats the key; a map renders a
+subsection, as in `cache.diff_summary.diskLimit` becoming
+`[cache "diff_summary"]`. Notable defaults:
+
+| Value                       | Default                          | Notes                                                    |
+| --------------------------- | -------------------------------- | -------------------------------------------------------- |
+| `auth.type`                 | `DEVELOPMENT_BECOME_ANY_ACCOUNT` | Smoke default only; never use it in production           |
+| `sendemail.enable`          | `false`                          | Gerrit's default relays through `localhost`, which the pod lacks |
+| `sshd.listenAddress`        | `*:29418`                        |                                                          |
+| `container.user`            | `gerrit`                         |                                                          |
+| `cache.*.diskLimit`         | `1g`                             | For `diff_summary`, `gerrit_file_diff`, `git_file_diff` and `modified_files` |
+| `plugins.allowRemoteAdmin`  | `false`                          | Plugins come from `pluginCatalogue`, not remote installs |
+
+`jgit` and `notedb` render `etc/jgit.config` and `etc/notedb.config`
+the same way, each top-level key a section. Secrets never go in
+values: `auth.registerEmailPrivateKey` and `sendemail.smtpPass` come
+from the [Secret contract](#secret-contract).
+
+`gerrit.extraConfig` is appended verbatim, for settings with no typed
+value. A key there that a typed value also sets adds a second entry
+rather than replacing the first, so set such keys through the typed
+value.
+
+### Server ID
+
+`gerrit.serverId` is site identity: Gerrit stamps it on every change
+and refuses to load changes stamped with an ID it does not know. With
+the value empty, Gerrit generates an ID on a new site and `site-init`
+carries the site's ID into every later render. `site-init` stops
+rather than read an unreadable or malformed `etc/gerrit.config` as
+holding no ID. With the value set, `site-init` fails before Gerrit
+starts when the site already holds a different ID, and on a new site
+`gerrit init` takes it as the site's ID. When adopting an existing
+site, copy the ID from its `etc/gerrit.config`.
 
 ### Volume permissions
 
@@ -138,3 +217,13 @@ with each values file under `examples/`. With `image.digest` set, it
 parses each render with `scripts/lib/chart_digests.py` and checks
 that every container, init container and ephemeral container image
 ends in that digest.
+
+`tests/chart/` holds golden tests: each values file under `examples/`
+must render the `gerrit.config`, `jgit.config` and `notedb.config` in
+`tests/chart/golden/<example>/`, and `render-config.sh` must write the
+`secure.config` there with mode `0600`. After an intended change to
+the rendered output, regenerate the goldens and review the diff:
+
+```sh
+UPDATE_GOLDEN=1 uv run --extra test pytest tests/chart
+```

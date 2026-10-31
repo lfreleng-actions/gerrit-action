@@ -106,7 +106,6 @@ def test_every_example_has_goldens() -> None:
     assert len(examples) >= 3
 
 
-@pytest.mark.xfail(strict=True, reason="the chart renders no gerrit.config yet")
 @pytest.mark.parametrize("example", EXAMPLE_NAMES)
 def test_rendered_config_matches_golden(example: str) -> None:
     data = render_config(EXAMPLES / f"{example}.yaml")
@@ -118,7 +117,6 @@ def test_rendered_config_matches_golden(example: str) -> None:
         assert data[name] == read_golden(golden), f"{example}/{name}"
 
 
-@pytest.mark.xfail(strict=True, reason="the chart renders no gerrit.config yet")
 @pytest.mark.parametrize("example", EXAMPLE_NAMES)
 def test_rendered_config_parses_as_git_config(example: str, tmp_path: Path) -> None:
     data = render_config(EXAMPLES / f"{example}.yaml")
@@ -134,7 +132,6 @@ def test_rendered_config_parses_as_git_config(example: str, tmp_path: Path) -> N
         assert proc.returncode == 0, f"{example}/{name}: {proc.stderr}"
 
 
-@pytest.mark.xfail(strict=True, reason="the chart renders no gerrit.config yet")
 def test_secrets_stay_out_of_the_rendered_config() -> None:
     data = render_config(EXAMPLES / "values-one-segment-prefix.yaml")
     config = data["gerrit.config"].lower()
@@ -146,13 +143,11 @@ def test_no_smtp_egress_without_mail() -> None:
     assert egress_ports() == {53, 443}
 
 
-@pytest.mark.xfail(strict=True, reason="the chart opens no SMTP egress yet")
 def test_smtp_egress_uses_the_configured_port() -> None:
     ports = egress_ports("-f", str(EXAMPLES / "values-one-segment-prefix.yaml"))
     assert 587 in ports
 
 
-@pytest.mark.xfail(strict=True, reason="the chart opens no SMTP egress yet")
 @pytest.mark.parametrize(("encryption", "port"), [("none", 25), ("ssl", 465)])
 def test_smtp_egress_defaults_to_gerrits_port(encryption: str, port: int) -> None:
     ports = egress_ports(

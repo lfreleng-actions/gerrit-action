@@ -2,17 +2,19 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: 2026 The Linux Foundation
 
-# Prepare the Gerrit site on the persistent volume. The first boot
-# runs "gerrit init"; every start refreshes the binaries and enabled
-# plugins from the image and writes gerrit.config from the environment.
-# The volume is mounted at GERRIT_SITE so the image's /var/gerrit stays
-# visible.
+# Prepare the Gerrit site on the persistent volume. Every start
+# replaces etc/gerrit.config, jgit.config and notedb.config with the
+# files the chart rendered, and refreshes the binaries and enabled
+# plugins from the image; the first boot then runs "gerrit init" on
+# the rendered configuration. The volume is mounted at GERRIT_SITE so
+# the image's /var/gerrit stays visible.
 
 set -eu
 
 site=${GERRIT_SITE:?}
 image_bin=/var/gerrit/bin
 config="$site/etc/gerrit.config"
+rendered=${GERRIT_RENDERED_CONFIG:?}
 catalogue=${GERRIT_CATALOGUE:-/var/gerrit-catalogue}
 
 # Create the directories the pod mounts by subPath before the kubelet
@@ -20,16 +22,6 @@ catalogue=${GERRIT_CATALOGUE:-/var/gerrit-catalogue}
 # shellcheck disable=SC2086
 (cd "$site" && mkdir -p bin plugins lib ${GERRIT_SITE_DIRS:-})
 cp "$image_bin/gerrit.war" "$image_bin/gerrit.sh" "$site/bin/"
-
-# The launcher unpacks into ~/.gerritcodereview, and the gerrit user's
-# home is the image's read-only /var/gerrit, so point it at /tmp
-if [ ! -f "$config" ]; then
-  echo "Initialising a new Gerrit site in $site"
-  java -Duser.home=/tmp \
-    --add-opens java.base/java.net=ALL-UNNAMED \
-    --add-opens java.base/java.lang.invoke=ALL-UNNAMED \
-    -jar "$site/bin/gerrit.war" init --batch --no-auto-start -d "$site"
-fi
 
 # The site's plugins and libraries are exactly the ones named: clear
 # them, then copy each from the image catalogue. An absent catalogue
@@ -58,29 +50,65 @@ copy_jars plugins "$site/plugins" ${GERRIT_PLUGINS:-}
 copy_jars lib "$site/lib" ${GERRIT_LIBS:-}
 set +f
 
-cfg() {
-  git config -f "$config" "$@"
+# Print a key from a config file, or nothing when the key is absent.
+# Any other failure, such as an unreadable or malformed file, stops
+# the script: reading it as absent could discard the site's identity.
+get_key() {
+  if [ ! -r "$1" ]; then
+    echo "ERROR: cannot read $1" >&2
+    exit 1
+  fi
+  rc=0
+  git config -f "$1" --get "$2" || rc=$?
+  if [ "$rc" -gt 1 ]; then
+    echo "ERROR: cannot read $2 from $1" >&2
+    exit 1
+  fi
 }
 
-cfg gerrit.canonicalWebUrl "${GERRIT_CANONICAL_WEB_URL:?}"
-cfg httpd.listenUrl "${GERRIT_LISTEN_URL:?}"
-cfg sshd.listenAddress "${GERRIT_SSHD_LISTEN_ADDRESS:?}"
-cfg sshd.advertisedAddress "${GERRIT_SSHD_ADVERTISED_ADDRESS:?}"
-cfg auth.type "${GERRIT_AUTH_TYPE:?}"
-cfg container.user gerrit
-
-# git config exits 5 when there is nothing to unset
-cfg --unset-all container.javaOptions || [ "$?" -eq 5 ]
-for opt in \
-  "-Dflogger.backend_factory=com.google.common.flogger.backend.log4j.Log4jBackendFactory#getInstance" \
-  "-Dflogger.logging_context=com.google.gerrit.server.logging.LoggingContext#getInstance" \
-  "-Djava.security.egd=file:/dev/./urandom" \
-  "--add-opens java.base/java.net=ALL-UNNAMED" \
-  "--add-opens java.base/java.lang.invoke=ALL-UNNAMED" \
-  "${GERRIT_JAVA_OPTIONS:-}"; do
-  if [ -n "$opt" ]; then
-    cfg --add container.javaOptions "$opt"
+# gerrit.serverId is site identity: Gerrit refuses changes stamped
+# with another ID, so no render may change it. An empty value keeps
+# the site's own ID.
+want_id=$(get_key "$rendered/gerrit.config" gerrit.serverId)
+site_id() {
+  if [ -e "$config" ]; then
+    get_key "$config" gerrit.serverId
   fi
-done
+}
+have_id=$(site_id)
+if [ -n "$want_id" ] && [ -n "$have_id" ] && [ "$want_id" != "$have_id" ]; then
+  echo "ERROR: gerrit.serverId $want_id does not match the site's $have_id" >&2
+  exit 1
+fi
+
+install_config() {
+  cp "$rendered/gerrit.config" "$config.new"
+  if [ -z "$want_id" ] && [ -n "$have_id" ]; then
+    git config -f "$config.new" gerrit.serverId "$have_id"
+  fi
+  mv -f "$config.new" "$config"
+  for name in jgit.config notedb.config; do
+    cp "$rendered/$name" "$site/etc/$name"
+  done
+}
+
+install_config
+
+# A site without its All-Projects repository, named by
+# gerrit.allProjects, has never been initialised. Init runs on the
+# rendered configuration, so a set serverId becomes the site's ID;
+# the render is then installed again over whatever init added. The
+# launcher unpacks into ~/.gerritcodereview, and the gerrit user's
+# home is the image's read-only /var/gerrit, so point it at /tmp.
+all_projects=$(get_key "$config" gerrit.allProjects)
+if [ ! -d "$site/git/${all_projects:-All-Projects}.git" ]; then
+  echo "Initialising a new Gerrit site in $site"
+  java -Duser.home=/tmp \
+    --add-opens java.base/java.net=ALL-UNNAMED \
+    --add-opens java.base/java.lang.invoke=ALL-UNNAMED \
+    -jar "$site/bin/gerrit.war" init --batch --no-auto-start -d "$site"
+  have_id=$(site_id)
+  install_config
+fi
 
 echo "Gerrit site in $site is ready"

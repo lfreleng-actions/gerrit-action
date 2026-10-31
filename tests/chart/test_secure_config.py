@@ -67,7 +67,6 @@ def test_secure_config_is_private(site: Path) -> None:
     assert mode == 0o600
 
 
-@pytest.mark.xfail(strict=True, reason="render-config.sh writes no smtpPass yet")
 def test_secure_config_matches_golden(site: Path) -> None:
     proc = run_script(site, SECRET_ENV)
     assert proc.returncode == 0, proc.stderr

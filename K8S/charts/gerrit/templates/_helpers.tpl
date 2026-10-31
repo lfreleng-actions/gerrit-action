@@ -121,13 +121,83 @@ argocd.argoproj.io/sync-options: Prune=false,Delete=false
 {{- default (printf "%s:29418" $host) .Values.ssh.advertisedAddress -}}
 {{- end -}}
 
-{{/* Heap as a share of the container memory limit unless set */}}
+{{/* container.javaOptions: the options the image needs, a heap of 70%
+of the memory limit unless container.heapLimit is set, then the
+operator's own, as a list */}}
 {{- define "gerrit.javaOptions" -}}
-{{- if .Values.javaOptions -}}
-{{- .Values.javaOptions -}}
-{{- else if dig "limits" "memory" "" (default dict .Values.resources) -}}
--XX:MaxRAMPercentage=70.0
+{{- $opts := list
+  "-Dflogger.backend_factory=com.google.common.flogger.backend.log4j.Log4jBackendFactory#getInstance"
+  "-Dflogger.logging_context=com.google.gerrit.server.logging.LoggingContext#getInstance"
+  "-Djava.security.egd=file:/dev/./urandom"
+  "--add-opens java.base/java.net=ALL-UNNAMED"
+  "--add-opens java.base/java.lang.invoke=ALL-UNNAMED" -}}
+{{- if and (not .Values.container.heapLimit) (dig "limits" "memory" "" (default dict .Values.resources)) -}}
+{{- $opts = append $opts "-XX:MaxRAMPercentage=70.0" -}}
 {{- end -}}
+{{- toJson (concat $opts (default list .Values.container.javaOptions)) -}}
+{{- end -}}
+
+{{/* One git-config value. Whole numbers print without an exponent;
+strings are quoted when git config would otherwise misread them. */}}
+{{- define "gerrit.configValue" -}}
+{{- if kindIs "float64" . -}}
+{{- if eq . (float64 (int64 .)) }}{{ int64 . }}{{ else }}{{ . }}{{ end -}}
+{{- else if kindIs "string" . -}}
+{{- if regexMatch "(^\\s|\\s$|[#;\"\\\\]|\\n)" . -}}
+"{{ . | replace "\\" "\\\\" | replace "\"" "\\\"" | replace "\n" "\\n" }}"
+{{- else -}}
+{{ . }}
+{{- end -}}
+{{- else -}}
+{{ . }}
+{{- end -}}
+{{- end -}}
+
+{{/* The key lines of one section: null and "" are left out, a list
+repeats the key */}}
+{{- define "gerrit.configKeys" -}}
+{{- range $key, $value := . }}
+{{- if kindIs "slice" $value }}
+{{- range $value }}
+{{ printf "\t%s = %s" $key (include "gerrit.configValue" .) }}
+{{- end }}
+{{- else if not (or (kindIs "invalid" $value) (and (kindIs "string" $value) (eq $value ""))) }}
+{{ printf "\t%s = %s" $key (include "gerrit.configValue" $value) }}
+{{- end }}
+{{- end }}
+{{- end -}}
+
+{{/* A git-config section from a map: scalar and list keys under
+[name], and each map-valued key as a [name "key"] subsection. Renders
+nothing when no key has a value. */}}
+{{- define "gerrit.configSection" -}}
+{{- $name := .name -}}
+{{- $plain := dict -}}
+{{- $subs := dict -}}
+{{- range $key, $value := (default dict .values) -}}
+{{- if kindIs "map" $value -}}
+{{- $_ := set $subs $key $value -}}
+{{- else -}}
+{{- $_ := set $plain $key $value -}}
+{{- end -}}
+{{- end -}}
+{{- $keys := include "gerrit.configKeys" $plain -}}
+{{- if $keys }}
+[{{ $name }}]{{ $keys }}
+{{- end }}
+{{- range $sub, $values := $subs }}
+{{- $keys := include "gerrit.configKeys" $values }}
+{{- if $keys }}
+[{{ $name }} "{{ $sub | replace "\\" "\\\\" | replace "\"" "\\\"" }}"]{{ $keys }}
+{{- end }}
+{{- end }}
+{{- end -}}
+
+{{/* A whole config file from a map of section name to section map */}}
+{{- define "gerrit.configFile" -}}
+{{- range $name, $values := . }}
+{{- include "gerrit.configSection" (dict "name" $name "values" $values) }}
+{{- end }}
 {{- end -}}
 
 {{/* Existing value of a Secret key, or a new random one. lookup sees
@@ -139,6 +209,15 @@ installs name pre-created Secrets in secrets.*.existingSecret. */}}
 {{- index $existing.data .key -}}
 {{- else -}}
 {{- randAlphaNum 40 | b64enc -}}
+{{- end -}}
+{{- end -}}
+
+{{/* Existing value of a Secret key, or an empty one, for keys the
+operator fills in after install */}}
+{{- define "gerrit.optionalSecretValue" -}}
+{{- $existing := lookup "v1" "Secret" .ctx.Release.Namespace .name -}}
+{{- if $existing -}}
+{{- index (default dict $existing.data) .key | default "" -}}
 {{- end -}}
 {{- end -}}
 

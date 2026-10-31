@@ -205,7 +205,6 @@ def test_fails_without_development_login(gerrit: tuple[StubGerrit, str]) -> None
         verify_site.start_session(base)
 
 
-@pytest.mark.xfail(strict=True, reason="check_server_info is not written yet")
 def test_server_info_matches(gerrit: tuple[StubGerrit, str]) -> None:
     _, base = gerrit
     detail = verify_site.check_server_info(
@@ -214,7 +213,6 @@ def test_server_info_matches(gerrit: tuple[StubGerrit, str]) -> None:
     assert detail == "auth DEVELOPMENT_BECOME_ANY_ACCOUNT; download schemes http, ssh"
 
 
-@pytest.mark.xfail(strict=True, reason="check_server_info is not written yet")
 def test_server_info_reports_without_expectations(
     gerrit: tuple[StubGerrit, str],
 ) -> None:
@@ -224,7 +222,6 @@ def test_server_info_reports_without_expectations(
     assert detail == "auth HTTP; download schemes none"
 
 
-@pytest.mark.xfail(strict=True, reason="check_server_info is not written yet")
 def test_server_info_wrong_auth_type(gerrit: tuple[StubGerrit, str]) -> None:
     _, base = gerrit
     with pytest.raises(
@@ -234,7 +231,6 @@ def test_server_info_wrong_auth_type(gerrit: tuple[StubGerrit, str]) -> None:
         verify_site.check_server_info(base, "HTTP", [])
 
 
-@pytest.mark.xfail(strict=True, reason="check_server_info is not written yet")
 def test_server_info_missing_download_scheme(
     gerrit: tuple[StubGerrit, str],
 ) -> None:
@@ -246,7 +242,6 @@ def test_server_info_missing_download_scheme(
         verify_site.check_server_info(base, None, ["ssh", "anonymous http"])
 
 
-@pytest.mark.xfail(strict=True, reason="--auth-type is not parsed yet")
 def test_parse_args_server_info_options() -> None:
     args = verify_site.parse_args(
         [

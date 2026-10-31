@@ -202,13 +202,19 @@ with an "empty repository" warning.
 
 `files/scripts/verify-site.py` runs the last four checks itself, port
 forwarding the Service and proving persistence with a marker project
-it creates before deleting the pod. It needs only python3, `kubectl`
-and `git`, and stays out of the scripts `ConfigMap`, which takes
-`*.sh` alone:
+it creates before deleting the pod. It also checks that
+`<urlPrefix>/config/server/info` reports the authentication type
+given with `--auth-type`, and each download scheme given with
+`--download-scheme`, by the name server info reports (`ssh`, `http`,
+`anonymous http`). Download schemes come from the `download-commands`
+plugin, so name them only when `pluginCatalogue` installs it. The
+script needs only python3, `kubectl` and `git`, and stays out of the
+scripts `ConfigMap`, which takes `*.sh` alone:
 
 ```sh
 python3 K8S/charts/gerrit/files/scripts/verify-site.py \
-  --namespace gerrit-smoke --fullname gerrit --url-prefix /r
+  --namespace gerrit-smoke --fullname gerrit --url-prefix /r \
+  --auth-type DEVELOPMENT_BECOME_ANY_ACCOUNT
 ```
 
 The `chart-smoke` job in `.github/workflows/testing.yaml` runs this

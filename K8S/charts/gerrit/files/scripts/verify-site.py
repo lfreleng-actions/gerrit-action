@@ -7,6 +7,9 @@
 Port-forwards the release's HTTP Service and checks that:
 
 - the version endpoint answers under the URL prefix;
+- ``config/server/info`` reports the configured authentication type
+  and download schemes, when ``--auth-type`` and ``--download-scheme``
+  name them;
 - ``All-Projects`` clones over HTTP;
 - the site survives a pod delete: a marker project created before the
   delete is still there once the StatefulSet has replaced the pod.
@@ -150,6 +153,23 @@ def check_version(base: str) -> str:
     return version
 
 
+def check_server_info(base: str, auth_type: str | None, schemes: list[str]) -> str:
+    """Check the auth type and download schemes server info reports."""
+    info = parse_gerrit_json(
+        http_get(urllib.request.build_opener(), f"{base}/config/server/info")
+    )
+    if not isinstance(info, dict):
+        raise CheckError(f"unexpected server info payload: {info!r}")
+    reported_auth = (info.get("auth") or {}).get("auth_type")
+    if auth_type is not None and reported_auth != auth_type:
+        raise CheckError(f"auth type {reported_auth!r}, expected {auth_type!r}")
+    reported = sorted((info.get("download") or {}).get("schemes") or {})
+    missing = [s for s in schemes if s not in reported]
+    if missing:
+        raise CheckError(f"download schemes {reported} lack {missing}")
+    return f"auth {reported_auth}; download schemes {', '.join(reported) or 'none'}"
+
+
 def check_clone(base: str, project: str) -> None:
     """Clone a project anonymously over HTTP into a scratch directory."""
     env = dict(os.environ, GIT_TERMINAL_PROMPT="0")
@@ -229,7 +249,7 @@ def start_session(base: str) -> tuple[urllib.request.OpenerDirector, str, int]:
     if not has_session():
         raise CheckError(
             f"development login set no session (HTTP {status}); "
-            "is gerrit.auth DEVELOPMENT_BECOME_ANY_ACCOUNT?"
+            "is auth.type DEVELOPMENT_BECOME_ANY_ACCOUNT?"
         )
     # The login reply sets no XSRF_TOKEN; the base page does, once signed in
     with contextlib.suppress(CheckError):
@@ -329,6 +349,13 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
         "Service <fullname>-http (default: gerrit)",
     )
     parser.add_argument("--url-prefix", default="/r")
+    parser.add_argument("--auth-type", help="auth type server info must report")
+    parser.add_argument(
+        "--download-scheme",
+        action="append",
+        default=[],
+        help="a download scheme server info must report, such as 'anonymous http'",
+    )
     parser.add_argument("--local-port", type=int, default=18080)
     parser.add_argument(
         "--timeout",
@@ -366,6 +393,11 @@ def main(argv: list[str] | None = None) -> int:
         return marker
 
     run_check(failures, "version endpoint", forwarded(check_version))
+    run_check(
+        failures,
+        "server info reports the configuration",
+        forwarded(lambda b: check_server_info(b, args.auth_type, args.download_scheme)),
+    )
     run_check(
         failures,
         "clone All-Projects over HTTP",

@@ -752,7 +752,7 @@ jobs:
           # Verify the site
           python3 "$CHART/files/scripts/verify-site.py" \
             --namespace "$SMOKE_NAMESPACE" --fullname gerrit \
-            --url-prefix /r
+            --url-prefix /r --auth-type DEVELOPMENT_BECOME_ANY_ACCOUNT
 
       - name: 'Collect diagnostics'
         if: failure()

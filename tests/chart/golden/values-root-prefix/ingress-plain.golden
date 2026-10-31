@@ -1,0 +1,38 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: 2026 The Linux Foundation
+---
+# Source: gerrit/templates/ingress.yaml
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: gerrit
+  namespace: gerrit-test
+  labels:
+    helm.sh/chart: gerrit-0.1.0
+    app.kubernetes.io/name: gerrit
+    app.kubernetes.io/instance: gerrit
+    app.kubernetes.io/version: "3.13.1"
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/part-of: gerrit
+  annotations:
+    cert-manager.io/cluster-issuer: letsencrypt-prod
+    nginx.ingress.kubernetes.io/proxy-body-size: "0"
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "3600"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "3600"
+spec:
+  ingressClassName: nginx
+  tls:
+    - hosts:
+        - "review.example.org"
+      secretName: gerrit-tls
+  rules:
+    - host: "review.example.org"
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: gerrit-http
+                port:
+                  name: http

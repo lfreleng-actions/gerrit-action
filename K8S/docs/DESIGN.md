@@ -185,11 +185,14 @@ import of an existing site sets the value from the source.
 
 The rendered `gerrit.config` sets `gerrit.basePath` to the git store on
 the volume, `gerrit.canonicalWebUrl` to
-`<gerrit.webScheme>://<gerrit.host><gerrit.urlPrefix>/` (for example
+`<scheme>://<gerrit.host><gerrit.urlPrefix>/` (for example
 `https://gerrit.example.org/r/`), and `httpd.listenUrl` to
-`<gerrit.listenScheme>://*:8080<gerrit.urlPrefix>/` (for example
+`<scheme>://*:8080<gerrit.urlPrefix>/` (for example
 `proxy-https://*:8080/r/`), so that Gerrit builds links with the
-prefix the Ingress serves
+prefix the Ingress serves. Behind the chart's Ingress the schemes are
+`https` and `proxy-https` with `ingress.tls.enabled`, and `http` and
+`proxy-http` without; with no Ingress they are `gerrit.webScheme` and
+`gerrit.listenScheme`
 ([config-gerrit: httpd.listenUrl][gc-listenurl]).
 
 ### 1.5 HTTP: ClusterIP Service behind an Ingress
@@ -199,23 +202,34 @@ HTTP reaches Gerrit through an Ingress and the `ClusterIP` Service
 `gerrit.urlPrefix` (`/r` by default, `""` for the root) and does not
 rewrite it: Gerrit expects the prefix in the request path when
 `httpd.listenUrl` carries one. TLS ends at the Ingress controller,
-which is why `gerrit.listenScheme` defaults to `proxy-https`. The
-headless Service `<fullname>-headless` governs the StatefulSet and
-carries no client traffic.
+which is why `httpd.listenUrl` uses `proxy-https`. The headless
+Service `<fullname>-headless` governs the StatefulSet and carries no
+client traffic.
 
-The skeleton renders no Ingress yet; it renders the Service, and a
-later sub-issue of #228 adds the Ingress (section 7).
+With `ingress.enabled` the chart renders a `networking.k8s.io/v1`
+`Ingress` with `pathType: Prefix` on the prefix, and with
+`ingress.tls.issuer` the cert-manager annotation that issues its
+certificate. With `ingress.traefik.enabled` it renders a Traefik
+`IngressRoute` instead, with `Middleware`s for the redirect from `/`
+to the prefix and for security headers, and a cert-manager
+`Certificate`. The chart README covers both and the controller
+settings a large `git push` needs.
 
 ### 1.6 SSH: LoadBalancer Service
 
 Gerrit's SSH daemon (port 29418) speaks a protocol an HTTP Ingress
 cannot route, so it gets its own Service, `<fullname>-ssh`, rendered
-when `ssh.service.enabled` is set; `ssh.service.type` defaults to
-`LoadBalancer`. `sshd.advertisedAddress` is `ssh.advertisedAddress`,
-or `gerrit.host` without any port followed by `:29418`. Where the
-platform supports it the Service should set
-`externalTrafficPolicy: Local`, so that Gerrit's SSH log records the
-client address rather than a node's. The skeleton does not set it yet.
+when `ssh.service.enabled` is set (the default); `ssh.service.type`
+defaults to `LoadBalancer`. `sshd.advertisedAddress` is `ssh.host`,
+or `gerrit.host`, without any port, followed by the SSH port:
+`ssh.port`, else `ssh.service.nodePort` on a `NodePort` Service, else
+29418; a `NodePort` Service with neither fails to render. The Service
+sets `externalTrafficPolicy: Local` (`ssh.service.externalTrafficPolicy`)
+when its type is `LoadBalancer` or `NodePort`, so that Gerrit's SSH
+log records the client address rather than a node's. With
+`ssh.service.externalDNS` it carries the external-dns hostname
+annotation for `ssh.host`, which then has to differ from `gerrit.host`
+when the Ingress is enabled.
 
 ### 1.7 Site import
 
@@ -326,7 +340,10 @@ With `networkPolicy.enabled` (the default), the chart installs a
 default-deny `NetworkPolicy` for ingress and egress on the Gerrit pod,
 then allows:
 
-- ingress to port 8080 (HTTP) and port 29418 (SSH);
+- ingress to port 8080 (HTTP), from the namespaces
+  `networkPolicy.ingressNamespaceSelector` selects when it is set,
+  such as the Ingress controller's, and from any source otherwise;
+- ingress to port 29418 (SSH) from any source;
 - egress to cluster DNS, UDP and TCP port 53.
 
 **Current default.** The skeleton (#254) also allows egress to TCP
@@ -361,7 +378,7 @@ feature's rule cannot name the host in its URL.
 
 Narrowing the default to the per-feature destinations, and excluding
 the Kubernetes API, which no pod needs (section 1.11), is follow-up
-chart work under #238. Until then, a deployment that needs tighter
+chart work under #228. Until then, a deployment that needs tighter
 egress enforces it outside the chart.
 
 ### 1.11 Pod Security and API access
@@ -637,16 +654,17 @@ reference; each updates the section it changes.
 - #235: SAML authentication, its Secret and its metadata egress
   (sections 1.10 and 5).
 - #236: replication and its SSH key Secret (sections 1.10 and 5).
-- #238: narrowing the egress default to the per-feature destinations
-  and excluding the Kubernetes API (section 1.10).
+- #238: the Ingress, the SSH `LoadBalancer` and the ingress rule for
+  the Ingress controller namespace (sections 1.5, 1.6 and 1.10).
 - #239: the export tool (merged); section 3 describes its output.
 - #240: the `site-import` init container and its state file
   (section 1.7).
 - #242: the backup CronJob and its `backup` manifests (sections 1.8
   and 3).
 - #256: the export tool leaving out `.chart/` (sections 1.7 and 3.1).
-- The other sub-issues of #228 cover the Ingress, the maintenance
-  CronJob, the admin toolbox and the Argo CD example.
+- The other sub-issues of #228 cover narrowing the egress default to
+  the per-feature destinations, the maintenance CronJob, the admin
+  toolbox and the Argo CD example.
 
 Open questions:
 

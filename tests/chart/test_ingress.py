@@ -6,7 +6,7 @@
 Renders ``templates/ingress.yaml`` for each values file under
 ``K8S/charts/gerrit/examples/``, once as a plain Ingress and once as a
 Traefik IngressRoute, and compares it with
-``tests/chart/golden/<example>/ingress-<mode>.yaml``. Also checks the
+``tests/chart/golden/<example>/ingress-<mode>.golden``. Also checks the
 SSH Service, the NetworkPolicy rules and the gerrit.config keys the
 chart derives from the same values.
 
@@ -80,7 +80,6 @@ def gerrit_config(docs: list[dict[str, Any]]) -> str:
     return config
 
 
-@pytest.mark.xfail(strict=True, reason="chart renders no Ingress yet")
 @pytest.mark.parametrize("mode", sorted(MODES))
 @pytest.mark.parametrize("example", EXAMPLE_NAMES)
 def test_ingress_matches_golden(example: str, mode: str) -> None:
@@ -96,7 +95,7 @@ def test_ingress_matches_golden(example: str, mode: str) -> None:
         "--show-only",
         "templates/ingress.yaml",
     )
-    golden = GOLDEN / example / f"ingress-{mode}.yaml"
+    golden = GOLDEN / example / f"ingress-{mode}.golden"
     if os.environ.get("UPDATE_GOLDEN"):
         golden.write_text(GOLDEN_HEADER + out, encoding="utf-8")
     assert out == read_golden(golden)
@@ -108,7 +107,6 @@ def test_no_ingress_by_default() -> None:
         assert not objects(docs, kind), kind
 
 
-@pytest.mark.xfail(strict=True, reason="chart renders no Ingress yet")
 @pytest.mark.parametrize(
     ("example", "host", "path"),
     [
@@ -142,7 +140,6 @@ def test_ingress_host_and_path_follow_values(
         }
 
 
-@pytest.mark.xfail(strict=True, reason="chart renders no Ingress yet")
 def test_nginx_has_no_root_path_without_the_redirect() -> None:
     docs = render(
         "-f",
@@ -158,14 +155,12 @@ def test_nginx_has_no_root_path_without_the_redirect() -> None:
     assert [p["path"] for p in rule["http"]["paths"]] == ["/gerrit"]
 
 
-@pytest.mark.xfail(strict=True, reason="chart renders no Ingress yet")
 def test_ingress_drops_the_port_from_the_host() -> None:
     docs = render("--set", "gerrit.host=gerrit.example.org:8443", *MODES["plain"])
     [rule] = named(docs, "Ingress", "gerrit")["spec"]["rules"]
     assert rule["host"] == "gerrit.example.org"
 
 
-@pytest.mark.xfail(strict=True, reason="chart renders no Ingress yet")
 def test_traefik_issues_a_certificate() -> None:
     docs = render(*MODES["traefik"])
     assert not objects(docs, "Ingress")
@@ -181,7 +176,6 @@ def test_traefik_issues_a_certificate() -> None:
     assert route["spec"]["tls"] == {"secretName": "gerrit-tls"}
 
 
-@pytest.mark.xfail(strict=True, reason="chart renders no Ingress yet")
 def test_traefik_class_annotation_yields_to_the_users() -> None:
     key = "kubernetes.io/ingress.class"
     route = named(render(*MODES["traefik"]), "IngressRoute", "gerrit")
@@ -195,7 +189,6 @@ def test_traefik_class_annotation_yields_to_the_users() -> None:
     assert route["metadata"]["annotations"][key] == "traefik-internal"
 
 
-@pytest.mark.xfail(strict=True, reason="redirect runs before the headers")
 def test_traefik_security_headers_wrap_the_root_redirect() -> None:
     route = named(render(*MODES["traefik"]), "IngressRoute", "gerrit")
     [root] = [r for r in route["spec"]["routes"] if "Path(`/`)" in r["match"]]
@@ -205,14 +198,12 @@ def test_traefik_security_headers_wrap_the_root_redirect() -> None:
     ]
 
 
-@pytest.mark.xfail(strict=True, reason="default CSP lacks worker-src")
 def test_traefik_default_csp_allows_blob_workers() -> None:
     headers = named(render(*MODES["traefik"]), "Middleware", "gerrit-security-headers")
     policy = headers["spec"]["headers"]["contentSecurityPolicy"]
     assert "worker-src 'self' blob:" in policy.split("; ")
 
 
-@pytest.mark.xfail(strict=True, reason="chart renders no Ingress yet")
 def test_tls_without_issuer_uses_the_operators_secret() -> None:
     args = ("--set", "ingress.tls.issuer=", "--set", "ingress.tls.secretName=own-tls")
     plain = render(*MODES["plain"], *args)
@@ -223,7 +214,6 @@ def test_tls_without_issuer_uses_the_operators_secret() -> None:
     assert not objects(traefik, "Certificate")
 
 
-@pytest.mark.xfail(strict=True, reason="chart renders no Ingress yet")
 @pytest.mark.parametrize(
     ("tls", "web", "listen"),
     [("true", "https", "proxy-https"), ("false", "http", "proxy-http")],
@@ -243,7 +233,6 @@ def test_ingress_tls_sets_the_url_schemes(tls: str, web: str, listen: str) -> No
     assert f"listenUrl = {listen}://*:8080/r/" in config
 
 
-@pytest.mark.xfail(strict=True, reason="ssh.host does not exist yet")
 @pytest.mark.parametrize(
     ("args", "address"),
     [
@@ -259,7 +248,6 @@ def test_ssh_advertised_address_follows_ssh_host(
     assert f"advertisedAddress = {address}" in config
 
 
-@pytest.mark.xfail(strict=True, reason="the SSH port is fixed at 29418")
 @pytest.mark.parametrize(
     ("args", "address", "node_port"),
     [
@@ -299,7 +287,6 @@ def test_ssh_advertised_port_follows_the_service(
     assert port.get("nodePort") == node_port
 
 
-@pytest.mark.xfail(strict=True, reason="the SSH port is fixed at 29418")
 def test_node_port_ssh_service_needs_a_known_port() -> None:
     proc = subprocess.run(
         [
@@ -319,7 +306,6 @@ def test_node_port_ssh_service_needs_a_known_port() -> None:
     assert "ssh.service.nodePort" in proc.stderr
 
 
-@pytest.mark.xfail(strict=True, reason="SSH Service lacks the new settings")
 def test_ssh_service_defaults() -> None:
     service = named(render(), "Service", "gerrit-ssh")
     assert service["spec"]["type"] == "LoadBalancer"
@@ -327,7 +313,6 @@ def test_ssh_service_defaults() -> None:
     assert "annotations" not in service["metadata"]
 
 
-@pytest.mark.xfail(strict=True, reason="SSH Service lacks the new settings")
 def test_ssh_service_annotations_and_external_dns() -> None:
     docs = render(
         "--set",
@@ -351,7 +336,6 @@ def test_cluster_ip_ssh_service_has_no_traffic_policy() -> None:
     assert "externalTrafficPolicy" not in named(docs, "Service", "gerrit-ssh")["spec"]
 
 
-@pytest.mark.xfail(strict=True, reason="externalDNS does not exist yet")
 def test_external_dns_refuses_the_http_host() -> None:
     proc = subprocess.run(
         [
@@ -387,7 +371,6 @@ def test_network_policy_admits_http_and_ssh_from_anywhere_by_default() -> None:
     assert ingress_rules() == {8080: None, 29418: None}
 
 
-@pytest.mark.xfail(strict=True, reason="ingressNamespaceSelector does not exist yet")
 def test_network_policy_limits_http_to_the_ingress_namespace() -> None:
     rules = ingress_rules(
         "--set",

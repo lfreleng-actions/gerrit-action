@@ -1,0 +1,170 @@
+{{/*
+SPDX-License-Identifier: Apache-2.0
+SPDX-FileCopyrightText: 2026 The Linux Foundation
+*/}}
+{{- if .Values.ingress.enabled }}
+{{- $fullname := include "gerrit.fullname" . }}
+{{- $host := include "gerrit.httpHost" . }}
+{{- $prefix := include "gerrit.urlPrefix" . }}
+{{- $tls := .Values.ingress.tls }}
+{{- $secret := include "gerrit.tlsSecretName" . }}
+{{- if .Values.ingress.traefik.enabled }}
+{{- $headers := .Values.ingress.securityHeaders }}
+{{- $redirect := and .Values.ingress.redirectRootToPrefix $prefix }}
+{{- $middlewares := list }}
+{{- if $headers.enabled }}
+{{- $middlewares = append $middlewares (printf "%s-security-headers" $fullname) }}
+{{- end }}
+{{- if and $tls.enabled $tls.issuer }}
+{{- /* cert-manager does not watch IngressRoutes, so ask it directly */}}
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: {{ $secret }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "gerrit.labels" . | nindent 4 }}
+spec:
+  secretName: {{ $secret }}
+  dnsNames:
+    - {{ $host | quote }}
+  issuerRef:
+    group: cert-manager.io
+    kind: ClusterIssuer
+    name: {{ $tls.issuer | quote }}
+---
+{{- end }}
+{{- if $headers.enabled }}
+apiVersion: traefik.io/v1alpha1
+kind: Middleware
+metadata:
+  name: {{ $fullname }}-security-headers
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "gerrit.labels" . | nindent 4 }}
+spec:
+  headers:
+    contentSecurityPolicy: {{ default (include "gerrit.contentSecurityPolicy" .) $headers.contentSecurityPolicy | quote }}
+    {{- if $tls.enabled }}
+    stsSeconds: 31536000
+    {{- end }}
+    referrerPolicy: strict-origin-when-cross-origin
+    permissionsPolicy: "camera=(), geolocation=(), microphone=(), payment=(), usb=()"
+    contentTypeNosniff: true
+---
+{{- end }}
+{{- if $redirect }}
+apiVersion: traefik.io/v1alpha1
+kind: Middleware
+metadata:
+  name: {{ $fullname }}-root-redirect
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "gerrit.labels" . | nindent 4 }}
+spec:
+  redirectRegex:
+    regex: "^(https?://[^/]+)/?"
+    replacement: "${1}{{ $prefix }}/"
+    permanent: true
+---
+{{- end }}
+{{- /* No buffering Middleware: Traefik then sets no request body limit,
+and a git push streams through rather than being held whole */}}
+apiVersion: traefik.io/v1alpha1
+kind: IngressRoute
+metadata:
+  name: {{ $fullname }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "gerrit.labels" . | nindent 4 }}
+  {{- $ann := deepCopy (default dict .Values.ingress.annotations) }}
+  {{- if and .Values.ingress.className (not (hasKey $ann "kubernetes.io/ingress.class")) }}
+  {{- $_ := set $ann "kubernetes.io/ingress.class" .Values.ingress.className }}
+  {{- end }}
+  {{- with $ann }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  {{- with .Values.ingress.traefik.entryPoints }}
+  entryPoints:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+  routes:
+    - kind: Rule
+      {{- if $prefix }}
+      match: {{ printf "Host(`%s`) && (Path(`%s`) || PathPrefix(`%s/`))" $host $prefix $prefix | quote }}
+      {{- else }}
+      match: {{ printf "Host(`%s`)" $host | quote }}
+      {{- end }}
+      {{- with $middlewares }}
+      middlewares:
+        {{- range . }}
+        - name: {{ . }}
+        {{- end }}
+      {{- end }}
+      services:
+        - name: {{ $fullname }}-http
+          port: 8080
+    {{- if $redirect }}
+    - kind: Rule
+      match: {{ printf "Host(`%s`) && Path(`/`)" $host | quote }}
+      {{- /* The redirect answers without calling what follows it, so
+      the headers Middleware comes first to wrap the redirect */}}
+      middlewares:
+        {{- range $middlewares }}
+        - name: {{ . }}
+        {{- end }}
+        - name: {{ $fullname }}-root-redirect
+      services:
+        - name: {{ $fullname }}-http
+          port: 8080
+    {{- end }}
+  {{- if $tls.enabled }}
+  tls:
+    secretName: {{ $secret }}
+  {{- end }}
+{{- else }}
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: {{ $fullname }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "gerrit.labels" . | nindent 4 }}
+  {{- with include "gerrit.ingressAnnotations" . | fromYaml }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  {{- with .Values.ingress.className }}
+  ingressClassName: {{ . }}
+  {{- end }}
+  {{- if $tls.enabled }}
+  tls:
+    - hosts:
+        - {{ $host | quote }}
+      secretName: {{ $secret }}
+  {{- end }}
+  rules:
+    - host: {{ $host | quote }}
+      http:
+        paths:
+          {{- if include "gerrit.nginxRootRedirect" . }}
+          - path: /
+            pathType: Exact
+            backend:
+              service:
+                name: {{ $fullname }}-http
+                port:
+                  name: http
+          {{- end }}
+          - path: {{ default "/" $prefix }}
+            pathType: Prefix
+            backend:
+              service:
+                name: {{ $fullname }}-http
+                port:
+                  name: http
+{{- end }}
+{{- end }}

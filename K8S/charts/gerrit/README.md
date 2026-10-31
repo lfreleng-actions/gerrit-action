@@ -17,13 +17,15 @@ volume holds state only.
 | --------------------------------- | -------------------------------------------------------------- |
 | `StatefulSet` `<fullname>`        | Gerrit; site PVC `site` mounted at `/var/gerrit`               |
 | `Service` `<fullname>-http`       | ClusterIP, port 8080                                           |
-| `Service` `<fullname>-ssh`        | Port 29418, type `LoadBalancer`; only with `ssh.service.enabled` |
+| `Service` `<fullname>-ssh`        | Port 29418, type `LoadBalancer`, `externalTrafficPolicy: Local`; with `ssh.service.enabled` (the default) |
 | `Service` `<fullname>-headless`   | Governing service of the `StatefulSet`                         |
+| `Ingress` `<fullname>`            | With `ingress.enabled`; see [Exposing Gerrit](#exposing-gerrit) |
+| `IngressRoute` `<fullname>`, `Middleware`s, `Certificate` `<fullname>-tls` | Instead of the `Ingress`, with `ingress.traefik.enabled` |
 | `ConfigMap` `<fullname>-scripts`  | `files/scripts/*.sh`                                           |
 | `ConfigMap` `<fullname>-config`   | Rendered `gerrit.config`, `jgit.config` and `notedb.config`    |
 | `Secret` `<fullname>-admin`       | Admin credential placeholder; not consumed yet                 |
 | `Secret` `<fullname>-secure-config` | Values `render-config.sh` writes to `etc/secure.config`; see the Secret contract |
-| `NetworkPolicy` (two)             | Default deny; allow ingress to 8080 and 29418, egress to DNS, HTTPS and, with mail configured, the SMTP relay's port |
+| `NetworkPolicy` (two)             | Default deny; allow ingress to 8080 (from `networkPolicy.ingressNamespaceSelector` when set) and 29418, egress to DNS, HTTPS and, with mail configured, the SMTP relay's port |
 
 The Secrets carry `helm.sh/resource-policy: keep` and
 `argocd.argoproj.io/sync-options: Prune=false,Delete=false`, so they
@@ -90,8 +92,19 @@ mounts empty anonymous volumes over them and the site disappears.
 | `gerrit.instanceId`                      | `""`                             | `gerrit.instanceId`; left out when empty                   |
 | `gerrit.serverId`                        | `""`                             | See [Server ID](#server-id)                                |
 | `gerrit.extraConfig`                     | `""`                             | Appended verbatim to `gerrit.config`                       |
-| `gerrit.webScheme`                       | `https`                          | Scheme of `gerrit.canonicalWebUrl`                         |
-| `gerrit.listenScheme`                    | `proxy-https`                    | `httpd.listenUrl` scheme; `http` for direct access         |
+| `gerrit.webScheme`                       | `https`                          | Scheme of `gerrit.canonicalWebUrl`; ignored with `ingress.enabled` |
+| `gerrit.listenScheme`                    | `proxy-https`                    | `httpd.listenUrl` scheme; `http` for direct access; ignored with `ingress.enabled` |
+| `ingress.enabled`                        | `false`                          | Renders the `Ingress`, or the Traefik objects              |
+| `ingress.className`                      | `""`                             | `ingressClassName`; `nginx` adds the ingress-nginx annotations |
+| `ingress.annotations`                    | `{}`                             | Added to the chart's own; a key here wins                  |
+| `ingress.tls.enabled`                    | `true`                           | TLS ends at the controller                                 |
+| `ingress.tls.secretName`                 | `""`                             | Defaults to `<fullname>-tls`                               |
+| `ingress.tls.issuer`                     | `letsencrypt-prod`               | cert-manager `ClusterIssuer`; `""` to create the Secret yourself |
+| `ingress.redirectRootToPrefix`           | `true`                           | Redirects `/` to `<gerrit.urlPrefix>/`                     |
+| `ingress.securityHeaders.enabled`        | `true`                           | Traefik only; see below                                    |
+| `ingress.securityHeaders.contentSecurityPolicy` | `""`                      | `""` for the chart's default policy                        |
+| `ingress.traefik.enabled`                | `false`                          | `IngressRoute` and `Middleware`s instead of an `Ingress`   |
+| `ingress.traefik.entryPoints`            | `[]`                             | Traefik's default entry points when empty                  |
 | `pluginCatalogue.path`                   | `/var/gerrit-catalogue`          | Image directory holding `plugins/` and `lib/`              |
 | `pluginCatalogue.plugins` / `.libs`      | `[]`                             | Jar names without `.jar`; a missing one fails `site-init`  |
 | `persistence.storageClassName`           | `""`                             | Cluster default when empty                                 |
@@ -100,9 +113,16 @@ mounts empty anonymous volumes over them and the site disappears.
 | `resources`                              | 500m / 2Gi, 4Gi limit            |                                                            |
 | `secrets.admin.existingSecret`           | `""`                             | Pre-created Secret with `username` and `password`          |
 | `secrets.secureConfig.existingSecret`    | `""`                             | Pre-created Secret with `registerEmailPrivateKey`          |
-| `ssh.advertisedAddress`                  | `""`                             | Defaults to `gerrit.host`, without its port, on port 29418 |
-| `ssh.service.enabled`                    | `false`                          | Adds the SSH `Service`                                     |
+| `ssh.host`                               | `""`                             | SSH host clients use; defaults to `gerrit.host` without its port |
+| `ssh.port`                               | `null`                           | SSH port clients use; see [SSH](#ssh)                      |
+| `ssh.service.enabled`                    | `true`                           | Adds the SSH `Service`                                     |
+| `ssh.service.type`                       | `LoadBalancer`                   |                                                            |
+| `ssh.service.nodePort`                   | `null`                           | Fixed node port with type `NodePort`                       |
+| `ssh.service.annotations`                | `{}`                             | For example the AWS NLB annotations below                  |
+| `ssh.service.externalTrafficPolicy`      | `Local`                          | Set on `LoadBalancer` and `NodePort` Services only         |
+| `ssh.service.externalDNS`                | `false`                          | Adds `external-dns.alpha.kubernetes.io/hostname: <ssh.host>` |
 | `networkPolicy.enabled`                  | `true`                           |                                                            |
+| `networkPolicy.ingressNamespaceSelector` | `{}`                             | Label selector for the namespaces that may reach 8080; `{}` admits any source |
 
 ### gerrit.config
 
@@ -118,9 +138,9 @@ values:
 | Key                         | Value                                                         |
 | --------------------------- | ------------------------------------------------------------- |
 | `gerrit.basePath`           | `git`                                                         |
-| `gerrit.canonicalWebUrl`    | `<gerrit.webScheme>://<gerrit.host><gerrit.urlPrefix>/`       |
-| `httpd.listenUrl`           | `<gerrit.listenScheme>://*:8080<gerrit.urlPrefix>/`           |
-| `sshd.advertisedAddress`    | `ssh.advertisedAddress`, else `gerrit.host` on port 29418     |
+| `gerrit.canonicalWebUrl`    | `<scheme>://<gerrit.host><gerrit.urlPrefix>/`; the scheme is `https` behind the chart's Ingress with TLS, `http` without, and `gerrit.webScheme` with no Ingress |
+| `httpd.listenUrl`           | `<scheme>://*:8080<gerrit.urlPrefix>/`; the scheme is `proxy-https` behind the chart's Ingress with TLS, `proxy-http` without, and `gerrit.listenScheme` with no Ingress |
+| `sshd.advertisedAddress`    | `ssh.host`, else `gerrit.host`, without any port, then `:` and the SSH port: `ssh.port`, else `ssh.service.nodePort` on a `NodePort` Service, else `29418` |
 | `cache.directory`           | `cache`                                                       |
 | `container.javaOptions`     | The options the image needs, then `-XX:MaxRAMPercentage=70.0` unless `container.heapLimit` is set or there is no memory limit, then `container.javaOptions` from values |
 
@@ -163,6 +183,155 @@ holding no ID. With the value set, `site-init` fails before Gerrit
 starts when the site already holds a different ID, and on a new site
 `gerrit init` takes it as the site's ID. When adopting an existing
 site, copy the ID from its `etc/gerrit.config`.
+
+## Exposing Gerrit
+
+HTTP goes through the cluster's Ingress controller to the
+`<fullname>-http` Service; SSH goes through its own `<fullname>-ssh`
+Service, because an HTTP Ingress cannot route Gerrit's SSH protocol.
+The chart derives `gerrit.canonicalWebUrl`, `httpd.listenUrl` and
+`sshd.advertisedAddress` from `gerrit.host`, `gerrit.urlPrefix`,
+`ssh.host` and `ingress.tls.enabled`, so the links Gerrit builds match
+what the Ingress and the SSH Service serve.
+
+### Ingress
+
+With `ingress.enabled`, the chart renders a `networking.k8s.io/v1`
+`Ingress` for the host in `gerrit.host`, without its port, and the path
+`gerrit.urlPrefix` (`/` for the root) with `pathType: Prefix`. It does
+not rewrite the path: Gerrit expects the prefix in the request. With
+`ingress.tls.enabled`, TLS ends at the controller with the certificate
+in `ingress.tls.secretName`, and with `ingress.tls.issuer` set
+cert-manager issues that Secret through the
+`cert-manager.io/cluster-issuer` annotation.
+
+Only ingress-nginx has annotations for the root redirect and for large
+`git push` requests, so with `ingress.className: nginx` the chart adds
+`app-root` for the redirect, with an `Exact` path for `/` so that the
+Ingress receives the request it redirects, `proxy-body-size: "0"` and
+one-hour read and send timeouts. For another controller, set its
+equivalents in `ingress.annotations`, or use the Traefik objects
+below. The security headers are Traefik-only for the same reason.
+
+### Traefik
+
+With `ingress.traefik.enabled`, the chart renders a Traefik
+`IngressRoute` and `Middleware`s instead of the `Ingress`:
+
+- a route for `Host(<host>)` and the prefix, matched by path segment;
+- with `ingress.redirectRootToPrefix` and a prefix, a route for `/`
+  through a `redirectRegex` Middleware to `<prefix>/`;
+- with `ingress.securityHeaders.enabled`, a `headers` Middleware on
+  both routes, ahead of the redirect so that the redirect carries the
+  headers too, setting `Content-Security-Policy`,
+  `Strict-Transport-Security` (with TLS), `Referrer-Policy`,
+  `Permissions-Policy` and `X-Content-Type-Options: nosniff`;
+- with TLS and an issuer, a cert-manager `Certificate`, since
+  cert-manager does not read `IngressRoute`s.
+
+The default `Content-Security-Policy` allows same-origin resources,
+the inline scripts and styles the web UI and SAML's auto-post page
+use, web workers from `blob:` URLs, which the web UI's syntax
+highlighting creates, and avatar images from any HTTPS origin. Set
+`ingress.securityHeaders.contentSecurityPolicy` to replace it.
+
+The chart adds no buffering Middleware, so Traefik puts no limit on
+the request body and streams a `git push` through. The read timeout
+is the entry point's `respondingTimeouts.readTimeout`, which Traefik
+v3 sets to 60 seconds by default. It belongs to Traefik's own static
+configuration, not to the chart, so raise it on the entry point Gerrit
+uses, for example to `0` or several hours, before pushing large
+repositories over HTTP.
+
+`ingress.className` becomes the `kubernetes.io/ingress.class`
+annotation, which Traefik's `kubernetesCRD` provider filters on when it
+has an `ingressClass` set; that key in `ingress.annotations` wins.
+
+### SSH
+
+`ssh.service.enabled` (the default) renders `<fullname>-ssh` on port
+29418 as `ssh.service.type`, `LoadBalancer` by default, with
+`externalTrafficPolicy: Local` so that `sshd_log` records each
+client's address rather than a node's. With `Local`, only nodes running
+the Gerrit pod pass the load balancer's health check, which is what a
+single-replica StatefulSet needs. `sshd.advertisedAddress` is
+`<ssh.host>:<port>`, with `ssh.host` defaulting to `gerrit.host`.
+
+The port is `ssh.port` when set, for a proxy or load balancer that
+publishes 29418 on another port. Otherwise a `NodePort` Service
+advertises `ssh.service.nodePort`, which the chart also sets as the
+Service's node port, and any other type advertises 29418. Kubernetes
+picks an unset node port at random, so a `NodePort` Service with
+neither value fails to render rather than advertise a port that does
+not answer.
+
+With `ssh.service.externalDNS`, the Service carries
+`external-dns.alpha.kubernetes.io/hostname: <ssh.host>`. The Ingress
+publishes `gerrit.host` through a different load balancer, so with both
+enabled `ssh.host` has to name another host, such as
+`ssh.gerrit.example.org`; the chart fails to render otherwise.
+
+On AWS, an NLB through the AWS Load Balancer Controller needs:
+
+```yaml
+ssh:
+  host: ssh.gerrit.example.org
+  service:
+    annotations:
+      service.beta.kubernetes.io/aws-load-balancer-type: external
+      service.beta.kubernetes.io/aws-load-balancer-nlb-target-type: ip
+      service.beta.kubernetes.io/aws-load-balancer-scheme: internet-facing
+      service.beta.kubernetes.io/aws-load-balancer-target-group-attributes: preserve_client_ip.enabled=true
+    externalDNS: true
+```
+
+IP targets send traffic straight to the pod, bypassing
+`externalTrafficPolicy`. The NLB then keeps the client address only
+with the target group attribute `preserve_client_ip.enabled=true`,
+which the last annotation sets; without it `sshd_log` records the
+NLB's address.
+
+### CDN or TCP proxy in front
+
+A CDN or HTTP proxy in front of the Ingress works for HTTP when it
+forwards the `Host` header and the path unchanged and sets
+`X-Forwarded-Proto: https`; leave `gerrit.host` as the public name.
+Raise its body size limit and read timeout as for the Ingress, or
+large pushes over HTTP fail at the CDN.
+
+An HTTP CDN cannot carry SSH. Point `ssh.host` at a name that resolves
+to the SSH load balancer, or to a TCP (layer 4) proxy that forwards
+port 29418 unchanged, not at the CDN's name. Leave the PROXY protocol
+off on such a proxy unless the Gerrit release in use accepts it on its
+SSH port: a PROXY header sent to a daemon that does not expect one
+breaks every connection. Without it, `sshd_log` records the proxy's
+address.
+
+### Why TLS cannot end in front of SSH
+
+Gerrit's SSH port speaks the SSH protocol, which runs its own key
+exchange and encryption directly over TCP. A TLS terminator in front
+of 29418 would expect a TLS handshake that SSH clients never send, and
+would send TLS records that Gerrit's SSH daemon cannot read, so the
+connection fails at once. A TLS-terminating HTTP load balancer or CDN
+also routes by HTTP request, which SSH does not make. SSH therefore
+needs a plain TCP path end to end, and its host key, not a TLS
+certificate, proves the server's identity.
+
+### Network policy
+
+`networkPolicy.ingressNamespaceSelector` limits port 8080 to pods in
+the namespaces it selects, for example the Ingress controller's:
+
+```yaml
+networkPolicy:
+  ingressNamespaceSelector:
+    matchLabels:
+      kubernetes.io/metadata.name: traefik
+```
+
+Left empty, 8080 admits any source, as port 29418 always does: SSH
+clients arrive from outside the cluster through the load balancer.
 
 ### Volume permissions
 
@@ -226,7 +395,9 @@ ends in that digest.
 
 `tests/chart/` holds golden tests: each values file under `examples/`
 must render the `gerrit.config`, `jgit.config` and `notedb.config` in
-`tests/chart/golden/<example>/`, and `render-config.sh` must write the
+`tests/chart/golden/<example>/`, and `templates/ingress.yaml` as a
+plain Ingress and as Traefik objects in `ingress-plain.golden` and
+`ingress-traefik.golden` there, and `render-config.sh` must write the
 `secure.config` there with mode `0600`. After an intended change to
 the rendered output, regenerate the goldens and review the diff:
 

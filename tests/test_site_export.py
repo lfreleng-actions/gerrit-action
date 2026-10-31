@@ -37,7 +37,7 @@ import pytest
 SCRIPT = Path(__file__).parent.parent / "scripts" / "gerrit-site-export.py"
 PROC_ENV = "GERRIT_SITE_EXPORT_PROC"
 GERRIT_VERSION = "3.10.1"
-EXCLUDED = ["cache", "index", "logs", "tmp", "bin", ".gerritcodereview/tmp"]
+EXCLUDED = ["cache", "index", "logs", "tmp", "bin", ".gerritcodereview/tmp", ".chart"]
 ARCHIVES = ["git.tar.zst", "site.tar.zst"]
 GIT_ENV = {
     "GIT_AUTHOR_NAME": "Fixture",
@@ -1039,7 +1039,6 @@ def test_excludes_root_entries_whatever_their_type(
         assert not path.exists() and not path.is_symlink(), name
 
 
-@pytest.mark.xfail(strict=True, reason="the export copies .chart")
 @pytest.mark.parametrize("kind", ["directory", "symlink"])
 def test_excludes_chart_state(site: dict[str, Any], tmp_path: Path, kind: str) -> None:
     state = tmp_path / "state" if kind == "symlink" else site["root"] / ".chart"

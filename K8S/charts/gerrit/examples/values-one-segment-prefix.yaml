@@ -1,0 +1,53 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: 2026 The Linux Foundation
+
+# Synthetic example: a placeholder host served under a one-segment URL
+# prefix behind a TLS-terminating proxy, with mail, download schemes
+# and issue tracker links. CI lints and renders the chart with every
+# file in this directory, and tests/chart compares each rendered
+# gerrit.config with a golden file.
+
+gerrit:
+  host: gerrit.example.org
+  urlPrefix: /gerrit
+  webScheme: https
+  listenScheme: proxy-https
+  instanceId: example-one
+
+auth:
+  type: HTTP
+  gitBasicAuthPolicy: HTTP
+  editableAccountFields:
+    - FULL_NAME
+    - USER_NAME
+  cookieSecure: true
+
+sendemail:
+  enable: true
+  smtpServer: smtp.example.org
+  smtpServerPort: 587
+  smtpEncryption: tls
+  from: MIXED
+  smtpUser: gerrit@example.org
+
+download:
+  scheme:
+    - ssh
+    - anon_http
+  command:
+    - checkout
+    - cherry_pick
+    - pull
+  archive:
+    - tgz
+    - zip
+
+trackingid:
+  example:
+    match: "EX-[0-9]+"
+    link: "https://issues.example.org/browse/$0"
+    system: EXAMPLE
+
+ssh:
+  service:
+    enabled: true

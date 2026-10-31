@@ -19,12 +19,119 @@ imagePullSecrets: []
 gerrit:
   host: gerrit.example.org        # gerrit.canonicalWebUrl host
   urlPrefix: /r                   # served path prefix; "" for root
-  # Smoke default only; the real authentication types arrive later
-  auth: DEVELOPMENT_BECOME_ANY_ACCOUNT
   # Scheme of gerrit.canonicalWebUrl
   webScheme: https
   # proxy-https behind a TLS-terminating proxy; http for direct access
   listenScheme: proxy-https
+  instanceId: ""
+  # Site identity, stamped on every change. Leave empty for a new site
+  # and Gerrit generates one; the chart then keeps the site's own ID on
+  # every start. When set it must match the site's ID, or site-init
+  # fails before Gerrit starts. Copy it from the source site's
+  # gerrit.config when importing.
+  serverId: ""
+  # Appended verbatim to gerrit.config, for settings with no typed
+  # value below. A key here adds a second entry beside a typed one
+  # rather than replacing it.
+  extraConfig: ""
+
+# The sections below render into etc/gerrit.config, which site-init
+# replaces from the chart at every start. Each key is the Gerrit key of
+# the same name (config-gerrit.html); null or "" leaves it out so
+# Gerrit's own default applies, a list repeats the key, and a map under
+# a section renders a subsection such as [cache "diff"]. Secrets never
+# go here: render-config writes them to etc/secure.config.
+
+# httpd.listenUrl is derived from gerrit.listenScheme and urlPrefix
+httpd:
+  maxQueued: null
+  requestLog: null
+
+# sshd.advertisedAddress is derived; see ssh.advertisedAddress
+sshd:
+  listenAddress: "*:29418"
+  threads: null
+  idleTimeout: null
+  enableCompression: null
+
+# auth.registerEmailPrivateKey comes from secrets.secureConfig
+auth:
+  # Smoke default only; never use it in production
+  type: DEVELOPMENT_BECOME_ANY_ACCOUNT
+  gitBasicAuthPolicy: null
+  contributorAgreements: null
+  editableAccountFields: []
+  cookieSecure: null
+
+# sendemail.smtpPass comes from secrets.secureConfig
+sendemail:
+  # Gerrit's default is true, with a relay on localhost the pod lacks
+  enable: false
+  smtpServer: null
+  smtpServerPort: null
+  smtpEncryption: null
+  from: null
+  smtpUser: null
+
+# The chart always sets the JVM options the image needs, and a heap of
+# 70% of resources.limits.memory unless heapLimit is set.
+container:
+  user: gerrit
+  heapLimit: null
+  javaOptions: []                 # extra options, one per entry
+
+# cache.directory is always "cache" on the site volume. Each map
+# renders one [cache "<name>"] subsection.
+cache:
+  diff_summary:
+    diskLimit: 1g
+  gerrit_file_diff:
+    diskLimit: 1g
+  git_file_diff:
+    diskLimit: 1g
+  modified_files:
+    diskLimit: 1g
+
+change:
+  updateDelay: null
+  mergeabilityComputationBehavior: null
+  enableRobotComments: null
+  allowBlame: null
+
+receive:
+  enableSignedPush: null
+  maxObjectSizeLimit: null
+  timeout: null
+
+download:
+  scheme: []
+  command: []
+  archive: []
+
+index:
+  type: null
+  maxLimit: null
+  onlineUpgrade: null
+
+gc:
+  startTime: null
+  interval: null
+  aggressive: null
+
+plugins:
+  allowRemoteAdmin: false
+
+# Free-form sections; for trackingid each map is one subsection, for
+# example {jira: {match: "...", system: JIRA, link: "..."}}
+user: {}
+trackingid: {}
+accounts: {}
+suggest: {}
+
+# etc/jgit.config and etc/notedb.config, rendered the same way: each
+# top-level key is a section, for example {core: {packedGitLimit: 1g}}
+jgit: {}
+notedb: {}
 
 # Plugins and libraries copied into the site from the image catalogue
 # at every start. Each name is a jar basename without ".jar".
@@ -49,10 +156,6 @@ resources:
   limits:
     memory: 4Gi
 
-# Extra JVM options, one string. When empty the heap is sized as a
-# share of resources.limits.memory.
-javaOptions: ""
-
 # The chart generates each Secret once and reuses its values on upgrade
 # through lookup. A GitOps tool that renders offline, such as Argo CD,
 # sees no existing values and would replace them at every sync: create
@@ -61,7 +164,9 @@ secrets:
   admin:
     existingSecret: ""            # keys: username, password
   secureConfig:
-    existingSecret: ""            # key: registerEmailPrivateKey
+    # keys: registerEmailPrivateKey, and smtpPass when the relay
+    # needs a password
+    existingSecret: ""
 
 ssh:
   # Address clients use for SSH; defaults to gerrit.host, without any

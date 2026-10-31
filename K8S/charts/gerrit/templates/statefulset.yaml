@@ -71,11 +71,16 @@ spec:
               value: /mnt/site
             - name: GERRIT_SITE_DIRS
               value: {{ include "gerrit.imageVolumeDirs" . | quote }}
+            - name: GERRIT_RENDERED_CONFIG
+              value: /config
+            - name: GERRIT_CATALOGUE
+              value: {{ .Values.pluginCatalogue.path | quote }}
+            - name: GERRIT_PLUGINS
+              value: {{ join " " .Values.pluginCatalogue.plugins | quote }}
+            - name: GERRIT_LIBS
+              value: {{ join " " .Values.pluginCatalogue.libs | quote }}
             - name: HOME
               value: /tmp
-          envFrom:
-            - configMapRef:
-                name: {{ $fullname }}-config
           securityContext:
             {{- include "gerrit.containerSecurityContext" . | nindent 12 }}
           resources:
@@ -83,6 +88,9 @@ spec:
           volumeMounts:
             - name: site
               mountPath: /mnt/site
+            - name: config
+              mountPath: /config
+              readOnly: true
             - name: scripts
               mountPath: /scripts
               readOnly: true
@@ -102,6 +110,12 @@ spec:
                 secretKeyRef:
                   name: {{ include "gerrit.secureConfigSecretName" . }}
                   key: registerEmailPrivateKey
+            - name: GERRIT_SMTP_PASS
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "gerrit.secureConfigSecretName" . }}
+                  key: smtpPass
+                  optional: true
           securityContext:
             {{- include "gerrit.containerSecurityContext" . | nindent 12 }}
           volumeMounts:
@@ -154,6 +168,9 @@ spec:
             - name: tmp
               mountPath: /tmp
       volumes:
+        - name: config
+          configMap:
+            name: {{ $fullname }}-config
         - name: scripts
           configMap:
             name: {{ $fullname }}-scripts

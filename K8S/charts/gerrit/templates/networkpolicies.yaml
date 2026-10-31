@@ -48,4 +48,13 @@ spec:
     - ports:
         - protocol: TCP
           port: 443
+    {{- with .Values.sendemail }}
+    {{- if and .smtpServer (ne (toString .enable) "false") }}
+    {{- /* Gerrit's default port is 465 with SSL and 25 otherwise */}}
+    {{- $default := ternary 465 25 (eq (lower (toString .smtpEncryption)) "ssl") }}
+    - ports:
+        - protocol: TCP
+          port: {{ int (.smtpServerPort | default $default) }}
+    {{- end }}
+    {{- end }}
 {{- end }}

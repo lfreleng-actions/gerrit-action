@@ -631,6 +631,16 @@ jobs:
         with:
           enable-cache: true
 
+      # Golden tests of the rendered gerrit.config and of secure.config,
+      # with the Helm version pinned above; the pytest job skips them
+      # when its runner has no helm
+      - name: 'Run the chart golden tests'
+        shell: bash
+        run: |
+          # Run the chart golden tests
+          set -euo pipefail
+          uv run --extra test pytest tests/chart -q
+
       # scripts/lib/chart_digests.py parses the rendered manifests as
       # YAML and requires every container, init container and ephemeral
       # container image in every pod spec to end in @<digest>
@@ -752,7 +762,7 @@ jobs:
           # Verify the site
           python3 "$CHART/files/scripts/verify-site.py" \
             --namespace "$SMOKE_NAMESPACE" --fullname gerrit \
-            --url-prefix /r
+            --url-prefix /r --auth-type DEVELOPMENT_BECOME_ANY_ACCOUNT
 
       - name: 'Collect diagnostics'
         if: failure()

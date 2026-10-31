@@ -13,7 +13,8 @@ metadata:
 data:
   {{- (.Files.Glob "files/scripts/*.sh").AsConfig | nindent 2 }}
 ---
-# gerrit.config fragment; site-init.sh writes each value with git config
+# etc/gerrit.config, jgit.config and notedb.config; site-init copies
+# each over the site's own at every start
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -22,12 +23,17 @@ metadata:
   labels:
     {{- include "gerrit.labels" . | nindent 4 }}
 data:
-  GERRIT_CANONICAL_WEB_URL: {{ include "gerrit.canonicalWebUrl" . | quote }}
-  GERRIT_LISTEN_URL: {{ include "gerrit.listenUrl" . | quote }}
-  GERRIT_SSHD_LISTEN_ADDRESS: "*:29418"
-  GERRIT_SSHD_ADVERTISED_ADDRESS: {{ include "gerrit.sshAdvertisedAddress" . | quote }}
-  GERRIT_AUTH_TYPE: {{ .Values.gerrit.auth | quote }}
-  GERRIT_JAVA_OPTIONS: {{ include "gerrit.javaOptions" . | quote }}
-  GERRIT_CATALOGUE: {{ .Values.pluginCatalogue.path | quote }}
-  GERRIT_PLUGINS: {{ join " " .Values.pluginCatalogue.plugins | quote }}
-  GERRIT_LIBS: {{ join " " .Values.pluginCatalogue.libs | quote }}
+  gerrit.config: |
+    {{- tpl (.Files.Get "files/conf/gerrit.config.tpl") . | trim | nindent 4 }}
+  {{- with include "gerrit.configFile" .Values.jgit | trim }}
+  jgit.config: |
+    {{- . | nindent 4 }}
+  {{- else }}
+  jgit.config: ""
+  {{- end }}
+  {{- with include "gerrit.configFile" .Values.notedb | trim }}
+  notedb.config: |
+    {{- . | nindent 4 }}
+  {{- else }}
+  notedb.config: ""
+  {{- end }}

@@ -1,0 +1,48 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: 2026 The Linux Foundation
+
+# Synthetic example: Gerrit served from the root of its host, with the
+# server ID, SSH address and heap set explicitly and jgit.config filled
+# in. CI lints and renders the chart with every file in this directory,
+# and tests/chart compares each rendered gerrit.config with a golden
+# file.
+
+gerrit:
+  host: review.example.org
+  urlPrefix: ""
+  serverId: 00000000-0000-4000-8000-000000000000
+
+ssh:
+  advertisedAddress: ssh.review.example.org:29418
+
+sshd:
+  threads: 16
+  idleTimeout: 1h
+  enableCompression: true
+
+container:
+  heapLimit: 3g
+  javaOptions:
+    - -XX:+UseG1GC
+
+change:
+  updateDelay: 5min
+  mergeabilityComputationBehavior: API_REF_UPDATED_AND_CHANGE_REINDEX
+  allowBlame: true
+
+receive:
+  enableSignedPush: false
+  maxObjectSizeLimit: 100m
+  timeout: 4min
+
+index:
+  type: lucene
+  maxLimit: 10000
+  onlineUpgrade: true
+
+jgit:
+  core:
+    packedGitLimit: 1g
+    packedGitOpenFiles: 4096
+  receive:
+    autogc: false

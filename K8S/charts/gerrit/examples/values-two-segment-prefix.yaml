@@ -1,0 +1,41 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: 2026 The Linux Foundation
+
+# Synthetic example: Gerrit under a two-segment URL prefix, with cache
+# limits, garbage collection, user defaults and a free-form block for a
+# setting the chart has no typed value for. CI lints and renders the
+# chart with every file in this directory, and tests/chart compares
+# each rendered gerrit.config with a golden file.
+
+gerrit:
+  host: www.example.org
+  urlPrefix: /code/review
+  extraConfig: |
+    [commentlink "changeid"]
+    	match = (I[0-9a-f]{8,40})
+    	link = "#/q/$1"
+
+httpd:
+  maxQueued: 200
+  requestLog: true
+
+cache:
+  accounts:
+    memoryLimit: 4096
+  web_sessions:
+    maxAge: 30 days
+
+gc:
+  startTime: Sat 02:00
+  interval: 1 week
+  aggressive: false
+
+user:
+  name: Gerrit Code Review
+  email: gerrit@example.org
+
+accounts:
+  visibility: SAME_GROUP
+
+suggest:
+  maxSuggestedReviewers: 20

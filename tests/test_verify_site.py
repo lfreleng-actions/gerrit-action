@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: 2026 The Linux Foundation
 
-"""Tests for verify-site.py's development login, against a stub Gerrit."""
+"""Tests for verify-site.py's login and server info checks, against a stub Gerrit."""
 
 from __future__ import annotations
 
@@ -43,6 +43,12 @@ class StubGerrit:
     accounts: set[int] = field(default_factory=set)
     dev_auth: bool = True
     base_visited: bool = False
+    server_info: dict[str, object] = field(
+        default_factory=lambda: {
+            "auth": {"auth_type": "DEVELOPMENT_BECOME_ANY_ACCOUNT"},
+            "download": {"schemes": {"http": {}, "ssh": {}}, "archives": []},
+        }
+    )
     requests: list[tuple[str, str, str, str]] = field(default_factory=list)
 
 
@@ -119,6 +125,9 @@ def _handler(stub: StubGerrit) -> type[BaseHTTPRequestHandler]:
                 else:
                     # A GET with action=create_account only shows the form
                     self._reply(200, b"<html>login</html>")
+            elif method == "GET" and url.path == f"{p}/config/server/info":
+                payload = json.dumps(stub.server_info).encode()
+                self._reply(200, b")]}'\n" + payload)
             elif method == "GET" and url.path == f"{p}/a/accounts/self":
                 session = self._session()
                 if session is None:
@@ -194,3 +203,63 @@ def test_fails_without_development_login(gerrit: tuple[StubGerrit, str]) -> None
     stub.dev_auth = False
     with pytest.raises(verify_site.CheckError, match="set no session \\(HTTP 404\\)"):
         verify_site.start_session(base)
+
+
+@pytest.mark.xfail(strict=True, reason="check_server_info is not written yet")
+def test_server_info_matches(gerrit: tuple[StubGerrit, str]) -> None:
+    _, base = gerrit
+    detail = verify_site.check_server_info(
+        base, "DEVELOPMENT_BECOME_ANY_ACCOUNT", ["ssh", "http"]
+    )
+    assert detail == "auth DEVELOPMENT_BECOME_ANY_ACCOUNT; download schemes http, ssh"
+
+
+@pytest.mark.xfail(strict=True, reason="check_server_info is not written yet")
+def test_server_info_reports_without_expectations(
+    gerrit: tuple[StubGerrit, str],
+) -> None:
+    stub, base = gerrit
+    stub.server_info = {"auth": {"auth_type": "HTTP"}}
+    detail = verify_site.check_server_info(base, None, [])
+    assert detail == "auth HTTP; download schemes none"
+
+
+@pytest.mark.xfail(strict=True, reason="check_server_info is not written yet")
+def test_server_info_wrong_auth_type(gerrit: tuple[StubGerrit, str]) -> None:
+    _, base = gerrit
+    with pytest.raises(
+        verify_site.CheckError,
+        match="auth type 'DEVELOPMENT_BECOME_ANY_ACCOUNT', expected 'HTTP'",
+    ):
+        verify_site.check_server_info(base, "HTTP", [])
+
+
+@pytest.mark.xfail(strict=True, reason="check_server_info is not written yet")
+def test_server_info_missing_download_scheme(
+    gerrit: tuple[StubGerrit, str],
+) -> None:
+    _, base = gerrit
+    with pytest.raises(
+        verify_site.CheckError,
+        match=r"download schemes \['http', 'ssh'\] lack \['anonymous http'\]",
+    ):
+        verify_site.check_server_info(base, None, ["ssh", "anonymous http"])
+
+
+@pytest.mark.xfail(strict=True, reason="--auth-type is not parsed yet")
+def test_parse_args_server_info_options() -> None:
+    args = verify_site.parse_args(
+        [
+            "--namespace",
+            "ns",
+            "--auth-type",
+            "HTTP",
+            "--download-scheme",
+            "ssh",
+            "--download-scheme",
+            "http",
+        ]
+    )
+    assert (args.auth_type, args.download_scheme) == ("HTTP", ["ssh", "http"])
+    defaults = verify_site.parse_args(["--namespace", "ns"])
+    assert (defaults.auth_type, defaults.download_scheme) == (None, [])

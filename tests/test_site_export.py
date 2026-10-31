@@ -1039,6 +1039,21 @@ def test_excludes_root_entries_whatever_their_type(
         assert not path.exists() and not path.is_symlink(), name
 
 
+@pytest.mark.xfail(strict=True, reason="the export copies .chart")
+@pytest.mark.parametrize("kind", ["directory", "symlink"])
+def test_excludes_chart_state(site: dict[str, Any], tmp_path: Path, kind: str) -> None:
+    state = tmp_path / "state" if kind == "symlink" else site["root"] / ".chart"
+    state.mkdir()
+    (state / "site-state.json").write_text('{"source": "release"}\n')
+    if kind == "symlink":
+        (site["root"] / ".chart").symlink_to(state)
+
+    manifest = export_ok(site, "final")
+    path = site["out"] / "site" / ".chart"
+    assert not path.exists() and not path.is_symlink()
+    assert ".chart" in manifest["excluded"]
+
+
 def test_final_copies_ref_rewritten_with_same_size_and_mtime(
     site: dict[str, Any],
 ) -> None:

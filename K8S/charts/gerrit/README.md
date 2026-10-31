@@ -497,7 +497,11 @@ python3 K8S/charts/gerrit/files/scripts/verify-site.py \
 ```
 
 The `chart-smoke` job in `.github/workflows/testing.yaml` runs this
-sequence on every pull request. It also lints and renders the chart
+sequence on every pull request. It then upgrades the release with
+`gc.cronJob.enabled`, runs the CronJob once with
+`kubectl create job --from` on a fixture repository of loose objects,
+and checks that the Job succeeds and leaves the objects packed. It
+also lints and renders the chart
 with each values file under `examples/`. With `image.digest` set, it
 parses each render with `scripts/lib/chart_digests.py` and checks
 that every container, init container and ephemeral container image

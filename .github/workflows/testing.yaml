@@ -764,6 +764,62 @@ jobs:
             --namespace "$SMOKE_NAMESPACE" --fullname gerrit \
             --url-prefix /r --auth-type DEVELOPMENT_BECOME_ANY_ACCOUNT
 
+      # Enables the git gc CronJob with a full gc, runs it once on a
+      # fixture repository of loose objects and checks it packed them
+      - name: 'Run the git gc CronJob'
+        shell: bash
+        run: |
+          # Run the git gc CronJob
+          set -euo pipefail
+          ns="$SMOKE_NAMESPACE"
+          helm upgrade gerrit "$CHART" --namespace "$ns" --reuse-values \
+            --set gc.cronJob.enabled=true \
+            --set-json 'gc.cronJob.args=["--prune=now"]' \
+            --wait --timeout 15m
+          repo=/var/gerrit/git/gc-fixture.git
+          in_gerrit() {
+            kubectl exec -n "$ns" gerrit-0 -c gerrit -- sh -c "$1"
+          }
+          in_gerrit "set -e
+            export GIT_AUTHOR_NAME=smoke GIT_AUTHOR_EMAIL=smoke@example.org
+            export GIT_COMMITTER_NAME=smoke GIT_COMMITTER_EMAIL=smoke@example.org
+            git init -q --bare $repo
+            blob=\$(echo smoke | git --git-dir=$repo hash-object -w --stdin)
+            tree=\$(printf '100644 blob %s\tsmoke\n' \$blob \
+              | git --git-dir=$repo mktree)
+            commit=\$(git --git-dir=$repo commit-tree \$tree -m smoke)
+            git --git-dir=$repo update-ref refs/heads/main \$commit"
+          loose="find $repo/objects -path '*/[0-9a-f][0-9a-f]/*' -type f"
+          before=$(in_gerrit "$loose | wc -l")
+          if [ "$before" -eq 0 ]; then
+            echo "::error::The fixture repository has no loose objects ❌"
+            exit 1
+          fi
+          kubectl create job -n "$ns" gc-smoke --from=cronjob/gerrit-git-gc
+          succeeded=""
+          for _ in $(seq 60); do
+            succeeded=$(kubectl get job -n "$ns" gc-smoke \
+              -o jsonpath='{.status.succeeded}')
+            failed=$(kubectl get job -n "$ns" gc-smoke \
+              -o jsonpath='{.status.failed}')
+            if [ "$succeeded" = 1 ] || [ "${failed:-0}" != 0 ]; then
+              break
+            fi
+            sleep 5
+          done
+          kubectl logs -n "$ns" job/gc-smoke || true
+          if [ "$succeeded" != 1 ]; then
+            echo "::error::The git gc Job did not succeed ❌"
+            exit 1
+          fi
+          packs=$(in_gerrit "ls $repo/objects/pack/*.pack 2>/dev/null | wc -l")
+          after=$(in_gerrit "$loose | wc -l")
+          if [ "$packs" -eq 0 ] || [ "$after" -ne 0 ]; then
+            echo "::error::gc left $packs packs and $after loose objects ❌"
+            exit 1
+          fi
+          echo "The git gc Job packed $before loose objects ✅"
+
       - name: 'Collect diagnostics'
         if: failure()
         shell: bash
